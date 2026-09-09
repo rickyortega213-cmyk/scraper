@@ -74,6 +74,7 @@ class Settings:
     apify_token: str = ""
     apify_actor: str = "compass~crawler-google-places"
     scrapingdog_key: str = ""
+    scraperapi_key: str = ""
 
     mailtester_key: str = ""
     millionverifier_key: str = ""
@@ -183,7 +184,8 @@ class Settings:
             "outscraper": self.outscraper_key,
             "apify": self.apify_token,
             "scrapingdog": self.scrapingdog_key,
-            "generic": self.generic_maps_config or self.maps_api_key,
+            "scraperapi": self.scraperapi_key,
+            "generic": self.generic_maps_config,
             "file": self.places_file,
         }
 
@@ -196,5 +198,5 @@ class Settings:
             "reoon": self.reoon_key,
             "emaillistverify": self.emaillistverify_key,
             "bouncer": self.bouncer_key,
-            "generic": self.generic_verify_config or self.verify_api_key,
+            "generic": self.generic_verify_config,
         }

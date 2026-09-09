@@ -41,12 +41,19 @@ gmscrape run -f examples/queries.txt --limit 60 --format all
 Both API layers are adapters, so nothing in the pipeline changes when you swap
 vendors. Set **one** key and `MAPS_PROVIDER=auto` picks it up.
 
-**Google Maps** — built-in support for `serpapi`, `serper`, `outscraper`,
-`apify`, `scrapingdog`.
+**Google Maps** — built-in support for `scraperapi`, `serpapi`, `serper`,
+`outscraper`, `apify`, `scrapingdog`.
 
 ```bash
-SERPAPI_KEY=...        # or SERPER_KEY / OUTSCRAPER_KEY / APIFY_TOKEN / SCRAPINGDOG_KEY
+SCRAPERAPI_KEY=...     # or SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY /
+                       #    APIFY_TOKEN / SCRAPINGDOG_KEY
 ```
+
+The ScraperAPI adapter targets their structured endpoint
+(`/structured/google/mapssearch`) and reads listings from `local_results`,
+`results`, `places` or a bare array, so a shape change doesn't break it. Paging
+stops as soon as a page returns nothing new, so it collects everything when
+`page` is honoured and never loops when it isn't.
 
 **Using an API that isn't on that list?** Describe it in JSON instead of writing
 code — copy `examples/maps_api.example.json`, adjust, and point at it:
@@ -248,7 +255,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 40 tests, no network or API keys needed
+make test     # 51 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -265,7 +272,8 @@ gmscrape/
   config.py           settings from env / .env / flags
   query.py            "business type in location" parsing
   core/pipeline.py    orchestration
-  providers/maps/     serpapi, serper, outscraper, apify, scrapingdog, generic, file
+  providers/maps/     scraperapi, serpapi, serper, outscraper, apify,
+                      scrapingdog, generic, file
   providers/verify/   mailtester, millionverifier, zerobounce, neverbounce,
                       reoon, emaillistverify, bouncer, generic, local
   web/                fetch (async, robots, cache) · crawl · extract

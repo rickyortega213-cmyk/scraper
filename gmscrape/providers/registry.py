@@ -11,6 +11,7 @@ from .maps.apify import ApifyMaps
 from .maps.file_provider import FileMaps
 from .maps.generic import GenericMaps
 from .maps.outscraper import OutscraperMaps
+from .maps.scraperapi import ScraperApiMaps
 from .maps.scrapingdog import ScrapingDogMaps
 from .maps.serpapi import SerpApiMaps
 from .maps.serper import SerperMaps
@@ -27,6 +28,7 @@ MAPS_PROVIDERS: dict[str, Type[MapsProvider]] = {
     OutscraperMaps.name: OutscraperMaps,
     ApifyMaps.name: ApifyMaps,
     ScrapingDogMaps.name: ScrapingDogMaps,
+    ScraperApiMaps.name: ScraperApiMaps,
     "generic": GenericMaps,
     "file": FileMaps,
 }
@@ -40,7 +42,10 @@ VERIFY_PROVIDERS: dict[str, Type[EmailVerifier]] = {
 
 # Auto-detection order: whichever credential is present wins, most specific
 # (a real maps API) before the local-file fallback.
-MAPS_AUTO_ORDER = ("generic", "serpapi", "serper", "outscraper", "apify", "scrapingdog", "file")
+MAPS_AUTO_ORDER = (
+    "generic", "scraperapi", "serpapi", "serper", "outscraper", "apify",
+    "scrapingdog", "file",
+)
 VERIFY_AUTO_ORDER = (
     "generic", "mailtester", "millionverifier", "zerobounce", "neverbounce",
     "reoon", "emaillistverify", "bouncer",
@@ -62,8 +67,9 @@ def detect_maps_provider(settings: Settings) -> str:
             return name
     raise ProviderError(
         "No Google Maps provider configured. Set one of "
-        "SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY / APIFY_TOKEN / "
-        "SCRAPINGDOG_KEY, or describe your own API with GENERIC_MAPS_CONFIG "
+        "SCRAPERAPI_KEY / SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY / "
+        "APIFY_TOKEN / SCRAPINGDOG_KEY, or describe your own API with "
+        "GENERIC_MAPS_CONFIG "
         "(see examples/maps_api.example.json), or pass "
         "--maps-provider file --places-file <path>."
     )

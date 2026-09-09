@@ -173,3 +173,41 @@ def test_rerun_uses_cached_verifications(tmp_path, settings, site_server):
         report = pipeline.run(["*"])
     assert second.calls == [], "second run should be served entirely from cache"
     assert report.verification_cache_hits > 0
+
+
+def test_full_run_through_a_mocked_maps_api(tmp_path, settings, site_server):
+    """Maps provider -> crawl -> extract -> verify, with nothing stubbed but HTTP."""
+    import httpx
+
+    from gmscrape.providers.maps.scraperapi import ScraperApiMaps
+
+    payload = {
+        "local_results": [
+            {"title": "Joe's Plumbing & Heating", "place_id": "m1", "type": "Plumber",
+             "website": f"{site_server}/site1/", "reviews": 87, "rating": 4.8,
+             "address": "100 Main St, Austin, TX 78701", "phone": "(512) 555-0100"},
+            {"title": "McDonald's", "place_id": "m2", "type": "Fast food restaurant",
+             "website": "https://mcdonalds.com/us/en-us.html", "reviews": 2100},
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["query"] == "plumber in austin tx"
+        assert request.url.params["api_key"] == "test-key"
+        return httpx.Response(200, json=payload if request.url.params["page"] == "1" else {})
+
+    settings.scraperapi_key = "test-key"
+    maps = ScraperApiMaps(settings)
+    maps.client._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    store = Store(settings.db_path)
+    with Pipeline(settings, store=store, maps=maps, verifier=StubVerifier(settings)) as pipeline:
+        run = pipeline.run(["plumber in austin tx"])
+
+    joe = _by_name(run.results, "Joe's Plumbing")
+    assert joe.place.query == "plumber in austin tx"
+    assert joe.place.domain == "" or joe.place.website.startswith(site_server)
+    assert "office@joesplumbing.com" in {c.email for c in joe.emails}
+
+    mcd = _by_name(run.results, "McDonald's")
+    assert mcd.is_chain and not mcd.guessed_emails
