@@ -1,0 +1,10 @@
+# One search query per line, formatted "business type in location".
+# Lines starting with # are ignored.
+
+dentist in austin tx
+plumber in miami fl
+roofing contractor in denver co
+med spa in scottsdale az
+coffee shop in portland or
+law firm in charlotte nc
+hvac contractor in 33101

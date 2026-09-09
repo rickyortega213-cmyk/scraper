@@ -1,0 +1,41 @@
+{
+  "name": "my-maps-api",
+  "method": "GET",
+  "url": "https://api.example.com/v1/google-maps/search",
+  "headers": {
+    "Authorization": "Bearer {api_key}",
+    "Accept": "application/json"
+  },
+  "query": {
+    "q": "{query}",
+    "limit": "{page_size}",
+    "page": "{page}",
+    "hl": "{language}",
+    "gl": "{country}"
+  },
+  "results_path": "data.results",
+  "error_path": "error.message",
+  "pagination": {
+    "style": "page",
+    "param": "page",
+    "start": 1,
+    "size": 20
+  },
+  "field_map": {
+    "name": ["business_name", "title"],
+    "website": ["web_url", "website"],
+    "phone": ["phone_number", "phone"],
+    "address": ["formatted_address", "address"],
+    "reviews": ["review_count", "reviews"],
+    "rating": ["avg_rating", "rating"],
+    "place_id": ["gmaps_id", "place_id"],
+    "category": ["primary_category", "category"]
+  },
+  "_notes": {
+    "placeholders": "{api_key} {query} {business_type} {location} {limit} {page} {offset} {page_size} {language} {country} {cursor}",
+    "pagination.style": "page | offset | cursor | none",
+    "cursor_style": "set pagination.style=cursor, cursor_path=data.next_cursor, cursor_param=cursor",
+    "post_bodies": "add a \"body\": {...} object and \"method\": \"POST\"",
+    "field_map": "only needed when your field names are unusual; the built-in map already covers name/title, website/site/url, phone, address, rating, reviews, place_id and more"
+  }
+}

@@ -1,0 +1,3 @@
+name,website,phone,address,city,state,postal_code,category,rating,reviews,place_id
+Joe's Plumbing & Heating,https://example.com,(512) 555-0100,"100 Main St, Austin, TX 78701",Austin,TX,78701,Plumber,4.8,87,demo-1
+Austin Family Dental,https://example.org,(512) 555-0142,"220 Oak Ave, Austin, TX 78702",Austin,TX,78702,Dentist,4.6,412,demo-2

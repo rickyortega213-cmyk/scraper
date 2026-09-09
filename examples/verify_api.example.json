@@ -1,0 +1,39 @@
+{
+  "name": "my-verify-api",
+  "method": "GET",
+  "url": "https://api.example.com/v1/email/verify",
+  "headers": {
+    "Authorization": "Bearer {api_key}"
+  },
+  "query": {
+    "email": "{email}"
+  },
+  "result_path": "data",
+  "status_path": "result",
+  "sub_status_path": "reason",
+  "score_path": "confidence",
+  "catch_all_path": "accept_all",
+  "role_path": "is_role",
+  "free_path": "is_free",
+  "disposable_path": "is_disposable",
+  "mx_path": "has_mx",
+  "status_map": {
+    "deliverable": "valid",
+    "undeliverable": "invalid",
+    "risky": "risky",
+    "accept_all": "catch_all",
+    "unknown": "unknown"
+  },
+  "batch": {
+    "url": "https://api.example.com/v1/email/verify/bulk",
+    "method": "POST",
+    "body": { "emails": "{emails}" },
+    "results_path": "data.results",
+    "email_path": "email"
+  },
+  "_notes": {
+    "placeholders": "{api_key} {email} {emails}",
+    "status_map": "optional - common vendor words (valid/invalid/catch-all/accept_all/deliverable/ok/...) are already recognised",
+    "batch": "optional - omit it and addresses are verified one at a time"
+  }
+}
