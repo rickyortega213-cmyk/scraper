@@ -15,7 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from ..config import Settings
 from ..emails.patterns import build_permutations
@@ -36,6 +36,15 @@ from ..providers.base import EmailVerifier, MapsProvider, ProviderError
 from ..providers.verify.local import prefilter
 from ..query import parse_queries
 from ..store.db import Store
+from ..store.sinks import (
+    STATUS_CRAWLED,
+    STATUS_DONE,
+    STATUS_GUESSED,
+    STATUS_QUEUED,
+    STATUS_VERIFIED,
+    LeadSink,
+    NullSink,
+)
 from ..util import domain_has_mx, registered_domain
 from ..web.crawl import scrape_site
 from ..web.fetch import Fetcher
@@ -59,6 +68,7 @@ class RunReport:
     verification_calls: int = 0
     verification_cache_hits: int = 0
     errors: list[str] = field(default_factory=list)
+    sinks: list[Any] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -97,6 +107,7 @@ class Pipeline:
         maps: Optional[MapsProvider] = None,
         verifier: Optional[EmailVerifier] = None,
         progress: Optional[ProgressHook] = None,
+        sinks: Optional[Sequence[LeadSink]] = None,
     ) -> None:
         self.settings = settings
         settings.ensure_dirs()
@@ -105,6 +116,7 @@ class Pipeline:
         self.maps = maps or get_maps_provider(settings)
         self.verifier = verifier or get_verifier(settings)
         self.progress = progress or (lambda event, data: None)
+        self.sinks: list[LeadSink] = list(sinks) if sinks else [NullSink()]
         self._verify_calls = 0
         self._cache_hits = 0
 
@@ -120,13 +132,25 @@ class Pipeline:
             verify_provider=self.verifier.name,
         )
         self.store.start_run(report.run_id, report.queries, asdict(self.settings))
+        self._sink_call("start_run", report.run_id, {
+            "queries": report.queries,
+            "maps_provider": report.maps_provider,
+            "verify_provider": report.verify_provider,
+        })
 
         places = self._collect_places(specs, report)
         results = self._classify(places)
         if results:
+            # Publish and flush before any slow work, so the table is fully
+            # populated the moment the run starts rather than after the crawl.
+            self._publish(results, STATUS_QUEUED)
+            self._sink_call("flush")
             asyncio.run(self._scrape_websites(results))
+            self._publish(results, STATUS_CRAWLED)
             self._plan_permutations(results)
+            self._publish([r for r in results if r.guessed_emails], STATUS_GUESSED)
             self._verify_all(results)
+            self._publish(results, STATUS_VERIFIED)
 
         for result in results:
             score_business(result)
@@ -144,14 +168,34 @@ class Pipeline:
         report.results = results
         report.verification_calls = self._verify_calls
         report.verification_cache_hits = self._cache_hits
+        report.sinks = [s for s in self.sinks if not isinstance(s, NullSink)]
+        self._publish(results, STATUS_DONE)
         report.finished_at = time.time()
-        self.store.finish_run(report.run_id, report.stats())
-        self.progress("run_finished", {"stats": report.stats()})
+        stats = report.stats()
+        self.store.finish_run(report.run_id, stats)
+        self._sink_call("finish_run", report.run_id, stats)
+        self.progress("run_finished", {"stats": stats})
         return report
+
+    def _publish(self, results: Sequence[BusinessResult], status: str) -> None:
+        """Push a stage's results to every sink. A sink must never break a run."""
+        for sink in self.sinks:
+            try:
+                sink.upsert(results, status)
+            except Exception as exc:  # noqa: BLE001 - sinks are best-effort
+                log.warning("sink %s failed at %s: %s", type(sink).__name__, status, exc)
+
+    def _sink_call(self, method: str, *args: object) -> None:
+        for sink in self.sinks:
+            try:
+                getattr(sink, method)(*args)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("sink %s.%s failed: %s", type(sink).__name__, method, exc)
 
     def close(self) -> None:
         self.maps.close()
         self.verifier.close()
+        self._sink_call("close")
         if self._owns_store:
             self.store.close()
 
@@ -249,6 +293,8 @@ class Pipeline:
                     if scrape.errors:
                         result.notes.append(f"crawl_errors={len(scrape.errors)}")
                     done += 1
+                    # Stream this one straight out; the sink batches for us.
+                    self._publish([result], STATUS_CRAWLED)
                     self.progress(
                         "site_done",
                         {

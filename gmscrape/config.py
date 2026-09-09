@@ -130,6 +130,13 @@ class Settings:
     chain_mode: str = "flag"          # flag|skip|only
     chain_review_threshold: int = 1500
 
+    # --- Supabase live table -----------------------------------------------
+    supabase_url: str = ""
+    supabase_key: str = ""
+    supabase_schema: str = "public"
+    supabase_prefix: str = "gmscrape_"
+    supabase: bool = False
+
     # --- output / storage --------------------------------------------------
     db_path: str = "out/gmscrape.sqlite"
     out_dir: str = "out"
@@ -176,6 +183,10 @@ class Settings:
         db_parent = Path(self.db_path).expanduser().parent
         if str(db_parent):
             db_parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def supabase_configured(self) -> bool:
+        return bool(self.supabase_url and self.supabase_key)
 
     def configured_maps_keys(self) -> dict[str, str]:
         return {

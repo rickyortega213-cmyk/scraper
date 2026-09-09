@@ -7,6 +7,8 @@
     gmscrape extract https://example.com
     gmscrape guess acme.com --business-name "Joe's Plumbing"
     gmscrape probe-maps https://api.example.com/maps --key KEY
+    gmscrape supabase-init --write supabase_schema.sql
+    gmscrape run "dentist in austin tx" --supabase
     gmscrape doctor
 """
 
@@ -136,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     chains.add_argument("--guess-chains", dest="permutations_for_chains", action="store_true",
                         default=None, help="allow guessing on chain domains too")
 
+    live = run.add_argument_group("live lead table")
+    live.add_argument("--supabase", dest="supabase", action="store_true", default=None,
+                      help="mirror leads into Supabase as the run progresses")
+    live.add_argument("--supabase-prefix", dest="supabase_prefix",
+                      help="table name prefix (default gmscrape_)")
+
     # --- enrich ----------------------------------------------------------
     enrich = sub.add_parser(
         "enrich", help="run the email stages against a saved places file (no Maps API call)",
@@ -148,6 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
     enrich.add_argument("-n", "--limit", type=int, dest="results_per_query")
     enrich.add_argument("--no-verify", dest="verify_emails", action="store_false", default=None)
     enrich.add_argument("--no-permutations", dest="permutations", action="store_false", default=None)
+    enrich.add_argument("--supabase", dest="supabase", action="store_true", default=None,
+                        help="mirror leads into Supabase as the run progresses")
 
     # --- verify ----------------------------------------------------------
     verify_cmd = sub.add_parser("verify", help="verify addresses with the configured provider", parents=[common])
@@ -193,6 +203,18 @@ def build_parser() -> argparse.ArgumentParser:
                            help="provider name to record in the config")
     probe_cmd.add_argument("--show-sample", action="store_true",
                            help="print the full first result row")
+
+    # --- supabase --------------------------------------------------------
+    init_cmd = sub.add_parser(
+        "supabase-init", parents=[common],
+        help="print (or write) the SQL that creates the Supabase tables",
+    )
+    init_cmd.add_argument("--write", metavar="PATH", help="write the SQL to this file")
+    init_cmd.add_argument("--prefix", dest="supabase_prefix",
+                          help="table name prefix (default gmscrape_)")
+
+    sub.add_parser("supabase-check", parents=[common],
+                   help="verify the Supabase URL, key and tables")
 
     # --- misc ------------------------------------------------------------
     sub.add_parser("providers", help="list providers and show which are configured",
@@ -254,7 +276,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         echo(f"  • [cyan]{spec.business_type}[/cyan] in [magenta]{spec.location or 'anywhere'}[/magenta]")
 
     try:
-        pipeline = Pipeline(settings, progress=_make_progress())
+        pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
     except ProviderError as exc:
         echo(f"[red]{exc}[/red]")
         return 2
@@ -277,7 +299,7 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     settings.maps_provider = "file"
     settings.places_file = args.places_file
     try:
-        pipeline = Pipeline(settings, progress=_make_progress())
+        pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
     except ProviderError as exc:
         echo(f"[red]{exc}[/red]")
         return 2
@@ -463,6 +485,70 @@ def cmd_probe_maps(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_sinks(settings: Settings) -> list:
+    """The live sinks a run should publish to, based on configuration."""
+    if not settings.supabase:
+        return []
+    from .store.supabase import SupabaseConfig, SupabaseSink
+
+    if not settings.supabase_configured:
+        echo("[yellow]--supabase given but SUPABASE_URL / SUPABASE_KEY are not set;"
+             " continuing without it.[/yellow]")
+        return []
+    config = SupabaseConfig(
+        url=settings.supabase_url,
+        key=settings.supabase_key,
+        schema=settings.supabase_schema,
+        prefix=settings.supabase_prefix,
+    )
+    echo(f"live table: [green]{settings.supabase_url}[/green] "
+         f"({config.table('leads')})")
+    return [SupabaseSink(config)]
+
+
+def cmd_supabase_init(args: argparse.Namespace) -> int:
+    from .store.supabase import schema_sql
+
+    settings = settings_from_args(args)
+    sql = schema_sql(settings.supabase_prefix)
+    if args.write:
+        path = Path(args.write)
+        path.write_text(sql, encoding="utf-8")
+        echo(f"[bold]Wrote[/bold] [green]{path}[/green]")
+        echo("Next:")
+        echo("  1. open your Supabase project → SQL Editor → paste the file → Run")
+        echo("  2. put SUPABASE_URL and SUPABASE_KEY (service_role) in .env")
+        echo("  3. [cyan]gmscrape supabase-check[/cyan]")
+        echo('  4. [cyan]gmscrape run "dentist in austin tx" -n 5 --supabase[/cyan]')
+    else:
+        print(sql)
+    return 0
+
+
+def cmd_supabase_check(args: argparse.Namespace) -> int:
+    from .store.supabase import SupabaseConfig, SupabaseError, check_connection
+
+    settings = settings_from_args(args)
+    if not settings.supabase_configured:
+        echo("[red]SUPABASE_URL and SUPABASE_KEY are not both set.[/red]")
+        echo("Add them to .env, then re-run. The service_role key is the one to use "
+             "for writes from your own machine.")
+        return 2
+    config = SupabaseConfig(
+        url=settings.supabase_url, key=settings.supabase_key,
+        schema=settings.supabase_schema, prefix=settings.supabase_prefix,
+    )
+    try:
+        tables = check_connection(config)
+    except SupabaseError as exc:
+        echo(f"[red]{exc}[/red]")
+        return 1
+    _print_table("Supabase", ("table", "status"), list(tables.items()))
+    echo(f"[green]✓[/green] ready — run with [cyan]--supabase[/cyan] to stream leads into "
+         f"[bold]{config.table('table')}[/bold]")
+    return 0
+
+
 def cmd_providers(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     maps_keys = settings.configured_maps_keys()
@@ -592,6 +678,16 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
         echo("[yellow]Errors:[/yellow]")
         for error in report.errors[:10]:
             echo(f"  • {error}")
+    for sink in getattr(report, "sinks", []) or []:
+        stats_obj = getattr(sink, "stats", None)
+        if stats_obj is not None:
+            detail = (f"{stats_obj.leads_written} leads, {stats_obj.emails_written} emails"
+                      f" in {stats_obj.requests} request(s)")
+            if stats_obj.failures:
+                echo(f"[yellow]{sink.name}: {detail}, {stats_obj.failures} failed "
+                     f"— {stats_obj.last_error}[/yellow]")
+            else:
+                echo(f"[green]{sink.name}:[/green] {detail}")
     if paths:
         echo("[bold]Exported:[/bold]")
         for path in paths:
@@ -626,6 +722,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "extract": cmd_extract,
         "guess": cmd_guess,
         "probe-maps": cmd_probe_maps,
+        "supabase-init": cmd_supabase_init,
+        "supabase-check": cmd_supabase_check,
         "providers": cmd_providers,
         "doctor": cmd_doctor,
         "stats": cmd_stats,

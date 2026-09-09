@@ -226,6 +226,59 @@ Chains are never guessed at, and `--chain-mode` decides what happens to them:
 the chains). Emails actually *found* on a chain's site are still reported —
 they're real, just rarely the local decision-maker.
 
+## Live lead table in Supabase
+
+Watch leads fill in while the run is still going, Clay-style, instead of
+waiting for a CSV at the end.
+
+```bash
+gmscrape supabase-init --write supabase_schema.sql   # paste into the SQL editor
+# add SUPABASE_URL + SUPABASE_KEY (service_role) to .env
+gmscrape supabase-check                              # verifies key + tables
+gmscrape run "dentist in austin tx" -n 5 --supabase
+```
+
+Every business is written and flushed **before** any slow work starts, so the
+table is fully populated the moment the run begins. Each row's `status` then
+advances in place as the pipeline works on it:
+
+```
+queued  ─▶  crawled  ─▶  guessed  ─▶  verified  ─▶  done
+```
+
+```
+[table] {d1: crawled, d2: crawled, d3: crawled, d4: queued}
+[table] {d1: done,    d2: done,    d3: crawled, d4: crawled}
+```
+
+Three tables and two views are created:
+
+| Object | What's in it |
+|---|---|
+| `gmscrape_leads` | one row per business — best email, confidence, status, chain flags, crawl diagnostics |
+| `gmscrape_emails` | one row per address — source, verification status, provider, confidence |
+| `gmscrape_runs` | one row per run — queries, providers, final stats |
+| `gmscrape_table` | the lead view, columns ordered the way you actually read them, best-first |
+| `gmscrape_progress` | live counts per run and status |
+
+Rows are keyed by the same identity the deduplicator uses (place ID, then
+domain, then phone), so **re-running a query updates rows instead of
+duplicating them** — the table becomes a running database of your market, not
+an append-only log.
+
+Writes go through PostgREST, so there's no extra dependency, and they happen on
+a background thread — the crawler is never blocked waiting on a database. A
+Supabase outage can't cost you a scrape either: failures are counted and
+reported at the end, never raised.
+
+```
+supabase: 20 leads, 18 emails in 11 request(s)
+```
+
+Use the **service_role** key. It's server-side only and bypasses RLS; the
+schema leaves RLS enabled so the anon key can't read your leads. Add your own
+policies if you want to expose the table to a front end.
+
 ## Output
 
 `out/leads.csv` — one row per business (best email + counts + chain flags +
@@ -254,6 +307,8 @@ gmscrape extract https://acme.com          # crawl one site, print what's found
 gmscrape guess acme.com --business-name "Joe's Plumbing"
 gmscrape verify info@acme.com sales@acme.com
 gmscrape probe-maps https://api.example.com --key KEY   # discover an API's shape
+gmscrape supabase-init --write schema.sql   # SQL for the live lead table
+gmscrape supabase-check                     # verify Supabase key + tables
 gmscrape providers                          # which APIs are wired up
 gmscrape doctor                             # config + DNS + HTTPS check
 gmscrape stats                              # what's in the database
@@ -272,6 +327,7 @@ Useful flags on `run`:
 --min-confidence N     drop weak addresses
 --format all           csv + json + jsonl + xlsx
 --no-robots            ignore robots.txt
+--supabase             mirror leads into Supabase live as the run progresses
 ```
 
 ## Re-runs are cheap
@@ -292,7 +348,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 63 tests, no network or API keys needed
+make test     # 78 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -318,5 +374,6 @@ gmscrape/
   emails/             patterns (permutations) · score (confidence)
   filters/chains.py   local business vs. national chain
   store/              SQLite cache + results · CSV/JSON/XLSX export
+                      sinks (live publishing) · supabase (live lead table)
   data/               brand, free-mail, platform and junk-domain lists
 ```
