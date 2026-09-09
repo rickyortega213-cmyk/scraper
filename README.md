@@ -76,8 +76,44 @@ MAPS_API_KEY=your-key
 Placeholders: `{api_key} {query} {business_type} {location} {limit} {page}
 {offset} {page_size} {language} {country} {cursor}`. Pagination styles: `page`,
 `offset`, `cursor`, `none`. Field names like `name`/`title`,
-`website`/`site`/`url`, `phone`, `address`, `rating`, `reviews`, `place_id` are
-recognized automatically; add a `field_map` only for unusual ones.
+`website`/`site`/`url`, `phone`, `address`, `avg_rating`, `review_count`,
+`gmaps_id` are recognized automatically; add a `field_map` only for unusual ones.
+
+### Don't know your API's shape? Let it work that out
+
+`probe-maps` calls the endpoint a handful of times, figures out how it wants to
+be called, and writes the config for you:
+
+```bash
+gmscrape probe-maps https://api.example.com --key YOUR_KEY \
+    --query "dentist in austin tx" --write my_maps_api.json
+```
+
+```
+✓ found a working shape after 3 request(s)
+  endpoint     https://api.example.com/maps
+  auth         query:apikey
+  search param q
+  listings at  data.results (2 rows)
+
+  place field   value
+  name          Austin Family Dental
+  website       https://austinfamilydental.com
+  phone         (512) 555-0142
+  reviews       412
+```
+
+It is frugal, because successful calls cost credits: one request establishes
+which path exists, the next which auth style is accepted (a `400` means the key
+worked and only the parameters are off — that is already the answer), the next
+what the search parameter is called. Usually three requests, never more than
+`--max-requests` (default 12). Keys are redacted in all output.
+
+If nothing works, the status codes tell you what to do next: `401/403`
+everywhere means the key isn't accepted in any style tried, `400/422` means
+auth worked but a required parameter is missing (add it with `--param key=value`
+and re-run), and `404` on every path means you should pass the exact endpoint
+URL rather than the host.
 
 **Email verification** — built-in support for `mailtester` (MailTester Ninja),
 `millionverifier`, `zerobounce`, `neverbounce`, `reoon`, `emaillistverify`,
@@ -217,6 +253,7 @@ gmscrape enrich --places-file places.csv   # email stages only, no Maps call
 gmscrape extract https://acme.com          # crawl one site, print what's found
 gmscrape guess acme.com --business-name "Joe's Plumbing"
 gmscrape verify info@acme.com sales@acme.com
+gmscrape probe-maps https://api.example.com --key KEY   # discover an API's shape
 gmscrape providers                          # which APIs are wired up
 gmscrape doctor                             # config + DNS + HTTPS check
 gmscrape stats                              # what's in the database
@@ -255,7 +292,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 51 tests, no network or API keys needed
+make test     # 63 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -271,6 +308,7 @@ gmscrape/
   cli.py              commands, flags, tables
   config.py           settings from env / .env / flags
   query.py            "business type in location" parsing
+  probe.py            discover an unknown maps API's request/response shape
   core/pipeline.py    orchestration
   providers/maps/     scraperapi, serpapi, serper, outscraper, apify,
                       scrapingdog, generic, file

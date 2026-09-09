@@ -6,6 +6,7 @@
     gmscrape verify info@acme.com sales@acme.com
     gmscrape extract https://example.com
     gmscrape guess acme.com --business-name "Joe's Plumbing"
+    gmscrape probe-maps https://api.example.com/maps --key KEY
     gmscrape doctor
 """
 
@@ -170,6 +171,28 @@ def build_parser() -> argparse.ArgumentParser:
     guess_cmd.add_argument("--max-guesses", type=int, dest="permutation_max")
     guess_cmd.add_argument("--no-mx-check", dest="permutation_require_mx",
                            action="store_false", default=None)
+
+    # --- probe-maps ------------------------------------------------------
+    probe_cmd = sub.add_parser(
+        "probe-maps", parents=[common],
+        help="work out how an unknown maps API wants to be called, and write "
+             "a ready GENERIC_MAPS_CONFIG for it",
+    )
+    probe_cmd.add_argument("endpoint",
+                           help="endpoint URL, or just the host to try common paths")
+    probe_cmd.add_argument("--key", help="API key (defaults to MAPS_API_KEY from .env)")
+    probe_cmd.add_argument("--query", default="dentist in austin tx",
+                           help="search string to probe with")
+    probe_cmd.add_argument("--max-requests", type=int, default=12,
+                           help="hard cap on probe requests (default 12)")
+    probe_cmd.add_argument("--param", action="append", default=[], metavar="K=V",
+                           help="extra query parameter to send, repeatable")
+    probe_cmd.add_argument("--write", metavar="PATH",
+                           help="write the discovered config to this file")
+    probe_cmd.add_argument("--name", default="scrapertech",
+                           help="provider name to record in the config")
+    probe_cmd.add_argument("--show-sample", action="store_true",
+                           help="print the full first result row")
 
     # --- misc ------------------------------------------------------------
     sub.add_parser("providers", help="list providers and show which are configured",
@@ -348,6 +371,98 @@ def cmd_guess(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_maps(args: argparse.Namespace) -> int:
+    from .probe import (
+        build_generic_config,
+        describe_mapping,
+        probe_maps_api,
+        redact,
+    )
+
+    settings = settings_from_args(args)
+    api_key = args.key or settings.maps_api_key
+    if not api_key:
+        echo("[red]No API key.[/red] Pass --key or set MAPS_API_KEY in .env")
+        return 2
+
+    extra: dict[str, str] = {}
+    for item in args.param:
+        if "=" not in item:
+            echo(f"[red]--param must look like key=value, got {item!r}[/red]")
+            return 2
+        key, value = item.split("=", 1)
+        extra[key] = value
+
+    echo(f"probing [cyan]{args.endpoint}[/cyan] with query [magenta]{args.query!r}[/magenta]")
+    echo("[dim]each request may consume an API credit; "
+         f"capped at {args.max_requests}[/dim]")
+
+    winner, attempts = probe_maps_api(
+        args.endpoint, api_key, args.query,
+        max_requests=args.max_requests, extra_params=extra,
+    )
+
+    _print_table(
+        f"Probe attempts ({len(attempts)} request{'s' if len(attempts) != 1 else ''})",
+        ("url", "auth", "search param", "status", "rows", "detail"),
+        [
+            (
+                redact(a.url, api_key).replace("https://", ""),
+                a.auth_style,
+                a.query_param,
+                str(a.status or "-"),
+                str(a.rows) if a.rows else "",
+                redact(a.error or a.body_snippet, api_key)[:60],
+            )
+            for a in attempts
+        ],
+    )
+
+    if winner is None:
+        echo("[yellow]No request shape returned business listings.[/yellow]")
+        echo("The status codes above usually say why:")
+        echo("  • 401/403 everywhere → the key is not being accepted in any of "
+             "the styles tried; check how the docs pass it")
+        echo("  • 400/422 → auth worked, but a required parameter is missing; "
+             "add it with --param key=value and re-run")
+        echo("  • 404 on every path → pass the exact endpoint URL instead of the host")
+        return 1
+
+    echo(f"\n[green]✓ found a working shape[/green] after {len(attempts)} request(s)")
+    echo(f"  endpoint     [cyan]{winner.url}[/cyan]")
+    echo(f"  auth         {winner.auth_style}")
+    echo(f"  search param {winner.query_param}")
+    echo(f"  listings at  {winner.results_path or '(top-level array)'} "
+         f"({winner.rows} row{'s' if winner.rows != 1 else ''})")
+
+    resolved, unresolved = describe_mapping(winner.sample)
+    _print_table(
+        "Fields recognized in the first listing",
+        ("place field", "value"),
+        list(resolved.items()),
+    )
+    if unresolved:
+        echo(f"[dim]not found: {', '.join(unresolved)}[/dim]")
+        echo(f"[dim]row keys: {', '.join(sorted(winner.sample)[:24])}[/dim]")
+    if args.show_sample:
+        echo(json.dumps(winner.sample, indent=2, default=str)[:4000])
+
+    config = build_generic_config(winner, name=args.name)
+    rendered = json.dumps(config, indent=2)
+    if args.write:
+        path = Path(args.write)
+        path.write_text(rendered + "\n", encoding="utf-8")
+        echo(f"\n[bold]Wrote[/bold] [green]{path}[/green]. Use it with:")
+        echo(f"  GENERIC_MAPS_CONFIG={path}")
+        echo("  MAPS_API_KEY=<your key>")
+        echo(f"\nThen: [cyan]gmscrape run \"{args.query}\" -n 5[/cyan]")
+    else:
+        echo("\n[bold]Config for GENERIC_MAPS_CONFIG:[/bold]")
+        echo(rendered)
+        echo("[dim]re-run with --write scrapertech_maps.json to save it[/dim]")
+    return 0
+
+
 def cmd_providers(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     maps_keys = settings.configured_maps_keys()
@@ -510,6 +625,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "verify": cmd_verify,
         "extract": cmd_extract,
         "guess": cmd_guess,
+        "probe-maps": cmd_probe_maps,
         "providers": cmd_providers,
         "doctor": cmd_doctor,
         "stats": cmd_stats,
