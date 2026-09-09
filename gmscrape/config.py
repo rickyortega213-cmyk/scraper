@@ -75,6 +75,7 @@ class Settings:
     apify_actor: str = "compass~crawler-google-places"
     scrapingdog_key: str = ""
 
+    mailtester_key: str = ""
     millionverifier_key: str = ""
     zerobounce_key: str = ""
     neverbounce_key: str = ""
@@ -188,6 +189,7 @@ class Settings:
 
     def configured_verify_keys(self) -> dict[str, str]:
         return {
+            "mailtester": self.mailtester_key,
             "millionverifier": self.millionverifier_key,
             "zerobounce": self.zerobounce_key,
             "neverbounce": self.neverbounce_key,

@@ -16,6 +16,7 @@ from .maps.serpapi import SerpApiMaps
 from .maps.serper import SerperMaps
 from .verify.generic import GenericVerifier
 from .verify.local import LocalVerifier
+from .verify.mailtester import MailTesterNinja
 from .verify.vendors import VENDOR_CLASSES
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ MAPS_PROVIDERS: dict[str, Type[MapsProvider]] = {
 VERIFY_PROVIDERS: dict[str, Type[EmailVerifier]] = {
     "local": LocalVerifier,
     "generic": GenericVerifier,
+    MailTesterNinja.name: MailTesterNinja,
     **VENDOR_CLASSES,
 }
 
@@ -40,8 +42,8 @@ VERIFY_PROVIDERS: dict[str, Type[EmailVerifier]] = {
 # (a real maps API) before the local-file fallback.
 MAPS_AUTO_ORDER = ("generic", "serpapi", "serper", "outscraper", "apify", "scrapingdog", "file")
 VERIFY_AUTO_ORDER = (
-    "generic", "millionverifier", "zerobounce", "neverbounce", "reoon",
-    "emaillistverify", "bouncer",
+    "generic", "mailtester", "millionverifier", "zerobounce", "neverbounce",
+    "reoon", "emaillistverify", "bouncer",
 )
 
 

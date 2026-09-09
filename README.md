@@ -72,12 +72,26 @@ Placeholders: `{api_key} {query} {business_type} {location} {limit} {page}
 `website`/`site`/`url`, `phone`, `address`, `rating`, `reviews`, `place_id` are
 recognized automatically; add a `field_map` only for unusual ones.
 
-**Email verification** — built-in support for `millionverifier`, `zerobounce`,
-`neverbounce`, `reoon`, `emaillistverify`, `bouncer`, or your own via
-`GENERIC_VERIFY_CONFIG` (see `examples/verify_api.example.json`, which also
-supports a bulk endpoint). Vendor vocabularies (`deliverable`, `ok`,
-`accept_all`, `catch-all`, …) are normalized to
-`valid / invalid / risky / catch_all / disposable / unknown`.
+**Email verification** — built-in support for `mailtester` (MailTester Ninja),
+`millionverifier`, `zerobounce`, `neverbounce`, `reoon`, `emaillistverify`,
+`bouncer`, or your own via `GENERIC_VERIFY_CONFIG` (see
+`examples/verify_api.example.json`, which also supports a bulk endpoint).
+Vendor vocabularies (`deliverable`, `ok`, `accept_all`, `catch-all`, …) are
+normalized to `valid / invalid / risky / catch_all / disposable / unknown`.
+
+```bash
+MAILTESTER_KEY=sub_...          # your MailTester Ninja subscription id
+```
+
+MailTester Ninja's two-step flow is handled for you: the key is exchanged for a
+short-lived bearer token, the token is cached for its whole lifetime (read from
+its JWT `exp`), and it is re-fetched automatically when it lapses or the API
+rejects it mid-run. Their `code` values map as `ok` → valid, `ko` → invalid,
+`mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all; an `ok` whose
+message reveals a catch-all domain is downgraded rather than sold as
+deliverable. An unrecognized code becomes `unknown`, never `valid` — the raw
+`code:message` is always kept in `sub_status`, so `gmscrape verify` shows you
+the exact vocabulary on the first live call.
 
 With **no verification key at all** the pipeline still runs: it falls back to
 local syntax + MX + disposable/junk checks, which can rule an address out but
@@ -234,7 +248,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 32 tests, no network or API keys needed
+make test     # 40 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -252,8 +266,8 @@ gmscrape/
   query.py            "business type in location" parsing
   core/pipeline.py    orchestration
   providers/maps/     serpapi, serper, outscraper, apify, scrapingdog, generic, file
-  providers/verify/   millionverifier, zerobounce, neverbounce, reoon,
-                      emaillistverify, bouncer, generic, local
+  providers/verify/   mailtester, millionverifier, zerobounce, neverbounce,
+                      reoon, emaillistverify, bouncer, generic, local
   web/                fetch (async, robots, cache) · crawl · extract
   emails/             patterns (permutations) · score (confidence)
   filters/chains.py   local business vs. national chain
