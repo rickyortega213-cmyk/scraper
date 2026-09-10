@@ -1390,7 +1390,13 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
                      f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg, "
                      f"{stages.get('search_slots', 0)} at a time) · "
                      f"verify {_fmt_duration(stages['verify'] / n)} ({stages.get('checks', 0) // n} checks{gap}{keys}) · "
-                     f"maps {_fmt_duration(stages['maps'])} total[/dim]")
+                     f"maps {_fmt_duration(stages['maps'])} total · memory peak {int(stages.get('memory_mb', 0)):,} MB[/dim]")
+                logging.getLogger(__name__).info("pace: %s", {k: round(v, 2) if isinstance(v, float) else v
+                                                              for k, v in stages.items()})
+                if stages.get("memory_mb", 0) > 3000 and not state.get("memory_warned"):
+                    state["memory_warned"] = True
+                    echo("  [yellow]memory is above 3 GB - if the Mac warns about application memory, "
+                         "lower PREPARE_AHEAD (e.g. 4) and HTTP_CONCURRENCY (e.g. 128) and resume.[/yellow]")
             budget = data.get("time_left")
             if (data.get("eta_settled") and data["eta"] and budget not in (None, float("inf"))
                     and data["eta"] > budget and not state.get("budget_warned")):

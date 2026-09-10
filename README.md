@@ -628,6 +628,11 @@ Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
   of zero, and the end of the run lists the searches that found nothing with
   the command that shows the provider's raw answer:
   `gmscrape probe-mcp --call --raw --query "hotels in banning ca"`.
+- **Memory stays bounded.** The live-table writer keeps one row per business
+  in memory (the latest status), not one per status, so a slow Supabase never
+  piles rows up; pages are read up to 1 MB; the pace line reports the
+  process's peak memory and warns above 3 GB (then lower `PREPARE_AHEAD` and
+  `HTTP_CONCURRENCY` and resume).
 - **Every run also writes `out/scraper.log`** (rotating, 20 MB × 3), so a
   run that ends without a word on the terminal still leaves a record of its
   last minutes. On a Mac the program also runs `caffeinate` for as long as it
@@ -674,7 +679,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 252 tests, no network or API keys needed
+make test     # 253 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

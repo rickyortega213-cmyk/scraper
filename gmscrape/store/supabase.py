@@ -15,7 +15,6 @@ fail a scrape - errors are counted and reported, not raised.
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -32,7 +31,6 @@ log = logging.getLogger(__name__)
 FLUSH_INTERVAL = 2.0     # seconds between writes while a stage is running
 BATCH_SIZE = 100         # rows per PostgREST call
 QUEUE_TIMEOUT = 0.25
-SHUTDOWN = object()      # sentinel enqueued by close()
 
 
 def _now() -> str:
@@ -152,7 +150,15 @@ class SupabaseSink:
         self.stats = SinkStats()
         self._client = client or httpx.Client(timeout=config.timeout)
         self._owns_client = client is None
-        self._queue: "queue.Queue[Any]" = queue.Queue()
+        # Rows waiting to be written, latest version per id. A business goes
+        # through five statuses; keeping one row per business instead of one
+        # per status bounds memory by what is in flight, not by how fast the
+        # run goes or how slow Supabase answers.
+        self._pending: dict[str, dict[str, dict[str, Any]]] = {}
+        self._cv = threading.Condition()
+        self._rush = False
+        self._stopping = False
+        self._writing = False
         self._run_id = ""
         self._thread = threading.Thread(
             target=self._writer_loop, name="supabase-sink", daemon=True
@@ -192,17 +198,27 @@ class SupabaseSink:
 
     FLUSH_TIMEOUT = 180.0
 
+    def pending_rows(self) -> int:
+        with self._cv:
+            return sum(len(rows) for rows in self._pending.values())
+
     def flush(self) -> None:
-        """Block until everything queued so far has been written - but never
+        """Block until everything buffered so far has been written - but never
         forever: a wedged network must not wedge the scrape."""
         deadline = time.monotonic() + self.FLUSH_TIMEOUT
-        while self._queue.unfinished_tasks and time.monotonic() < deadline:
-            if not self._thread.is_alive():
-                self._record_failure("writer thread stopped", self._queue.unfinished_tasks)
-                return
-            time.sleep(0.05)
-        if self._queue.unfinished_tasks:
-            self._record_failure("flush timed out", self._queue.unfinished_tasks)
+        with self._cv:
+            self._rush = True
+            self._cv.notify_all()
+            while (self._pending or self._writing) and time.monotonic() < deadline:
+                if not self._thread.is_alive():
+                    self._record_failure("writer thread stopped", self.pending_rows_locked())
+                    return
+                self._cv.wait(timeout=0.1)
+            if self._pending or self._writing:
+                self._record_failure("flush timed out", self.pending_rows_locked())
+
+    def pending_rows_locked(self) -> int:
+        return sum(len(rows) for rows in self._pending.values())
 
     def finish_run(self, run_id: str, stats: dict[str, Any]) -> None:
         self._enqueue("runs", [{
@@ -213,7 +229,9 @@ class SupabaseSink:
         self.flush()
 
     def close(self) -> None:
-        self._queue.put(SHUTDOWN)
+        with self._cv:
+            self._stopping = True
+            self._cv.notify_all()
         self._thread.join(timeout=30.0)
         if self._owns_client:
             self._client.close()
@@ -227,55 +245,48 @@ class SupabaseSink:
     # --- writer thread -----------------------------------------------------
     def _enqueue(self, table: str, rows: list[dict[str, Any]], raw_table: bool = False,
                  urgent: bool = False) -> None:
-        stamped = [{**row, "updated_at": _now()} for row in rows]
-        self._queue.put((("=" + table) if raw_table else table, stamped, urgent))
+        name = ("=" + table) if raw_table else table
+        key = "run_id" if table == "runs" else "id"
+        now = _now()
+        with self._cv:
+            bucket = self._pending.setdefault(name, {})
+            for row in rows:
+                ident = str(row.get(key) or "")
+                previous = bucket.get(ident)
+                merged = {**previous, **row} if previous else dict(row)
+                merged["updated_at"] = now
+                bucket[ident] = merged
+            self._rush = self._rush or urgent      # freshly queued businesses: show them now
+            self._cv.notify_all()
 
     def _writer_loop(self) -> None:
-        """Drain the queue, coalescing rows per table before each write.
-
-        Queue items are acknowledged only once their rows have actually been
-        written, so `flush()` (a queue join) genuinely means "persisted".
-        """
-        pending: dict[str, list[dict[str, Any]]] = {}
-        unacked = 0
-        last_flush = time.monotonic()
-        stopping = False
-        rush = False
-
+        """Write the buffered rows: at once when asked (urgent / flush / a full
+        batch), otherwise every FLUSH_INTERVAL seconds while anything waits."""
         while True:
-            try:
-                item = self._queue.get(timeout=QUEUE_TIMEOUT)
-            except queue.Empty:
-                item = None
-            else:
-                unacked += 1
-                if item is SHUTDOWN:
-                    stopping = True
-                else:
-                    table, rows, urgent = item
-                    pending.setdefault(table, []).extend(rows)
-                    rush = rush or urgent      # e.g. freshly queued businesses: show them now
-
-            batch_full = any(len(rows) >= BATCH_SIZE for rows in pending.values())
-            idle = item is None
-            aged = time.monotonic() - last_flush >= FLUSH_INTERVAL
-            due = stopping or batch_full or rush or (bool(pending) and (idle or aged))
-            if due:
-                rush = False
-
-            if due:
-                for table, rows in list(pending.items()):
-                    try:
-                        self._write(table, rows)
-                    except Exception as exc:  # noqa: BLE001 - the thread must outlive any bug
-                        self._record_failure(f"{type(exc).__name__}: {exc}", len(rows))
-                pending.clear()
-                last_flush = time.monotonic()
-                for _ in range(unacked):
-                    self._queue.task_done()
-                unacked = 0
+            with self._cv:
+                waited = 0.0
+                while not (self._stopping or self._rush or self._batch_full_locked()):
+                    if self._pending and waited >= FLUSH_INTERVAL:
+                        break
+                    self._cv.wait(timeout=QUEUE_TIMEOUT)
+                    waited += QUEUE_TIMEOUT
+                batch, self._pending = self._pending, {}
+                self._rush = False
+                stopping = self._stopping
+                self._writing = bool(batch)
+            for table, rows in batch.items():
+                try:
+                    self._write(table, list(rows.values()))
+                except Exception as exc:  # noqa: BLE001 - the thread must outlive any bug
+                    self._record_failure(f"{type(exc).__name__}: {exc}", len(rows))
+            with self._cv:
+                self._writing = False
+                self._cv.notify_all()
             if stopping:
                 return
+
+    def _batch_full_locked(self) -> bool:
+        return any(len(rows) >= BATCH_SIZE for rows in self._pending.values())
 
     def _write(self, table: str, rows: list[dict[str, Any]]) -> None:
         rows = _dedupe_by_id(rows)

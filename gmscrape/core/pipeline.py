@@ -206,6 +206,18 @@ class RunStopped(Exception):
 DEFERRED = "deferred_guess"      # planned in pass 1, checked in the guess pass
 
 
+def _memory_peak_mb() -> float:
+    """Peak resident memory of this process, in MB (0 when unknown)."""
+    try:
+        import resource
+        import sys as _sys
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / (1024 * 1024) if _sys.platform == "darwin" else peak / 1024
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 class AdaptiveGate:
     """A concurrency limit that shrinks on HTTP 429 and grows back on success.
 
@@ -625,6 +637,7 @@ class Pipeline:
             "check_gap": float(getattr(self.verifier, "current_interval", 0.0) or 0.0),
             "keys": int(getattr(self.verifier, "working_keys", 1) or 1),
             "search_slots": self._search_gate.limit,
+            "memory_mb": _memory_peak_mb(),
         }
 
     # --- pass 2: the guesses, most valuable first, while time allows ----------

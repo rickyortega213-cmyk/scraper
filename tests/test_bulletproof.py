@@ -147,7 +147,7 @@ def test_flush_gives_up_on_a_dead_writer(monkeypatch):
     sink = SupabaseSink(SupabaseConfig(url="https://x.supabase.co", key="k"),
                         client=type("C", (), {"post": lambda *a, **k: None, "close": lambda s: None})())
     sink.close()                                  # thread gone
-    sink._queue.put(("leads", [{"id": "x"}]))     # something left unacknowledged
+    sink._enqueue("leads", [{"id": "x"}])         # something left unwritten
     monkeypatch.setattr(SupabaseSink, "FLUSH_TIMEOUT", 1.0)
     started = time.monotonic()
     sink.flush()

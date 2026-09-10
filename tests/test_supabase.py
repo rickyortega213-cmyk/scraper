@@ -408,3 +408,18 @@ def test_publish_pushes_a_finished_run_after_the_fact(tmp_path, settings, site_s
     # defaults to the latest finished run when no id is given
     assert cli.main(["publish", "--db", settings.db_path]) == 0
     assert cli.main(["publish", "nope", "--db", settings.db_path]) == 2
+
+
+def test_writer_buffer_keeps_one_row_per_business_not_one_per_status(supabase):
+    """Five statuses per business must not become five rows waiting in memory
+    (or five round trips) when Supabase is slower than the run."""
+    sink = SupabaseSink(config_for(supabase))
+    result = _result()
+    for i in range(60):
+        sink.upsert([result], STATUS_QUEUED if i % 2 == 0 else STATUS_DONE)
+    assert sink.pending_rows() <= 3                   # leads + emails buckets, one row each at most
+    sink.flush()
+    sink.close()
+    leads = _PostgREST.tables["gmscrape_leads"]
+    assert len(leads) == 1 and next(iter(leads.values()))["status"] == STATUS_DONE
+    assert sink.stats.requests < 60

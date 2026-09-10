@@ -127,7 +127,7 @@ class Settings:
     http_concurrency: int = 256
     per_host_concurrency: int = 2
     http_retries: int = 1              # a dead host costs one retry, not a minute
-    http_max_bytes: int = 3_000_000
+    http_max_bytes: int = 1_000_000    # contact details live in the first megabyte; 256 sockets x 3 MB was a memory spike
     obey_robots: bool = True
     user_agent: str = DEFAULT_USER_AGENTS[0]
     rotate_user_agent: bool = True
