@@ -99,10 +99,13 @@ class SupabaseConfig:
     def headers(self) -> dict[str, str]:
         headers = {
             "apikey": self.key,
-            "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal",
         }
+        # Legacy service_role keys are JWTs and also go in Authorization; the
+        # newer sb_secret_... keys are accepted through apikey alone.
+        if self.key.count(".") == 2:
+            headers["Authorization"] = f"Bearer {self.key}"
         if self.schema and self.schema != "public":
             headers["Content-Profile"] = self.schema
             headers["Accept-Profile"] = self.schema
@@ -159,9 +162,19 @@ class SupabaseSink:
         if emails:
             self._enqueue("emails", emails)
 
+    FLUSH_TIMEOUT = 180.0
+
     def flush(self) -> None:
-        """Block until everything queued so far has been written."""
-        self._queue.join()
+        """Block until everything queued so far has been written - but never
+        forever: a wedged network must not wedge the scrape."""
+        deadline = time.monotonic() + self.FLUSH_TIMEOUT
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+            if not self._thread.is_alive():
+                self._record_failure("writer thread stopped", self._queue.unfinished_tasks)
+                return
+            time.sleep(0.05)
+        if self._queue.unfinished_tasks:
+            self._record_failure("flush timed out", self._queue.unfinished_tasks)
 
     def finish_run(self, run_id: str, stats: dict[str, Any]) -> None:
         self._enqueue("runs", [{
@@ -219,7 +232,10 @@ class SupabaseSink:
 
             if due:
                 for table, rows in list(pending.items()):
-                    self._write(table, rows)
+                    try:
+                        self._write(table, rows)
+                    except Exception as exc:  # noqa: BLE001 - the thread must outlive any bug
+                        self._record_failure(f"{type(exc).__name__}: {exc}", len(rows))
                 pending.clear()
                 last_flush = time.monotonic()
                 for _ in range(unacked):
@@ -449,6 +465,96 @@ def apply_schema(config: SupabaseConfig, sql: str) -> None:
         )
 
 
+EXEC_FUNCTION = "gmscrape_exec"
+
+
+def exec_function_sql() -> str:
+    """A tightly scoped SQL runner so the project API key can create run tables.
+
+    It only accepts statements that create/alter gmscrape_* or run_* objects,
+    and is callable only with the service/secret key (never anon)."""
+    return f"""
+create or replace function {EXEC_FUNCTION}(sql text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if sql !~* '^\\s*(create table if not exists|alter table|create index if not exists|create or replace view|create view)\\s+(public\\.)?(gmscrape_|run_)' then
+    raise exception '{EXEC_FUNCTION} only manages gmscrape_* and run_* objects';
+  end if;
+  execute sql;
+end $$;
+revoke all on function {EXEC_FUNCTION}(text) from public;
+revoke all on function {EXEC_FUNCTION}(text) from anon;
+revoke all on function {EXEC_FUNCTION}(text) from authenticated;
+"""
+
+
+def bootstrap_sql(prefix: str = "gmscrape_") -> str:
+    """The one-time paste: shared tables + the runner that makes later runs automatic."""
+    return schema_sql(prefix) + "\n-- Lets gmscrape create a table per run with just the project API key.\n" + exec_function_sql()
+
+
+def _statements(sql: str) -> list[str]:
+    """Split SQL on ';' outside of $$ bodies and comments."""
+    out: list[str] = []
+    buffer: list[str] = []
+    in_dollar = False
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        buffer.append(line)
+        if "$$" in line:
+            in_dollar = not in_dollar if line.count("$$") % 2 else in_dollar
+        if not in_dollar and stripped.endswith(";"):
+            out.append("\n".join(buffer).strip().rstrip(";"))
+            buffer = []
+    if buffer:
+        out.append("\n".join(buffer).strip().rstrip(";"))
+    return [st for st in out if st]
+
+
+def exec_via_rpc(config: SupabaseConfig, sql: str) -> None:
+    """Run DDL through the project's own API key using the installed runner."""
+    url = f"{config.rest_url}/rpc/{EXEC_FUNCTION}"
+    headers = {**config.headers(), "Prefer": "return=minimal"}
+    with httpx.Client(timeout=60.0) as client:
+        for statement in _statements(sql):
+            if statement.lower().startswith(("revoke", "create or replace function")):
+                continue          # only the bootstrap paste may touch the runner itself
+            response = client.post(url, json={"sql": statement}, headers=headers)
+            if response.status_code == 404 or "PGRST202" in response.text:
+                raise SupabaseError("runner_missing")
+            if response.status_code >= 400:
+                raise SupabaseError(
+                    f"{EXEC_FUNCTION} refused a statement (HTTP {response.status_code}): "
+                    f"{response.text[:200]}"
+                )
+
+
+def runner_installed(config: SupabaseConfig) -> bool:
+    """Whether the bootstrap paste has been applied."""
+    try:
+        exec_via_rpc(config, "create table if not exists gmscrape__probe (id int)")
+    except SupabaseError as exc:
+        return str(exc) != "runner_missing"
+    return True
+
+
+def run_ddl(config: SupabaseConfig, sql: str) -> str:
+    """Create things by whatever route is available. Returns the route used."""
+    if config.key:
+        try:
+            exec_via_rpc(config, sql)
+            return "project key"
+        except SupabaseError as exc:
+            if str(exc) != "runner_missing":
+                raise
+    if config.access_token:
+        apply_schema(config, sql)
+        return "access token"
+    raise SupabaseError("bootstrap_needed")
+
+
 def ensure_schema(config: SupabaseConfig, run_table: str = "") -> tuple[bool, str]:
     """Make sure the tables exist. Returns (ready, what_happened).
 
@@ -459,22 +565,29 @@ def ensure_schema(config: SupabaseConfig, run_table: str = "") -> tuple[bool, st
     missing = missing_tables(config)
     if not missing and not run_table:
         return True, "tables present"
-    if config.access_token:
-        sql = schema_sql(config.prefix) if missing else ""
-        if run_table:
-            sql += run_table_sql(run_table)
-        apply_schema(config, sql)
-        still = missing_tables(config)
-        if still:
-            raise SupabaseError(f"schema applied but tables still missing: {', '.join(still)}")
-        done = []
-        if missing:
-            done.append(f"created {', '.join(missing)}")
-        if run_table:
-            done.append(f"created {run_table}")
-        return True, "; ".join(done) or "tables present"
-    if not missing:
-        return True, "tables present (no access token, so no per-run table)"
+    sql = (schema_sql(config.prefix) if missing else "") + (run_table_sql(run_table) if run_table else "")
+    try:
+        route = run_ddl(config, sql)
+    except SupabaseError as exc:
+        if str(exc) != "bootstrap_needed":
+            raise
+        if not missing:
+            return True, "tables present (paste `gmscrape supabase-init` once to get a table per run)"
+        return False, (
+            f"tables missing: {', '.join(missing)}. One-time setup: run "
+            "`gmscrape supabase-init` and paste the SQL into "
+            f"{config.sql_editor_url or 'the Supabase SQL editor'}, then every run "
+            "creates its own table automatically."
+        )
+    still = missing_tables(config)
+    if still:
+        raise SupabaseError(f"schema applied but tables still missing: {', '.join(still)}")
+    done = []
+    if missing:
+        done.append(f"created {', '.join(missing)}")
+    if run_table:
+        done.append(f"created {run_table}")
+    return True, ("; ".join(done) + f" (via {route})") if done else "tables present"
     return False, (
         f"tables missing: {', '.join(missing)}. Either save a Supabase access token "
         "(`gmscrape setup --only supabase`; make one at "

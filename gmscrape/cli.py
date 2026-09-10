@@ -796,7 +796,7 @@ def build_sinks(settings: Settings, queries: Sequence[str] = ()) -> list:
     try:
         config = supabase_config(settings)
         run_table = ""
-        if settings.supabase_run_tables and config.access_token:
+        if settings.supabase_run_tables and (config.access_token or config.key):
             run_table = (run_table_name(settings.supabase_table_name)
                          if settings.supabase_table_name
                          else run_table_name(run_label(list(queries))))
@@ -817,19 +817,18 @@ def build_sinks(settings: Settings, queries: Sequence[str] = ()) -> list:
 
 
 def cmd_supabase_init(args: argparse.Namespace) -> int:
-    from .store.supabase import schema_sql
+    from .store.supabase import bootstrap_sql
 
     settings = settings_from_args(args)
-    sql = schema_sql(settings.supabase_prefix)
+    sql = bootstrap_sql(settings.supabase_prefix)
     if args.write:
         path = Path(args.write)
         path.write_text(sql, encoding="utf-8")
         echo(f"[bold]Wrote[/bold] [green]{path}[/green]")
-        echo("Next:")
+        echo("Next (one time):")
         echo("  1. open your Supabase project → SQL Editor → paste the file → Run")
-        echo("  2. put SUPABASE_URL and SUPABASE_KEY (service_role) in .env")
-        echo("  3. [cyan]gmscrape supabase-check[/cyan]")
-        echo('  4. [cyan]gmscrape run "dentist in austin tx" -n 5 --supabase[/cyan]')
+        echo("  2. [cyan]gmscrape supabase-check[/cyan]")
+        echo("After that every run creates its own table with just the project API key.")
     else:
         print(sql)
     return 0
@@ -840,8 +839,8 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
 
     settings = settings_from_args(args)
     if not settings.supabase_configured:
-        echo("[red]No Supabase access token saved.[/red] Run `gmscrape setup --only supabase` "
-             "and paste the sbp_... token from https://supabase.com/dashboard/account/tokens")
+        echo("[red]No Supabase credentials saved.[/red] Run `gmscrape setup --only supabase` "
+             "and paste the project URL and project API key from Project Settings → API")
         return 2
     from .store.supabase import ensure_schema
 
@@ -860,7 +859,16 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
     _print_table("Supabase", ("table", "status"), list(tables.items()))
     if detail != "tables present":
         echo(f"[green]{detail}[/green]")
-    echo(f"[green]✓[/green] ready — every run now streams into "
+    from .store.supabase import runner_installed
+
+    if config.key and runner_installed(config):
+        echo("[green]✓[/green] per-run tables: on (runner installed)")
+    elif config.access_token:
+        echo("[green]✓[/green] per-run tables: on (via access token)")
+    else:
+        echo("[yellow]per-run tables: off[/yellow] - paste `gmscrape supabase-init` once "
+             f"into {config.sql_editor_url or 'the SQL editor'} to turn them on")
+    echo(f"[green]✓[/green] ready — every run streams into "
          f"[bold]{config.table('table')}[/bold]  ({config.table_editor_url or settings.supabase_url})")
     return 0
 

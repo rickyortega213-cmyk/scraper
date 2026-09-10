@@ -11,6 +11,7 @@ import json
 import sqlite3
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -164,6 +165,8 @@ class Store:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
 
     # --- page cache --------------------------------------------------------
+    MAX_PAGE_BYTES = 400_000
+
     def get_page(self, url: str, ttl_hours: int) -> Optional[tuple[int, str, str]]:
         with self._lock:
             cutoff = time.time() - max(0, ttl_hours) * 3600
@@ -173,17 +176,39 @@ class Store:
             ).fetchone()
             if row is None:
                 return None
-            return int(row["status"] or 0), str(row["final_url"] or ""), str(row["html"] or "")
+            body = row["html"]
+            if isinstance(body, bytes):
+                try:
+                    body = zlib.decompress(body).decode("utf-8", errors="replace")
+                except zlib.error:
+                    return None
+            return int(row["status"] or 0), str(row["final_url"] or ""), str(body or "")
 
     def put_page(self, url: str, status: int, final_url: str, html: str) -> None:
+        """Cache a page, compressed and capped - thousands of sites must not
+        turn the database into gigabytes."""
+        payload = zlib.compress((html or "")[: self.MAX_PAGE_BYTES].encode("utf-8"), 6)
         with self._lock:
             self.conn.execute(
                 "INSERT INTO pages(url, final_url, status, html, fetched_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(url) DO UPDATE SET final_url=excluded.final_url, "
                 "status=excluded.status, html=excluded.html, fetched_at=excluded.fetched_at",
-                (url, final_url, status, html, time.time()),
+                (url, final_url, status, payload, time.time()),
             )
             self.conn.commit()
+
+    def prune(self, page_ttl_hours: int = 168, search_ttl_hours: int = 720) -> int:
+        """Drop expired cache rows; returns how many went."""
+        with self._lock:
+            now = time.time()
+            removed = self.conn.execute(
+                "DELETE FROM pages WHERE fetched_at < ?", (now - page_ttl_hours * 3600,)
+            ).rowcount
+            removed += self.conn.execute(
+                "DELETE FROM web_searches WHERE fetched_at < ?", (now - search_ttl_hours * 3600,)
+            ).rowcount
+            self.conn.commit()
+            return int(removed or 0)
 
     # --- verification cache ------------------------------------------------
     def get_verification(self, email: str, ttl_hours: int = 720) -> Optional[VerificationResult]:

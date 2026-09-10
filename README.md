@@ -386,23 +386,29 @@ keeps them but skips the person lookup.
 
 ## Live lead table in Supabase
 
-One credential, and every run gets its own table.
+Two values from your project, one paste, then every run gets its own table.
 
 ```bash
-scraper buddy        # paste your Supabase access token at the Supabase question
+scraper buddy        # paste the project URL and project API key at the Supabase questions
 ```
 
-The token (`sbp_…`, from supabase.com/dashboard/account/tokens) is all it
-needs: the project, its URL and its service key are looked up from the token
-and remembered. If the token can see several projects, it asks which
-(`SUPABASE_PROJECT_REF`).
+Both come from **Project Settings → API**: the Project URL and the **secret /
+service_role** key (never the anon one). The first run prints a one-time SQL
+snippet — `gmscrape supabase-init` — to paste into the SQL editor. It creates
+the shared tables and installs a small, tightly scoped runner
+(`gmscrape_exec`) that may only create or alter `gmscrape_*` / `run_*` objects
+and is callable only with your project key. After that, **every run creates
+its own table with nothing but the project key**:
 
-Each run creates a fresh table named after the search and the date —
-`run_2026_09_10_dentist_in_austin_tx` — with exactly the clean columns
-(`company_name`, `city`, `state`, `address`, `phone_number`, `verified_email`,
-`contact_first_name`, `contact_last_name`, `contact_title`, `business_type`,
-…) plus a `status` that advances live: `queued → crawled → guessed → verified
-→ done`. Open it in the Table Editor and watch it fill in. The run ends with:
+```
+run_2026_09_10_dentist_in_austin_tx
+```
+
+with exactly the clean columns (`company_name`, `city`, `state`, `address`,
+`phone_number`, `verified_email`, `contact_first_name`, `contact_last_name`,
+`contact_title`, `business_type`, …) plus a `status` that advances live:
+`queued → crawled → guessed → verified → done`. Buddy asks what to name it;
+Enter keeps the default. The run ends with:
 
 ```
 Live table:
@@ -412,11 +418,10 @@ Live table:
 ```
 
 The shared `gmscrape_table` keeps every run together (re-running a query
-updates rows there instead of duplicating them), so you have both: a table per
-run and a running database of your market. Writes happen on a background
-thread and can never fail a scrape — errors are counted and reported.
-`--no-supabase` skips it for one run; `SUPABASE_RUN_TABLES=false` keeps only
-the shared tables.
+updates rows there instead of duplicating them). An account access token
+(`sbp_…`) still works as an alternative and skips the paste. Writes happen on
+a background thread that cannot fail or wedge a scrape — errors are counted,
+reported, and time-limited. `--no-supabase` skips it for one run.
 
 ## Output
 
@@ -482,6 +487,24 @@ Useful flags on `run`:
 --no-supabase          skip the live table for this run
 ```
 
+## Volume
+
+150–200 searches at a time (6,000–8,000 businesses) is the design point.
+Everything external runs concurrently and independently: Maps queries six at a
+time, crawls 24 at a time (two per host), web searches 10, verifications 8,
+DNS lookups for a whole batch at once. Every call retries transient failures
+with backoff (429s honour `Retry-After`), and one bad site, search, query or
+verification never ends the run. Nothing about the concurrency changes what
+counts as a lead — the same evidence rules apply at any speed; the only thing
+you trade off is how quickly the providers answer.
+
+Things that are deliberately *not* remembered, because remembering them would
+be wrong: a verification that errored (it is retried next time, not cached as
+"unknown"), a DNS timeout (never stored as "no MX"), a partial Maps result.
+Fetched pages are cached compressed and capped at 400 KB each, and expired
+cache rows are pruned at the start of every run, so a big database stays in
+the hundreds of megabytes rather than gigabytes.
+
 ## If something breaks mid-run
 
 Nothing you've paid for is ever bought twice, and nothing finished is lost:
@@ -536,7 +559,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 195 tests, no network or API keys needed
+make test     # 205 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

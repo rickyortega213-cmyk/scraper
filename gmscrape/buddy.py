@@ -52,8 +52,10 @@ BUDDY_KEYS: tuple[BuddyKey, ...] = (
     BuddyKey("MailTester Ninja (email verification)", "MAILTESTER_KEY", "confirms emails are real"),
     BuddyKey("OpenWeb Ninja (web search)", "OPENWEBNINJA_KEY",
              "finds missing websites and owners", optional=True),
-    BuddyKey("Supabase access token (live table, sbp_...)", "SUPABASE_ACCESS_TOKEN",
-             "a new table in Supabase for every run", optional=True),
+    BuddyKey("Supabase project URL (live table)", "SUPABASE_URL",
+             "https://<project>.supabase.co", optional=True, secret=False),
+    BuddyKey("Supabase project API key (live table)", "SUPABASE_KEY",
+             "the secret / service_role key, never anon", optional=True),
 )
 
 
@@ -206,7 +208,7 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         limit = 40
 
     extra: list[str] = []
-    if os.getenv("SUPABASE_ACCESS_TOKEN"):
+    if os.getenv("SUPABASE_ACCESS_TOKEN") or (os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY")):
         from .store.supabase import run_label, run_table_name
 
         default = run_table_name(run_label(queries))

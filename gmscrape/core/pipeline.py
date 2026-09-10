@@ -64,7 +64,7 @@ from ..store.sinks import (
     NullSink,
 )
 from ..data.domains import FREE_MAIL_DOMAINS
-from ..util import city_from_address, domain_has_mx, hostname, registered_domain
+from ..util import city_from_address, hostname, mx_lookup, prefetch_mx, registered_domain
 from ..web.crawl import scrape_site
 from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
@@ -202,6 +202,10 @@ class Pipeline:
             search_provider=self.web_search.name if self.web_search else "none",
         )
         self.store.start_run(report.run_id, report.queries, asdict(self.settings))
+        try:
+            self.store.prune(self.settings.cache_ttl_hours, self.settings.search_cache_ttl_hours)
+        except Exception as exc:  # noqa: BLE001 - housekeeping must never block a run
+            log.debug("cache prune skipped: %s", exc)
         self._sink_call("start_run", report.run_id, {
             "queries": report.queries,
             "maps_provider": report.maps_provider,
@@ -729,8 +733,11 @@ class Pipeline:
         cached = self.store.get_domain_facts(domain)
         has_mx = cached[0] if cached else None
         if has_mx is None:
-            has_mx = domain_has_mx(domain)
-            self.store.put_domain_facts(domain, has_mx=has_mx)
+            lookup = mx_lookup(domain)
+            has_mx = bool(lookup)
+            if lookup is not None:
+                # Only a definite DNS answer is remembered; a timeout is retried next time.
+                self.store.put_domain_facts(domain, has_mx=has_mx)
         result.domain_has_mx = has_mx
         if cached and cached[1] is not None:
             result.domain_is_catch_all = cached[1]
@@ -743,6 +750,12 @@ class Pipeline:
                     result.permutations_skipped_reason = "permutations_disabled"
             return
 
+        # DNS is pure latency: look every domain up at once instead of one by one.
+        prefetch_mx(
+            result.place.domain or registered_domain(result.place.website)
+            for result in results
+            if not self.store.get_domain_facts(result.place.domain or registered_domain(result.place.website) or "")
+        )
         for result in results:
             domain = result.place.domain or registered_domain(result.place.website)
             known = [c.email for c in result.emails]
@@ -928,7 +941,8 @@ class Pipeline:
             return VerificationResult(
                 status="unknown", provider=self.verifier.name, error=str(exc)
             )
-        self.store.put_verification(email, result)
+        if not result.error:
+            self.store.put_verification(email, result)
         if result.mx_found is not None:
             self.store.put_domain_facts(email.split("@")[-1], has_mx=result.mx_found)
         return result

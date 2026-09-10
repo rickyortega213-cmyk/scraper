@@ -58,8 +58,31 @@ class MCPClient:
             headers["Mcp-Session-Id"] = self._session_id
         return headers
 
+    RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}
+
     def _post(self, payload: dict[str, Any], *, expect_result: bool = True) -> Any:
-        response = self._client.post(self.url, json=payload, headers=self._headers())
+        import random
+        import time
+
+        last_error: Optional[Exception] = None
+        response = None
+        for attempt in range(4):
+            try:
+                response = self._client.post(self.url, json=payload, headers=self._headers())
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last_error = exc
+                response = None
+            if response is not None and response.status_code not in self.RETRY_STATUS:
+                break
+            if attempt < 3:
+                retry_after = response.headers.get("Retry-After") if response is not None else None
+                try:
+                    delay = min(30.0, float(retry_after)) if retry_after else 1.5 * (2 ** attempt)
+                except ValueError:
+                    delay = 1.5 * (2 ** attempt)
+                time.sleep(delay + random.uniform(0, 0.4))
+        if response is None:
+            raise MCPError(f"MCP server unreachable: {last_error}")
         session = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
         if session:
             self._session_id = session

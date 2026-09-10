@@ -96,7 +96,7 @@ class Settings:
     discover_websites: bool = True      # search for a site when Maps has none
     find_owners: bool = True            # look for the owner on the website
     owner_search: bool = True           # ...and via web search when the site is silent
-    web_search_concurrency: int = 8
+    web_search_concurrency: int = 10
     search_cache_ttl_hours: int = 720
     website_min_confidence: int = 60    # accept a discovered site at/above this
     owner_min_confidence: int = 60      # guess owner addresses at/above this
@@ -111,7 +111,7 @@ class Settings:
     language: str = "en"
     country: str = "us"
     maps_max_pages: int = 5
-    maps_concurrency: int = 4          # queries fetched in parallel
+    maps_concurrency: int = 6          # queries fetched in parallel
     maps_cache_ttl_hours: int = 168    # a crash never re-buys the same search
     batch_size: int = 100              # businesses per checkpoint
 
@@ -119,7 +119,7 @@ class Settings:
     crawl_websites: bool = True
     max_pages_per_site: int = 6
     http_timeout: float = 20.0
-    http_concurrency: int = 16
+    http_concurrency: int = 24
     per_host_concurrency: int = 2
     http_retries: int = 2
     http_max_bytes: int = 3_000_000
@@ -143,7 +143,7 @@ class Settings:
     verify_emails: bool = True
     verify_found: bool = True
     verify_permutations: bool = True
-    verify_concurrency: int = 6
+    verify_concurrency: int = 8
     verify_budget: int = 0            # 0 = unlimited API calls for the run
     keep_risky: bool = True
     keep_invalid: bool = False
@@ -171,6 +171,7 @@ class Settings:
     out_dir: str = "out"
     cache_http: bool = True
     cache_ttl_hours: int = 168
+    cache_max_page_bytes: int = 400_000   # stored per page (compressed); the crawl still reads up to http_max_bytes
     export_formats: tuple[str, ...] = ("csv", "json")
     min_confidence: int = 0
     log_level: str = "INFO"

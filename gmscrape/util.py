@@ -161,36 +161,64 @@ def trim_context(text: str, index: int, width: int = 60) -> str:
     return squeeze(text[start:end])
 
 
-@functools.lru_cache(maxsize=4096)
-def mx_hosts(domain: str) -> tuple[str, ...]:
-    """MX hostnames for a domain (falls back to A/AAAA per RFC 5321)."""
+@functools.lru_cache(maxsize=16384)
+def mx_lookup(domain: str) -> Optional[tuple[str, ...]]:
+    """MX hostnames for a domain (A/AAAA fallback per RFC 5321).
+
+    Returns () when DNS says the domain cannot receive mail, and None when
+    DNS could not answer (timeout, server failure) - which is not the same
+    thing, and must never be cached as "no MX".
+    """
     if not domain:
         return ()
     try:
         import dns.resolver  # imported lazily so DNS stays optional
+        from dns.exception import Timeout
     except ImportError:  # pragma: no cover
-        return ()
+        return None
     resolver = dns.resolver.Resolver()
-    resolver.lifetime = 5.0
-    resolver.timeout = 5.0
+    resolver.lifetime = 4.0
+    resolver.timeout = 2.0
+    indeterminate = False
     try:
         answers = resolver.resolve(domain, "MX")
         hosts = tuple(str(r.exchange).rstrip(".").lower() for r in answers if str(r.exchange) != ".")
         if hosts:
             return hosts
-    except Exception:
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
         pass
+    except Timeout:
+        indeterminate = True
+    except Exception:
+        indeterminate = True
     for rtype in ("A", "AAAA"):
         try:
             resolver.resolve(domain, rtype)
             return (domain,)
-        except Exception:
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
             continue
-    return ()
+        except Exception:
+            indeterminate = True
+    return None if indeterminate else ()
+
+
+def mx_hosts(domain: str) -> tuple[str, ...]:
+    return mx_lookup(domain) or ()
 
 
 def domain_has_mx(domain: str) -> bool:
-    return bool(mx_hosts(domain))
+    return bool(mx_lookup(domain))
+
+
+def prefetch_mx(domains: Iterable[str], workers: int = 16) -> None:
+    """Warm the MX cache for many domains at once (DNS is latency-bound)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    unique = [d for d in dedupe_preserving_order(d for d in domains if d)]
+    if not unique:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(unique)))) as pool:
+        list(pool.map(mx_lookup, unique))
 
 
 def strip_edge_punct(token: str) -> str:
