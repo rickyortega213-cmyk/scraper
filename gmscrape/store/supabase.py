@@ -485,8 +485,11 @@ _RUN_ROW_KEYS = (
 def _run_row(record: dict[str, Any]) -> dict[str, Any]:
     """Project a leads record onto the per-run table's clean columns."""
     row = {key: record.get(key) for key in _RUN_ROW_KEYS}
+    from ..format import smart_title
+
     row.update({
         "id": record["id"],
+        "contact_type": smart_title(str(record.get("contact_type") or "")),
         "city": record.get("city_clean"),
         "state": record.get("state_clean"),
         "address": record.get("address_clean"),
