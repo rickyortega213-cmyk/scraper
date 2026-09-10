@@ -1,5 +1,7 @@
 """Command line interface.
 
+    gmscrape setup                      # save / change your API keys (first run does this)
+    gmscrape keys                       # show what is configured, masked
     gmscrape run "dentist in austin tx" "plumber in miami fl"
     gmscrape run -f queries.txt --limit 60 --format all
     gmscrape enrich --places-file leads.csv
@@ -93,6 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--verify-provider", choices=["auto", *list_verify_providers()],
                      dest="verify_provider")
     run.add_argument("--places-file", help="for --maps-provider file")
+    run.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
+                     default=None, help="start without the key check (for scripts / cron)")
     run.add_argument("-o", "--out-dir", dest="out_dir", help="export directory (default out/)")
     run.add_argument("--basename", default="leads", help="export file basename")
     run.add_argument("--format", dest="export_formats",
@@ -170,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     enrich.add_argument("--places-file", required=True, help="JSON/JSONL/CSV of places")
+    enrich.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
+                        default=None, help="start without the key check")
     enrich.add_argument("-o", "--out-dir", dest="out_dir")
     enrich.add_argument("--basename", default="enriched")
     enrich.add_argument("--format", dest="export_formats")
@@ -249,6 +255,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("supabase-check", parents=[common],
                    help="verify the Supabase URL, key and tables")
 
+    # --- keys ------------------------------------------------------------
+    setup_cmd = sub.add_parser("setup", parents=[common],
+                               help="save or change your API keys (interactive)")
+    setup_cmd.add_argument("--only", choices=["maps", "verify", "search", "supabase"],
+                           help="only walk through one group")
+    sub.add_parser("keys", parents=[common], help="show which keys are saved (masked)")
+
     # --- misc ------------------------------------------------------------
     sub.add_parser("providers", help="list providers and show which are configured",
                    parents=[common])
@@ -268,7 +281,7 @@ SETTINGS_KEYS = {
     "chain_mode", "permutations_for_chains", "db_path", "log_level",
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
-    "chain_people", "chain_person_guesses", "chain_crawl_pages",
+    "chain_people", "chain_person_guesses", "chain_crawl_pages", "confirm_keys_on_start",
 }
 
 
@@ -296,6 +309,80 @@ def configure_logging(level: str) -> None:
 
 
 # --- commands --------------------------------------------------------------
+def cmd_setup(args: argparse.Namespace) -> int:
+    from .keys import run_setup
+
+    settings_from_args(args)             # loads .env + saved keys so current values show
+    groups = (args.only,) if getattr(args, "only", None) else ("maps", "verify", "search", "supabase")
+    run_setup(echo=lambda m: echo(m), groups=groups)
+    _print_key_status(settings_from_args(args))
+    return 0
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    from .keys import KEY_FIELDS, current_values, mask, user_config_path
+
+    settings = settings_from_args(args)
+    values = current_values()
+    _print_table(
+        f"Keys (saved in {user_config_path()})",
+        ("key", "value", "used for"),
+        [
+            (f.env, (mask(values[f.env]) if f.secret else values[f.env] or "(not set)"), f.group)
+            for f in KEY_FIELDS if values[f.env]
+        ] or [("(none)", "", "run `gmscrape setup`")],
+    )
+    _print_key_status(settings)
+    return 0
+
+
+def _print_key_status(settings: Settings) -> None:
+    from .keys import key_status
+
+    status = key_status(settings)
+    colour = lambda v, bad: f"[red]{v}[/red]" if v == bad else f"[green]{v}[/green]"  # noqa: E731
+    echo(
+        f"maps: {colour(status.maps, 'none')}   verification: {colour(status.verify, 'local')}"
+        f"   web search: {colour(status.search, 'off')}   supabase: {status.supabase}"
+    )
+
+
+def _startup_key_check(settings: Settings, args: argparse.Namespace) -> Optional[Settings]:
+    """Show the keys a run will use; offer to change them. Returns the settings
+    to run with, or None if the user backed out."""
+    from .keys import interactive, key_status, run_setup
+
+    status = key_status(settings)
+    if not status.any_configured:
+        if not interactive():
+            echo("[red]No Google Maps provider configured.[/red] Run `gmscrape setup` "
+                 "or set a key in .env")
+            return None
+        echo("[yellow]No API keys saved yet - let's set them up.[/yellow]")
+        run_setup(echo=lambda m: echo(m))
+        settings = settings_from_args(args)
+        if not key_status(settings).any_configured:
+            echo("[red]Still no Google Maps provider - cannot run.[/red]")
+            return None
+        return settings
+
+    _print_key_status(settings)
+    if not settings.confirm_keys_on_start or not interactive():
+        return settings
+    try:
+        answer = input("Press Enter to start, or type k to change keys: ").strip().lower()
+    except EOFError:
+        return settings
+    if answer in ("k", "keys", "c", "change", "setup"):
+        run_setup(echo=lambda m: echo(m))
+        settings = settings_from_args(args)
+        _print_key_status(settings)
+    elif answer in ("q", "quit", "n", "no"):
+        echo("cancelled")
+        return None
+    return settings
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     queries: list[str] = list(args.queries or [])
@@ -310,6 +397,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     echo(f"[bold]{len(specs)}[/bold] quer{'y' if len(specs) == 1 else 'ies'} to run:")
     for spec in specs:
         echo(f"  • [cyan]{spec.business_type}[/cyan] in [magenta]{spec.location or 'anywhere'}[/magenta]")
+
+    checked = _startup_key_check(settings, args)
+    if checked is None:
+        return 2
+    settings = checked
 
     try:
         pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
@@ -335,6 +427,8 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     settings.maps_provider = "file"
     settings.places_file = args.places_file
+    if settings.confirm_keys_on_start:
+        _print_key_status(settings)
     try:
         pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
     except ProviderError as exc:
@@ -834,6 +928,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "extract": cmd_extract,
         "guess": cmd_guess,
         "probe-maps": cmd_probe_maps,
+        "setup": cmd_setup,
+        "keys": cmd_keys,
         "search": cmd_search,
         "owner": cmd_owner,
         "supabase-init": cmd_supabase_init,

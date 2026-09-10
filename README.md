@@ -34,13 +34,25 @@ publishes none, and verifies everything before it lands in your CSV.
 
 ```bash
 make dev                      # venv + install + dev deps
-cp .env.example .env          # add your API keys
-gmscrape providers            # what's configured?
-gmscrape doctor               # config + connectivity check
-
+gmscrape setup                # paste your API keys once - they're saved
 gmscrape run "dentist in austin tx" "plumber in miami fl"
 gmscrape run -f examples/queries.txt --limit 60 --format all
 ```
+
+Keys are saved to `~/.config/gmscrape/config.env` (owner-only permissions), so
+they work from any folder and survive a fresh clone. The first `run` with no
+keys opens the setup wizard by itself. Every run starts by showing what it's
+about to use:
+
+```
+maps: scraperapi   verification: mailtester   web search: openwebninja   supabase: off
+Press Enter to start, or type k to change keys:
+```
+
+`k` opens the wizard (Enter keeps a value, typing replaces it, `-` clears it);
+`gmscrape keys` shows them masked; `-y` skips the check for scripts and cron.
+A project `.env` still works and takes precedence over saved keys, and real
+environment variables beat both.
 
 ## Plugging in your APIs
 
@@ -470,7 +482,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 125 tests, no network or API keys needed
+make test     # 136 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

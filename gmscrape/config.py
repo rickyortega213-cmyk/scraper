@@ -46,16 +46,19 @@ def _env_float(key: str, default: float) -> float:
 
 
 def load_env(env_file: Optional[str] = None) -> None:
-    """Load .env once, before Settings is built."""
-    if load_dotenv is None:
-        return
-    if env_file:
-        load_dotenv(env_file, override=False)
-        return
-    for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"):
-        if candidate.exists():
-            load_dotenv(candidate, override=False)
-            return
+    """Load configuration sources, lowest priority last.
+
+    Real environment variables always win, then a project .env, then the keys
+    saved by `gmscrape setup` (~/.config/gmscrape/config.env).
+    """
+    if load_dotenv is not None:
+        if env_file:
+            load_dotenv(env_file, override=False)
+        elif (Path.cwd() / ".env").exists():
+            load_dotenv(Path.cwd() / ".env", override=False)
+    from .keys import load_saved_keys_into_env   # local import: keys imports Settings
+
+    load_saved_keys_into_env()
 
 
 @dataclass
@@ -161,6 +164,7 @@ class Settings:
     export_formats: tuple[str, ...] = ("csv", "json")
     min_confidence: int = 0
     log_level: str = "INFO"
+    confirm_keys_on_start: bool = True   # show keys before a run and offer to change them
 
     extra: dict[str, Any] = field(default_factory=dict)
 
