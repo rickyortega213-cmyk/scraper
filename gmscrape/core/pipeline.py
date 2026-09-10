@@ -348,6 +348,7 @@ class Pipeline:
         report.finished_at = time.time()
         stats = report.stats()
         self.store.finish_run(report.run_id, stats)
+        self._sink_call("flush")
         self._sink_call("finish_run", report.run_id, stats)
         self.progress("run_finished", {"stats": stats})
         return report
@@ -359,10 +360,19 @@ class Pipeline:
         businesses. The last batch of a chunk carries the chunk so the caller
         can mark its searches done once that batch is finished."""
         businesses_per_query: list[int] = []
-        for offset in range(0, len(pending_specs), chunk_size):
-            chunk = pending_specs[offset: offset + chunk_size]
-            found_per_query: dict[str, int] = {}
-            places = self._collect_places(chunk, report, found_per_query)
+        chunks = [pending_specs[o: o + chunk_size] for o in range(0, len(pending_specs), chunk_size)]
+
+        def fetch(chunk: list[QuerySpec]) -> tuple[list[Place], dict[str, int]]:
+            counts: dict[str, int] = {}
+            return self._collect_places(chunk, report, counts), counts
+
+        # Maps for the next chunk are fetched while this chunk is being crawled.
+        maps_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gmscrape-maps")
+        ahead = maps_pool.submit(fetch, chunks[0]) if chunks else None
+        for index, chunk in enumerate(chunks):
+            offset = index * chunk_size
+            places, found_per_query = ahead.result()  # type: ignore[union-attr]
+            ahead = maps_pool.submit(fetch, chunks[index + 1]) if index + 1 < len(chunks) else None
             fresh = [p for p in places if p.dedupe_key() not in seen_keys]
             seen_keys.update(p.dedupe_key() for p in fresh)
             results = self._classify(fresh)
@@ -372,12 +382,14 @@ class Pipeline:
             self._outstanding += len(results)
             report.total = report.done + self._outstanding + int(avg * remaining_queries)
             if results:
+                # Rows appear in the live table within seconds via the writer
+                # thread; waiting for them here would stall the crawl.
                 self._publish(results, STATUS_QUEUED)
-                self._sink_call("flush")
             batches = [results[b: b + batch_size] for b in range(0, len(results), batch_size)] or [[]]
-            for index, batch in enumerate(batches):
-                last = index == len(batches) - 1
+            for b_index, batch in enumerate(batches):
+                last = b_index == len(batches) - 1
                 yield _Work(batch, (chunk, found_per_query) if last else None)
+        maps_pool.shutdown(wait=False)
 
     def _prepared(self, items, ahead: int):
         """Yield work with its crawl/guess stage done. With `ahead` > 0 that
@@ -468,7 +480,7 @@ class Pipeline:
                     ):
                         candidate.lead_eligible = False
                         candidate.notes.append("not_lead_eligible:unverified_guess")
-            self.store.save_business(result, report.run_id, stage="done")
+        self.store.save_businesses(batch, report.run_id, stage="done")
         self._publish(batch, STATUS_DONE)
 
     def _publish(self, results: Sequence[BusinessResult], status: str) -> None:
@@ -992,11 +1004,20 @@ class Pipeline:
         # would otherwise cost twenty metered calls for one lead.
         if self.settings.verify_found:
             cap = self.settings.verify_found_max if paid else 0
-            unique: dict[str, list[EmailCandidate]] = {}
-            for result in results:
-                for candidate in self._found_worth_verifying(result, cap):
-                    unique.setdefault(candidate.email, []).append(candidate)
-            self._verify_batch(list(unique.keys()), unique)
+            if paid:
+                # Metered: walk each business's found addresses best-first and
+                # stop at the first deliverable one per contact type.
+                pending = [r for r in results if any(not c.is_low_value for c in r.found_emails)]
+                if pending:
+                    workers = max(1, self.settings.verify_concurrency)
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        list(pool.map(lambda r: self._verify_found_for(r, cap), pending))
+            else:
+                unique: dict[str, list[EmailCandidate]] = {}
+                for result in results:
+                    for candidate in self._found_worth_verifying(result, cap):
+                        unique.setdefault(candidate.email, []).append(candidate)
+                self._verify_batch(list(unique.keys()), unique)
 
         if not self.settings.verify_permutations:
             return
@@ -1029,8 +1050,11 @@ class Pipeline:
             return worth
 
         def rank(c: EmailCandidate) -> tuple:
+            # A company-domain address (this business's, or any non-free-mail
+            # domain when Maps gave us no domain to compare with) beats a
+            # gmail/hotmail one; then provenance; then the shorter mailbox.
             return (
-                0 if c.on_business_domain else 1 if c.is_personal_domain else 2,
+                0 if (c.on_business_domain or not c.is_personal_domain) else 1,
                 -SOURCE_WEIGHT.get(c.source, 0),
                 len(c.email),
             )
@@ -1043,6 +1067,26 @@ class Pipeline:
                 extra.lead_eligible = False
                 extra.notes.append("not_verified:over_cap")
         return chosen
+
+    def _verify_found_for(self, result: BusinessResult, cap: int) -> None:
+        """Found addresses, one contact type at a time, best first; the first
+        one the verifier accepts ends the walk. The rest stay in the emails
+        export flagged, never as a lead - a lead is always a checked address."""
+        chosen = self._found_worth_verifying(result, cap)
+        for pool in ([c for c in chosen if c.is_owner], [c for c in chosen if not c.is_owner]):
+            hit = False
+            for candidate in pool:
+                if hit:
+                    candidate.lead_eligible = False
+                    candidate.notes.append("not_verified:after_first_valid")
+                    continue
+                if self._budget_exhausted():
+                    candidate.notes.append("verification_budget_exhausted")
+                    continue
+                verification = self._verify_one(candidate.email)
+                candidate.verification = verification
+                if verification.status in (V_VALID, V_CATCH_ALL) or verification.is_catch_all:
+                    hit = True
 
     def _verify_guesses_for(self, result: BusinessResult) -> None:
         """Walk each contact type's guesses in order; stop at the first hit."""

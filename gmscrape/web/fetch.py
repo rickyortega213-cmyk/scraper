@@ -19,6 +19,28 @@ from urllib.robotparser import RobotFileParser
 import httpx
 
 from ..config import DEFAULT_USER_AGENTS, Settings
+
+
+def _cache_missing_optional_modules() -> None:
+    """httpcore asks "is trio here? is sniffio here?" on every request. Python
+    does not remember a failed import, so each ask walks sys.path and stats
+    dozens of files - a fifth of the CPU per business in profiling. Record
+    the absence once so the import fails instantly from then on."""
+    import importlib.util
+    import sys
+
+    for name in ("trio", "sniffio"):
+        if name in sys.modules:
+            continue
+        try:
+            found = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            sys.modules[name] = None  # type: ignore[assignment]
+
+
+_cache_missing_optional_modules()
 from ..util import hostname, normalize_url
 
 log = logging.getLogger(__name__)

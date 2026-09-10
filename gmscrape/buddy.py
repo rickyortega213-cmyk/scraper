@@ -172,6 +172,29 @@ def collect_queries(prompt: Prompt, echo: Echo) -> list[str]:
     return [s.search_string for s in parse_queries(lines)]
 
 
+def _hours(value: float) -> str:
+    if value < 1:
+        return f"~{max(5, int(round(value * 60 / 5.0)) * 5)} min"
+    return f"~{value:.0f} h" if value >= 3 else f"~{value:.1f} h"
+
+
+def choose_profile(prompt: Prompt, echo: Echo, businesses: int) -> str:
+    """Fast or thorough, with what each will roughly cost in time."""
+    from .config import estimate_hours
+
+    rate = int(os.getenv("MAILTESTER_RATE") or 57)
+    fast = estimate_hours(businesses, "fast", rate)
+    thorough = estimate_hours(businesses, "thorough", rate)
+    echo("")
+    echo(f"About {businesses:,} businesses. How deep should it go?")
+    echo(f"  1) fast      {_hours(fast):>8}   addresses published on websites, verified; "
+         "no info@/owner guessing, no owner search")
+    echo(f"  2) thorough  {_hours(thorough):>8}   + guesses info@/owner mailboxes and searches "
+         "for the owner of every business")
+    answer = prompt("Choose [1/2] (1): ").strip().lower()
+    return "thorough" if answer in ("2", "thorough", "t") else "fast"
+
+
 def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] = None) -> int:
     """The whole guided flow."""
     from .banner import print_banner
@@ -224,6 +247,7 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         limit = 40
 
     extra: list[str] = []
+    extra += ["--profile", choose_profile(prompt, echo, len(queries) * min(limit, 20))]
     if os.getenv("SUPABASE_ACCESS_TOKEN") or (os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY")):
         from .store.supabase import run_label, run_table_name
 

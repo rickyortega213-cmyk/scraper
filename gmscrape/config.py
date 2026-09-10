@@ -113,7 +113,7 @@ class Settings:
     language: str = "en"
     country: str = "us"
     maps_max_pages: int = 5
-    maps_concurrency: int = 8          # queries fetched in parallel
+    maps_concurrency: int = 16         # queries fetched in parallel
     maps_cache_ttl_hours: int = 168    # a crash never re-buys the same search
     batch_size: int = 100              # businesses per checkpoint
     query_chunk_size: int = 25         # queries fetched, then enriched, at a time (streaming)
@@ -124,7 +124,7 @@ class Settings:
     crawl_websites: bool = True
     max_pages_per_site: int = 6
     http_timeout: float = 15.0
-    http_concurrency: int = 48
+    http_concurrency: int = 64
     per_host_concurrency: int = 2
     http_retries: int = 2
     http_max_bytes: int = 3_000_000
@@ -182,6 +182,7 @@ class Settings:
     export_formats: tuple[str, ...] = ("csv", "json")
     min_confidence: int = 0
     log_level: str = "INFO"
+    profile: str = "thorough"         # thorough | fast (see apply_profile)
     confirm_keys_on_start: bool = True   # show keys before a run and offer to change them
 
     extra: dict[str, Any] = field(default_factory=dict)
@@ -213,7 +214,9 @@ class Settings:
             else:
                 values.setdefault("extra", {})
                 values["extra"][key] = value
-        return cls(**values)
+        settings = cls(**values)
+        apply_profile(settings, settings.profile)
+        return settings
 
     # --- convenience -------------------------------------------------------
     def ensure_dirs(self) -> None:
@@ -255,3 +258,49 @@ class Settings:
             "bouncer": self.bouncer_key,
             "generic": self.generic_verify_config,
         }
+
+
+PROFILES = ("thorough", "fast")
+
+# Metered checks per business, measured on real runs - used for the estimate.
+CHECKS_PER_BUSINESS = {"thorough": 2.0, "fast": 0.35}
+
+
+def apply_profile(settings: "Settings", name: str) -> "Settings":
+    """`fast` spends the verifier's metered checks only on addresses actually
+    found on websites (no info@/owner guessing, no per-business owner search)
+    and crawls a page less; that is the difference between a 150,000-business
+    run taking ~2 hours and ~15 hours on one MailTester key. `thorough` is the
+    default: everything on. Explicit env/CLI values still win because the
+    profile is applied to the defaults only."""
+    name = (name or "thorough").lower()
+    if name not in PROFILES:
+        raise ValueError(f"unknown profile {name!r}; choose one of {', '.join(PROFILES)}")
+    settings.profile = name
+    if name == "fast":
+        if settings.permutations is True and os.getenv("PERMUTATIONS") is None:
+            settings.permutations = False
+        if settings.owner_search is True and os.getenv("OWNER_SEARCH") is None:
+            settings.owner_search = False
+        if settings.verify_found_max == 3 and os.getenv("VERIFY_FOUND_MAX") is None:
+            settings.verify_found_max = 1
+        if settings.max_pages_per_site == 6 and os.getenv("MAX_PAGES_PER_SITE") is None:
+            settings.max_pages_per_site = 4
+        if settings.http_concurrency == 64 and os.getenv("HTTP_CONCURRENCY") is None:
+            settings.http_concurrency = 96
+    return settings
+
+
+def estimate_hours(businesses: int, profile: str, checks_per_10s: int, *,
+                   http_concurrency: int = 64) -> float:
+    """Rough wall-clock for a run: the metered verifier and the crawl run in
+    parallel, so the slower of the two sets the pace."""
+    checks = businesses * CHECKS_PER_BUSINESS.get(profile, 2.0)
+    per_hour = max(1, checks_per_10s) * 360
+    verify_hours = checks / per_hour
+    pages = 3.5 if profile == "fast" else 4.5
+    fetches = businesses * 0.55 * pages                  # ~55% have a site
+    if profile == "fast" and http_concurrency == 64:
+        http_concurrency = 96
+    crawl_hours = fetches / (max(1, http_concurrency) * 0.5 * 3600)   # ~2 s per fetch per slot
+    return max(verify_hours, crawl_hours, businesses / 150_000)         # never under ~1 h per 150k

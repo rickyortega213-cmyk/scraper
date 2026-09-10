@@ -19,7 +19,7 @@ from ..config import Settings
 from ..emails.people import OwnerCandidate, choose_owner, owner_candidates_from_html
 from ..models import EmailCandidate, Person
 from ..util import dedupe_preserving_order, normalize_url, registered_domain
-from .extract import extract_emails, find_internal_links, to_candidates
+from .extract import ParsedPage, extract_emails, find_internal_links, parse_page, to_candidates
 from .fetch import Fetcher, Page
 
 log = logging.getLogger(__name__)
@@ -85,19 +85,21 @@ async def scrape_site(
     result.status = "ok"
     result.final_url = home.final_url or url
     result.pages.append(result.final_url)
-    result.homepage_text = _page_text(home.html)
-
-    seen_emails: dict[str, EmailCandidate] = {}
-    _absorb(seen_emails, home, domain)
-    if find_owner:
-        result.owner_candidates.extend(
-            owner_candidates_from_html(home.html, result.final_url, business_name, medical=medical)
-        )
-
     page_limit = settings.max_pages_per_site if max_pages is None else max_pages
     budget = max(0, page_limit - 1)
+    parsed = parse_page(home.html, result.final_url, want_links=budget > 0, link_limit=budget * 4)
+    result.homepage_text = _page_text(home.html, parsed)
+
+    seen_emails: dict[str, EmailCandidate] = {}
+    _absorb(seen_emails, home, domain, parsed)
+    if find_owner:
+        result.owner_candidates.extend(
+            owner_candidates_from_html(home.html, result.final_url, business_name,
+                                       medical=medical, parsed=parsed)
+        )
+
     if budget and not _done(seen_emails, domain, result.owner_candidates, find_owner):
-        targets = find_internal_links(home.html, result.final_url, limit=budget * 4)
+        targets = find_internal_links(home.html, result.final_url, limit=budget * 4, parsed=parsed)
         if not targets:
             base = result.final_url.rstrip("/")
             targets = [f"{base}{path}" for path in FALLBACK_PATHS]
@@ -117,11 +119,13 @@ async def scrape_site(
                         result.errors.append(f"{page.url}: {page.error}")
                     continue
                 result.pages.append(page.final_url or page.url)
-                _absorb(seen_emails, page, domain)
+                page_parsed = parse_page(page.html)
+                _absorb(seen_emails, page, domain, page_parsed)
                 if find_owner:
                     result.owner_candidates.extend(
                         owner_candidates_from_html(
-                            page.html, page.final_url or page.url, business_name, medical=medical
+                            page.html, page.final_url or page.url, business_name,
+                            medical=medical, parsed=page_parsed,
                         )
                     )
             if _done(seen_emails, domain, result.owner_candidates, find_owner):
@@ -136,11 +140,12 @@ async def scrape_site(
     return result
 
 
-def _absorb(store: dict[str, EmailCandidate], page: Page, domain: str) -> None:
+def _absorb(store: dict[str, EmailCandidate], page: Page, domain: str,
+            parsed: Optional[ParsedPage] = None) -> None:
     from ..models import SOURCE_WEIGHT
 
     page_url = page.final_url or page.url
-    found = extract_emails(page.html, page_url, business_domain=domain)
+    found = extract_emails(page.html, page_url, business_domain=domain, parsed=parsed)
     for candidate in to_candidates(found, page_url=page_url, business_domain=domain):
         existing = store.get(candidate.email)
         if existing is None or SOURCE_WEIGHT.get(candidate.source, 0) > SOURCE_WEIGHT.get(
@@ -163,14 +168,10 @@ def _done(
     return have_email and have_owner
 
 
-def _page_text(html: str) -> str:
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html or "", "lxml")
-    for tag in soup(["script", "style", "noscript", "svg", "template"]):
-        tag.decompose()
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    return f"{title} {soup.get_text(' ', strip=True)}"[:20000]
+def _page_text(html: str, parsed: Optional[ParsedPage] = None) -> str:
+    if parsed is None:
+        parsed = parse_page(html)
+    return f"{parsed.title} {parsed.text}"[:20000]
 
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:

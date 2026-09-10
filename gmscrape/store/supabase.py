@@ -25,7 +25,7 @@ from typing import Any, Optional, Sequence
 import httpx
 
 from ..models import BusinessResult
-from .sinks import email_records, lead_records
+from .sinks import STATUS_QUEUED, email_records, lead_records
 
 log = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ class SupabaseSink:
             {**rec, "run_label": getattr(self, "_run_label", "")}
             for r in results for rec in lead_records(r, self._run_id, status)
         ]
-        self._enqueue("leads", leads)
+        self._enqueue("leads", leads, urgent=(status == STATUS_QUEUED))
         if self.run_table:
             self._enqueue(self.run_table, [
                 {**_run_row(rec), "status": status} for rec in leads
@@ -225,9 +225,10 @@ class SupabaseSink:
         self.close()
 
     # --- writer thread -----------------------------------------------------
-    def _enqueue(self, table: str, rows: list[dict[str, Any]], raw_table: bool = False) -> None:
+    def _enqueue(self, table: str, rows: list[dict[str, Any]], raw_table: bool = False,
+                 urgent: bool = False) -> None:
         stamped = [{**row, "updated_at": _now()} for row in rows]
-        self._queue.put((("=" + table) if raw_table else table, stamped))
+        self._queue.put((("=" + table) if raw_table else table, stamped, urgent))
 
     def _writer_loop(self) -> None:
         """Drain the queue, coalescing rows per table before each write.
@@ -239,6 +240,7 @@ class SupabaseSink:
         unacked = 0
         last_flush = time.monotonic()
         stopping = False
+        rush = False
 
         while True:
             try:
@@ -250,13 +252,16 @@ class SupabaseSink:
                 if item is SHUTDOWN:
                     stopping = True
                 else:
-                    table, rows = item
+                    table, rows, urgent = item
                     pending.setdefault(table, []).extend(rows)
+                    rush = rush or urgent      # e.g. freshly queued businesses: show them now
 
             batch_full = any(len(rows) >= BATCH_SIZE for rows in pending.values())
             idle = item is None
             aged = time.monotonic() - last_flush >= FLUSH_INTERVAL
-            due = stopping or batch_full or (bool(pending) and (idle or aged))
+            due = stopping or batch_full or rush or (bool(pending) and (idle or aged))
+            if due:
+                rush = False
 
             if due:
                 for table, rows in list(pending.items()):

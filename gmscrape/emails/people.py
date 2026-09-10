@@ -266,11 +266,14 @@ def _context(text: str, start: int, end: int, width: int = 80) -> str:
     return squeeze(text[max(0, start - width): min(len(text), end + width)])
 
 
-def _iter_jsonld(html: str, source_url: str) -> Iterable[OwnerCandidate]:
-    soup = BeautifulSoup(html or "", "lxml")
-    for script in soup.select('script[type="application/ld+json"]'):
+def _iter_jsonld(html: str, source_url: str, bodies: Optional[Sequence[str]] = None) -> Iterable[OwnerCandidate]:
+    if bodies is None:
+        soup = BeautifulSoup(html or "", "lxml")
+        bodies = [(script.string or script.get_text() or "")
+                  for script in soup.select('script[type="application/ld+json"]')]
+    for body in bodies:
         try:
-            data = json.loads(script.string or script.get_text() or "")
+            data = json.loads(body)
         except ValueError:
             continue
         yield from _walk_jsonld(data, source_url)
@@ -321,13 +324,14 @@ def _visible_text(html: str) -> str:
 
 
 def owner_candidates_from_html(
-    html: str, page_url: str, business_name: str, *, medical: bool = False
+    html: str, page_url: str, business_name: str, *, medical: bool = False, parsed: Any = None,
 ) -> list[OwnerCandidate]:
-    """Every plausible owner mention on one page."""
+    """Every plausible owner mention on one page. `parsed` is a
+    web.extract.ParsedPage when the caller already parsed the page."""
     out: list[OwnerCandidate] = []
-    for cand in _iter_jsonld(html, page_url):
+    for cand in _iter_jsonld(html, page_url, parsed.jsonld_bodies if parsed is not None else None):
         out.append(cand)
-    text = _visible_text(html)
+    text = parsed.people_text if parsed is not None else _visible_text(html)
     for cand in _iter_text_matches(text, "site_text", page_url):
         out.append(cand)
     if medical:

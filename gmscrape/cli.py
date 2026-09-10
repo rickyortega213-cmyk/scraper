@@ -101,6 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="continue an interrupted run (default: the latest one)")
     run.add_argument("--table-name", dest="supabase_table_name",
                      help="name for this run's Supabase table (default: from the search)")
+    run.add_argument("--profile", choices=["thorough", "fast"], dest="profile", default=None,
+                     help="fast: check only addresses found on sites, no guessing or owner search "
+                          "(~7x fewer metered checks); thorough: everything (default)")
     run.add_argument("--batch-size", type=int, dest="batch_size",
                      help="businesses per checkpoint (default 100)")
     run.add_argument("-o", "--out-dir", dest="out_dir", help="export directory (default out/)")
@@ -319,7 +322,7 @@ SETTINGS_KEYS = {
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
     "chain_people", "chain_person_guesses", "chain_crawl_pages", "confirm_keys_on_start",
-    "supabase_run_tables", "supabase_table_name", "batch_size", "maps_concurrency",
+    "supabase_run_tables", "supabase_table_name", "batch_size", "maps_concurrency", "profile",
 }
 
 

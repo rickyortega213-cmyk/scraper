@@ -13,7 +13,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from ..models import BusinessResult, EmailCandidate, Person, Place, VerificationResult
 
@@ -367,7 +367,15 @@ class Store:
             self.conn.commit()
 
     # --- results -----------------------------------------------------------
-    def save_business(self, result: BusinessResult, run_id: str, stage: str = "done") -> None:
+    def save_businesses(self, results: Sequence[BusinessResult], run_id: str, stage: str = "done") -> None:
+        """Save a whole batch in one transaction (one fsync instead of one per business)."""
+        with self._lock:
+            for result in results:
+                self.save_business(result, run_id, stage, commit=False)
+            self.conn.commit()
+
+    def save_business(self, result: BusinessResult, run_id: str, stage: str = "done",
+                      commit: bool = True) -> None:
         with self._lock:
             place = result.place
             key = place.dedupe_key()
@@ -433,7 +441,8 @@ class Store:
                         int(candidate.lead_eligible),
                     ),
                 )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
 
     def done_business_keys(self, run_id: str) -> set[str]:
         with self._lock:

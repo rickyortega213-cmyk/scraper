@@ -186,6 +186,7 @@ def test_buddy_asks_for_the_table_name_after_the_searches(tmp_path, monkeypatch)
     answers = iter(["", "", "", "", "",                 # keep every key
                     "dentist in austin tx", "",         # searches
                     "",                                 # businesses per search -> 40
+                    "",                                 # speed -> fast
                     "Austin Dentists Sept",             # table name
                     ""])                                # Start
     asked: list[str] = []

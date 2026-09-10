@@ -569,9 +569,25 @@ of the machine busy around them:
 
 With those defaults a business costs about 2 checks on average, so 150,000
 businesses need ~300,000 checks ≈ 15 hours on one Ultimate key. That is the
-real bound: to finish faster, verify fewer addresses (`VERIFY_PERMUTATIONS=false`
-keeps only addresses found on sites, about 1 check per business), or bring a
-verifier with a higher rate.
+real bound, so there are two speeds and `scraper buddy` asks which you want,
+with a time estimate for your search list:
+
+```
+About 150,000 businesses. How deep should it go?
+  1) fast          ~2.6 h   addresses published on websites, verified; no info@/owner guessing, no owner search
+  2) thorough       ~15 h   + guesses info@/owner mailboxes and searches for the owner of every business
+Choose [1/2] (1):
+```
+
+**fast** (`--profile fast`, or `PROFILE=fast`) checks only what sites
+publish - one address per contact type, best first - and skips the
+per-business owner web search and the info@/owner guessing; owners still come
+from the sites themselves. About a third of a check per business, so the
+metered verifier and the crawl finish together. **thorough** is everything.
+Any setting you set explicitly (`PERMUTATIONS=true`, say) still wins over the
+profile. Found addresses are always checked best-first and the walk stops at
+the first deliverable one per contact type: the others stay in the emails
+export, flagged, never as a lead.
 
 ## If something breaks mid-run
 
@@ -632,7 +648,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 229 tests, no network or API keys needed
+make test     # 230 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

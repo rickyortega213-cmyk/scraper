@@ -250,24 +250,74 @@ def _walk_json(node: object) -> Iterable[object]:
             yield from _walk_json(item)
 
 
+_NOISE_TAGS = ("script", "style", "noscript", "svg", "template")
+_CHROME_TAGS = ("nav", "footer")
+
+
+@dataclass
+class ParsedPage:
+    """One HTML parse, shared by every consumer of a page.
+
+    Parsing with lxml is the single biggest CPU cost per business, and the
+    email extractor, the owner finder, the link ranker and the homepage text
+    each used to build their own tree from the same bytes. Now the tree is
+    built once; the soup-based extractors run first (JSON-LD and Cloudflare
+    hints live in tags the text pass strips), then the tree is reduced to
+    visible text twice: with and without the site chrome.
+    """
+
+    raw_html: str
+    title: str = ""
+    text: str = ""                 # visible text, single spaces
+    people_text: str = ""          # visible text minus nav/footer, " | " between blocks
+    jsonld_bodies: list[str] = None  # type: ignore[assignment]
+    soup_found: list[Found] = None   # type: ignore[assignment]  mailto / cloudflare / json-ld hits
+    links: list[str] = None          # type: ignore[assignment]  ranked same-site links (if asked)
+
+
+def parse_page(raw_html: str, base_url: str = "", *, want_links: bool = False,
+               link_limit: int = 40) -> ParsedPage:
+    page = ParsedPage(raw_html or "", jsonld_bodies=[], soup_found=[], links=[])
+    if not raw_html:
+        return page
+    soup = BeautifulSoup(raw_html, "lxml")
+    page.title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    page.soup_found.extend(_iter_mailto(soup))
+    page.soup_found.extend(_iter_cloudflare(raw_html, soup))
+    page.soup_found.extend(_iter_jsonld(soup))
+    page.jsonld_bodies = [
+        (script.string or script.get_text() or "")
+        for script in soup.select('script[type="application/ld+json"]')
+    ]
+    if want_links:
+        page.links = _rank_links(soup, base_url, link_limit)
+    for tag in soup(list(_NOISE_TAGS)):
+        tag.decompose()
+    page.text = soup.get_text(" ", strip=True)
+    for tag in soup(list(_CHROME_TAGS)):
+        tag.decompose()
+    page.people_text = squeeze(soup.get_text(" | ", strip=True))
+    return page
+
+
 def _visible_text(soup: BeautifulSoup) -> str:
     clone = BeautifulSoup(str(soup), "lxml")
-    for tag in clone(["script", "style", "noscript", "svg", "template"]):
+    for tag in clone(list(_NOISE_TAGS)):
         tag.decompose()
     return clone.get_text(" ", strip=True)
 
 
-def extract_emails(raw_html: str, page_url: str = "", business_domain: str = "") -> list[Found]:
+def extract_emails(raw_html: str, page_url: str = "", business_domain: str = "",
+                   parsed: "ParsedPage | None" = None) -> list[Found]:
     """All plausible email hits on one page, best-provenance-first per address."""
     if not raw_html:
         return []
-    soup = BeautifulSoup(raw_html, "lxml")
-    text = _visible_text(soup)
+    if parsed is None:
+        parsed = parse_page(raw_html)
+    text = parsed.text
 
     found: list[Found] = []
-    found.extend(_iter_mailto(soup))
-    found.extend(_iter_cloudflare(raw_html, soup))
-    found.extend(_iter_jsonld(soup))
+    found.extend(parsed.soup_found)
     found.extend(_iter_regex(text, SOURCE_HTML_TEXT))
     found.extend(_iter_regex(html.unescape(raw_html), SOURCE_HTML_TEXT))
     found.extend(_iter_obfuscated(text, business_domain))
@@ -336,13 +386,19 @@ def score_link(href: str, text: str) -> int:
     return score
 
 
-def find_internal_links(raw_html: str, base_url: str, limit: int = 40) -> list[str]:
+def find_internal_links(raw_html: str, base_url: str, limit: int = 40,
+                        parsed: "ParsedPage | None" = None) -> list[str]:
     """Same-site links ranked by how likely they hold contact details."""
+    if parsed is not None and parsed.links:
+        return parsed.links[:limit]
+    return _rank_links(BeautifulSoup(raw_html or "", "lxml"), base_url, limit)
+
+
+def _rank_links(soup: BeautifulSoup, base_url: str, limit: int) -> list[str]:
     from urllib.parse import urljoin
 
     from ..util import same_site
 
-    soup = BeautifulSoup(raw_html or "", "lxml")
     scored: dict[str, int] = {}
     for anchor in soup.select("a[href]"):
         href = (anchor.get("href") or "").strip()
