@@ -127,6 +127,7 @@ def collect_queries(prompt: Prompt, echo: Echo) -> list[str]:
     echo("Searches - paste them, one per line (business type in location),")
     echo("then press Enter on an empty line. Or type the path to a .txt / .csv file.")
     lines: list[str] = []
+    empties = 0
     while True:
         try:
             line = prompt("  > ")
@@ -136,7 +137,11 @@ def collect_queries(prompt: Prompt, echo: Echo) -> list[str]:
         if not line:
             if lines:
                 break
+            empties += 1
+            if empties >= 2:          # nothing pasted, Enter twice: they mean "none"
+                break
             continue
+        empties = 0
         candidate = Path(line.strip("'\"")).expanduser()
         if candidate.suffix.lower() in (".txt", ".csv", ".tsv") and candidate.exists():
             found = _queries_from_file(candidate)
@@ -156,6 +161,24 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
 
     print_banner(_console)
     K.load_saved_keys_into_env()
+
+    # An interrupted run comes first: nothing already paid for is re-bought.
+    from .cli import cmd_resume
+    from .store.db import Store
+
+    settings = settings_from_args(build_parser().parse_args(["run", "x"]))
+    with Store(settings.db_path) as store:
+        unfinished = store.latest_unfinished_run()
+    if unfinished:
+        first = unfinished["queries"][0] if unfinished["queries"] else "?"
+        more = f" +{len(unfinished['queries']) - 1} more" if len(unfinished["queries"]) > 1 else ""
+        echo("")
+        echo(f"A previous run stopped early: {first}{more} - "
+             f"{unfinished['done']}/{unfinished['total']} businesses finished.")
+        if _yes(prompt("Resume it? [Y/n] "), default=True):
+            args = build_parser().parse_args(["resume", "-y", unfinished["run_id"]])
+            return cmd_resume(args)
+
     review_keys(prompt, rich_echo if echo is print else echo)
 
     if not any(os.getenv(k) for k in ("MCP_MAPS_URL", "GENERIC_MAPS_CONFIG", "SCRAPERAPI_KEY",
@@ -181,11 +204,23 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         limit = max(1, int(per)) if per else 40
     except ValueError:
         limit = 40
+
+    extra: list[str] = []
+    if os.getenv("SUPABASE_ACCESS_TOKEN"):
+        from .store.supabase import run_label, run_table_name
+
+        default = run_table_name(run_label(queries))
+        name = prompt(f"Name for this run's Supabase table [{default}]: ").strip()
+        table = run_table_name(name) if name else default
+        if name and table != name:
+            echo(f"    using {table} (table names are lowercase letters, digits and _)")
+        extra += ["--table-name", table]
+
     if not _yes(prompt("Start? [Y/n] "), default=True):
         echo("cancelled")
         return 0
 
-    args = build_parser().parse_args(["run", "-y", "-n", str(limit), *queries])
+    args = build_parser().parse_args(["run", "-y", "-n", str(limit), *extra, *queries])
     settings_from_args(args)      # loads .env + saved keys for the run
     return cmd_run(args)
 

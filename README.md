@@ -54,6 +54,7 @@ scraper buddy                 # that's it
     >
 
   2 searches. Businesses per search [40]:
+  Name for this run's Supabase table [run_2026_09_10_dentist_in_austin_tx]:
   Start? [Y/n]
 ```
 
@@ -481,6 +482,38 @@ Useful flags on `run`:
 --no-supabase          skip the live table for this run
 ```
 
+## If something breaks mid-run
+
+Nothing you've paid for is ever bought twice, and nothing finished is lost:
+
+- **Every API result is cached the moment it arrives** — Maps results per
+  search, fetched pages, web searches, verification results, MX/catch-all
+  facts. A resumed or repeated run reads them from disk.
+- **Work is done in batches** (100 businesses by default) with a **checkpoint
+  after each**: finished businesses are saved, and `out/leads.csv` is
+  rewritten so a partial result is always on disk.
+- **Ctrl-C or a crash** ends cleanly: the run is marked interrupted, the CSV
+  has everything finished so far, and the terminal says exactly what to do:
+
+```
+Stopped. 240/3600 businesses were finished and are in out/leads.csv.
+Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
+```
+
+- **`scraper resume`** restores the finished businesses from the database and
+  continues with the rest — no re-crawling, no re-verifying, no second Maps
+  call. `scraper buddy` offers this itself when it finds an unfinished run.
+  `gmscrape runs` lists recent runs and their state.
+
+Volume: 50–90 searches at a time is the intended scale (Maps queries fetched
+four at a time; crawls, web searches and verifications concurrent; one bad
+site, search or query never ends the run). Progress lines show the checkpoint,
+elapsed time and an ETA:
+
+```
+checkpoint batch 12/36 · 1200/3600 businesses · 41m 10s elapsed · ~1h 22m left
+```
+
 ## Re-runs are cheap
 
 SQLite caches fetched pages (`CACHE_TTL_HOURS`, default a week), every
@@ -503,7 +536,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 188 tests, no network or API keys needed
+make test     # 195 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

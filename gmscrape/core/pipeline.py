@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
@@ -92,6 +92,10 @@ class RunReport:
     verification_cache_hits: int = 0
     errors: list[str] = field(default_factory=list)
     sinks: list[Any] = field(default_factory=list)
+    resumed: int = 0                 # businesses restored from a previous attempt
+    total: int = 0                   # businesses in the run (restored + pending)
+    status: str = "running"          # running | done | interrupted | failed
+    maps_cache_hits: int = 0
 
     @property
     def duration(self) -> float:
@@ -128,8 +132,22 @@ class RunReport:
             "verification_cache_hits": self.verification_cache_hits,
             "web_search_calls": self.search_calls,
             "web_search_cache_hits": self.search_cache_hits,
+            "maps_cache_hits": self.maps_cache_hits,
+            "resumed_businesses": self.resumed,
+            "status": self.status,
             "duration_seconds": round(self.duration, 1),
         }
+
+
+class RunStopped(Exception):
+    """A run ended early (Ctrl-C or an unexpected error). Carries the partial
+    report - everything finished so far is saved and exportable, and the run
+    can be resumed."""
+
+    def __init__(self, report: RunReport, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.report = report
+        self.cause = cause
 
 
 class Pipeline:
@@ -159,7 +177,20 @@ class Pipeline:
         self._cache_hits = 0
 
     # --- public API --------------------------------------------------------
-    def run(self, queries: Sequence[str], *, run_id: Optional[str] = None) -> RunReport:
+    def run(
+        self,
+        queries: Sequence[str],
+        *,
+        run_id: Optional[str] = None,
+        resume: bool = False,
+    ) -> RunReport:
+        """Run every query. With `resume`, businesses already finished under
+        `run_id` are restored from the database rather than processed again.
+
+        Work happens in batches (settings.batch_size); each finished batch is
+        checkpointed, so a crash or Ctrl-C costs at most one batch of work and
+        no API calls that already returned (maps results, pages, searches and
+        verifications are all cached the moment they arrive)."""
         specs = parse_queries(queries)
         if not specs:
             raise ValueError("no usable queries provided")
@@ -177,22 +208,81 @@ class Pipeline:
             "verify_provider": report.verify_provider,
         })
 
-        places = self._collect_places(specs, report)
-        results = self._classify(places)
-        if results:
-            # Publish and flush before any slow work, so the table is fully
-            # populated the moment the run starts rather than after the crawl.
-            self._publish(results, STATUS_QUEUED)
+        try:
+            places = self._collect_places(specs, report)
+            results = self._classify(places)
+
+            pending = results
+            if resume:
+                done_keys = self.store.done_business_keys(report.run_id)
+                restored = [self.store.load_business(k) for k in done_keys]
+                restored = [r for r in restored if r is not None]
+                pending = [r for r in results if r.place.dedupe_key() not in done_keys]
+                report.results.extend(restored)
+                report.resumed = len(restored)
+                if restored:
+                    self._publish(restored, STATUS_DONE)
+            report.total = len(report.results) + len(pending)
+            self.store.set_run_state(report.run_id, "running", total=report.total,
+                                     done=len(report.results))
+
+            if pending:
+                # Publish and flush before any slow work, so the table is fully
+                # populated the moment the run starts rather than after the crawl.
+                self._publish(pending, STATUS_QUEUED)
+                self._sink_call("flush")
+
+            size = max(1, self.settings.batch_size)
+            batches = [pending[i: i + size] for i in range(0, len(pending), size)]
+            started = time.time()
+            for index, batch in enumerate(batches, start=1):
+                self._process_batch(batch, report)
+                report.results.extend(batch)
+                self.store.set_run_state(report.run_id, "running", done=len(report.results))
+                elapsed = time.time() - started
+                self.progress("batch_done", {
+                    "batch": index, "batches": len(batches),
+                    "done": len(report.results), "total": report.total,
+                    "elapsed": elapsed,
+                    "eta": (elapsed / index) * (len(batches) - index),
+                    "results": report.results,
+                })
+        except BaseException as exc:
+            status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            report.status = status
+            report.finished_at = time.time()
+            self.store.set_run_state(report.run_id, status, done=len(report.results))
             self._sink_call("flush")
-            asyncio.run(self._scrape_websites(results))
-            self._publish(results, STATUS_CRAWLED)
-            self._plan_permutations(results)
-            self._publish([r for r in results if r.guessed_emails], STATUS_GUESSED)
-            self._verify_all(results)
-            self._publish(results, STATUS_VERIFIED)
+            if not isinstance(exc, KeyboardInterrupt):
+                log.exception("run %s failed", report.run_id)
+            raise RunStopped(report, exc) from exc
+
+        report.verification_calls = self._verify_calls
+        report.verification_cache_hits = self._cache_hits
+        report.search_calls = self._search_calls
+        report.search_cache_hits = self._search_cache_hits
+        report.sinks = [s for s in self.sinks if not isinstance(s, NullSink)]
+        report.status = "done"
+        report.finished_at = time.time()
+        stats = report.stats()
+        self.store.finish_run(report.run_id, stats)
+        self._sink_call("finish_run", report.run_id, stats)
+        self.progress("run_finished", {"stats": stats})
+        return report
+
+    def _process_batch(self, batch: list[BusinessResult], report: RunReport) -> None:
+        """Crawl, guess, verify, score and checkpoint one batch of businesses."""
+        if not batch:
+            return
+        asyncio.run(self._scrape_websites(batch))
+        self._publish(batch, STATUS_CRAWLED)
+        self._plan_permutations(batch)
+        self._publish([r for r in batch if r.guessed_emails], STATUS_GUESSED)
+        self._verify_all(batch)
+        self._publish(batch, STATUS_VERIFIED)
 
         strict_guesses = self.settings.require_verified_guesses and self.verifier.requires_key
-        for result in results:
+        for result in batch:
             score_business(result)
             result.emails = [
                 candidate for candidate in result.emails
@@ -213,21 +303,8 @@ class Pipeline:
                     ):
                         candidate.lead_eligible = False
                         candidate.notes.append("not_lead_eligible:unverified_guess")
-            self.store.save_business(result, report.run_id)
-
-        report.results = results
-        report.verification_calls = self._verify_calls
-        report.verification_cache_hits = self._cache_hits
-        report.search_calls = self._search_calls
-        report.search_cache_hits = self._search_cache_hits
-        report.sinks = [s for s in self.sinks if not isinstance(s, NullSink)]
-        self._publish(results, STATUS_DONE)
-        report.finished_at = time.time()
-        stats = report.stats()
-        self.store.finish_run(report.run_id, stats)
-        self._sink_call("finish_run", report.run_id, stats)
-        self.progress("run_finished", {"stats": stats})
-        return report
+            self.store.save_business(result, report.run_id, stage="done")
+        self._publish(batch, STATUS_DONE)
 
     def _publish(self, results: Sequence[BusinessResult], status: str) -> None:
         """Push a stage's results to every sink. A sink must never break a run."""
@@ -260,25 +337,67 @@ class Pipeline:
         self.close()
 
     # --- stage 1: maps -----------------------------------------------------
+    def _fetch_query(self, spec: QuerySpec, report: RunReport) -> list[Place]:
+        """All places for one query - from the cache when we already paid for it."""
+        limit = self.settings.results_per_query
+        cached = self.store.get_maps(self.maps.name, spec.search_string, self.settings.maps_cache_ttl_hours)
+        if cached is None and self.maps.name == "cache":
+            cached = self.store.get_maps_any(spec.search_string, self.settings.maps_cache_ttl_hours)
+        if cached is not None:
+            rows, complete = cached
+            if complete or len(rows) >= limit:
+                report.maps_cache_hits += 1
+                return [self._place_from_cache(row, spec) for row in rows][:limit]
+        places: list[Place] = []
+        try:
+            for place in self.maps.search(spec, limit):
+                places.append(place)
+                if len(places) >= limit:
+                    break
+        except ProviderError as exc:
+            message = f"{spec.search_string}: {exc}"
+            log.error("maps provider failed for %s", message)
+            report.errors.append(message)
+            if places:
+                self.store.put_maps(self.maps.name, spec.search_string,
+                                    [asdict(p) for p in places], complete=False)
+            return places
+        # Fewer than asked for means the provider ran out: the list is complete.
+        self.store.put_maps(self.maps.name, spec.search_string,
+                            [asdict(p) for p in places], complete=True)
+        return places
+
+    @staticmethod
+    def _place_from_cache(row: dict, spec: QuerySpec) -> Place:
+        data = {k: v for k, v in row.items() if k in Place.__dataclass_fields__}
+        data["query"] = spec.search_string
+        return Place(**data)
+
     def _collect_places(self, specs: Sequence[QuerySpec], report: RunReport) -> list[Place]:
+        """Fetch every query (a few at a time), then dedupe across them in order."""
+        per_query: dict[int, list[Place]] = {}
+        workers = max(1, min(self.settings.maps_concurrency, len(specs)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._fetch_query, spec, report): index
+                       for index, spec in enumerate(specs)}
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    per_query[index] = future.result()
+                except Exception as exc:  # noqa: BLE001 - one bad query must not end the run
+                    report.errors.append(f"{specs[index].search_string}: {exc}")
+                    per_query[index] = []
+                self.progress("query_done", {"query": specs[index].search_string,
+                                             "found": len(per_query[index])})
         seen: set[str] = set()
         places: list[Place] = []
-        for spec in specs:
-            self.progress("query_start", {"query": spec.search_string})
-            found = 0
-            try:
-                for place in self.maps.search(spec, self.settings.results_per_query):
-                    key = place.dedupe_key()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    places.append(place)
-                    found += 1
-            except ProviderError as exc:
-                message = f"{spec.search_string}: {exc}"
-                log.error("maps provider failed for %s", message)
-                report.errors.append(message)
-            self.progress("query_done", {"query": spec.search_string, "found": found})
+        for index in range(len(specs)):
+            for place in per_query.get(index, []):
+                key = place.dedupe_key()
+                if key in seen:
+                    continue
+                seen.add(key)
+                places.append(place)
         return places
 
     # --- stage 2: chains ---------------------------------------------------

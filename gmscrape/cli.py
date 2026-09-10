@@ -28,7 +28,7 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .config import Settings, load_env
-from .core.pipeline import Pipeline, RunReport
+from .core.pipeline import Pipeline, RunReport, RunStopped
 from .emails.patterns import build_permutations
 from .providers import get_maps_provider, get_verifier, list_maps_providers, list_verify_providers
 from .providers.base import ProviderError
@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--places-file", help="for --maps-provider file")
     run.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
                      default=None, help="start without the key check (for scripts / cron)")
+    run.add_argument("--resume", metavar="RUN_ID", nargs="?", const="latest",
+                     help="continue an interrupted run (default: the latest one)")
+    run.add_argument("--table-name", dest="supabase_table_name",
+                     help="name for this run's Supabase table (default: from the search)")
+    run.add_argument("--batch-size", type=int, dest="batch_size",
+                     help="businesses per checkpoint (default 100)")
     run.add_argument("-o", "--out-dir", dest="out_dir", help="export directory (default out/)")
     run.add_argument("--basename", default="leads", help="export file basename")
     run.add_argument("--format", dest="export_formats",
@@ -266,6 +272,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("supabase-check", parents=[common],
                    help="verify the Supabase URL, key and tables")
 
+    # --- runs ------------------------------------------------------------
+    resume_cmd = sub.add_parser("resume", parents=[common],
+                                help="continue an interrupted run where it stopped")
+    resume_cmd.add_argument("run_id", nargs="?", help="run id (default: latest unfinished)")
+    resume_cmd.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
+                            default=None)
+    resume_cmd.add_argument("-o", "--out-dir", dest="out_dir")
+    resume_cmd.add_argument("--basename", default="leads")
+    resume_cmd.add_argument("--format", dest="export_formats")
+    runs_cmd = sub.add_parser("runs", parents=[common], help="list recent runs and their state")
+    runs_cmd.add_argument("--limit", type=int, default=15)
+
     # --- keys ------------------------------------------------------------
     setup_cmd = sub.add_parser("setup", parents=[common],
                                help="save or change your API keys (interactive)")
@@ -293,7 +311,7 @@ SETTINGS_KEYS = {
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
     "chain_people", "chain_person_guesses", "chain_crawl_pages", "confirm_keys_on_start",
-    "supabase_run_tables",
+    "supabase_run_tables", "supabase_table_name", "batch_size", "maps_concurrency",
 }
 
 
@@ -422,10 +440,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     if checked is None:
         return 2
     settings = checked
+    return _execute_run(settings, [s.search_string for s in specs], basename=args.basename,
+                        run_id=None, resume_id=getattr(args, "resume", None))
 
+
+def _execute_run(settings: Settings, queries: list[str], *, basename: str,
+                 run_id: Optional[str], resume_id: Optional[str]) -> int:
+    """Run (or resume) the pipeline, exporting after every batch and on any exit."""
+    resume = False
+    if resume_id:
+        with Store(settings.db_path) as store:
+            previous = (store.latest_unfinished_run() if resume_id == "latest"
+                        else next((r for r in store.list_runs(200) if r["run_id"] == resume_id), None))
+        if previous is None:
+            echo("[yellow]nothing to resume[/yellow]" if resume_id == "latest"
+                 else f"[yellow]no run {resume_id}[/yellow]")
+            return 2
+        run_id, queries, resume = previous["run_id"], previous["queries"], True
+        echo(f"resuming run [cyan]{run_id}[/cyan]: {previous['done']}/{previous['total']} businesses "
+             f"already done, {len(queries)} search{'es' if len(queries) != 1 else ''}")
+
+    exporter = _Exporter(settings, basename)
+    maps = None
+    if resume:
+        # The listings were cached by the original run; no provider is needed.
+        from .providers.maps.file_provider import CacheOnlyMaps
+        from .providers.registry import detect_maps_provider
+
+        try:
+            detect_maps_provider(settings)
+        except ProviderError:
+            maps = CacheOnlyMaps(settings)
     try:
-        pipeline = Pipeline(settings, progress=_make_progress(),
-                            sinks=build_sinks(settings, [s.search_string for s in specs]))
+        pipeline = Pipeline(settings, progress=_make_progress(exporter),
+                            sinks=build_sinks(settings, queries), maps=maps)
     except ProviderError as exc:
         echo(f"[red]{exc}[/red]")
         return 2
@@ -433,16 +481,74 @@ def cmd_run(args: argparse.Namespace) -> int:
     with pipeline:
         echo(f"maps: [green]{pipeline.maps.name}[/green]   "
              f"verification: [green]{pipeline.verifier.name}[/green]   "
-             f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]")
-        report = pipeline.run([s.search_string for s in specs])
-        paths = export_results(
-            report.results, settings.out_dir,
-            basename=args.basename, formats=settings.export_formats,
-            run_date=_today(),
-        )
+             f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
+             f"batches of {settings.batch_size}")
+        try:
+            report = pipeline.run(queries, run_id=run_id, resume=resume)
+        except RunStopped as stopped:
+            report = stopped.report
+            paths = exporter.export(report.results)
+            echo("")
+            if isinstance(stopped.cause, KeyboardInterrupt):
+                echo(f"[yellow]Stopped.[/yellow] {len(report.results)}/{report.total} businesses were "
+                     f"finished and are in {paths[0] if paths else 'the export'}.")
+            else:
+                echo(f"[red]The run hit an error:[/red] {stopped.cause}")
+                echo(f"{len(report.results)}/{report.total} businesses were finished and are in "
+                     f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
+                     "re-bought on resume.")
+            echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
+                 f"(run id {report.run_id})")
+            return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
+        paths = exporter.export(report.results)
     _print_report(report, paths)
     _print_final_table(report)
     _print_supabase_link(settings, report)
+    return 0
+
+
+class _Exporter:
+    """Writes the exports; called after every batch so a partial CSV always exists."""
+
+    def __init__(self, settings: Settings, basename: str) -> None:
+        self.settings = settings
+        self.basename = basename
+
+    def export(self, results) -> list[Path]:
+        return export_results(results, self.settings.out_dir, basename=self.basename,
+                              formats=self.settings.export_formats, run_date=_today())
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    _launch()
+    settings = settings_from_args(args)
+    return _execute_run(settings, [], basename=args.basename, run_id=None,
+                        resume_id=args.run_id or "latest")
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    settings = settings_from_args(args)
+    with Store(settings.db_path) as store:
+        runs = store.list_runs(args.limit)
+    if not runs:
+        echo("no runs yet")
+        return 0
+    _print_table(
+        "Runs",
+        ("run id", "started", "status", "done", "searches", "table"),
+        [
+            (r["run_id"], datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M"),
+             r["status"], f"{r['done']}/{r['total']}" if r["total"] else "",
+             (r["queries"][0] + (f" +{len(r['queries']) - 1}" if len(r["queries"]) > 1 else ""))[:40],
+             r["run_table"])
+            for r in runs
+        ],
+    )
+    unfinished = next((r for r in runs if r["status"] in ("interrupted", "failed", "running")), None)
+    if unfinished:
+        echo("resume the latest unfinished one with [cyan]scraper resume[/cyan]")
     return 0
 
 
@@ -691,7 +797,9 @@ def build_sinks(settings: Settings, queries: Sequence[str] = ()) -> list:
         config = supabase_config(settings)
         run_table = ""
         if settings.supabase_run_tables and config.access_token:
-            run_table = run_table_name(run_label(list(queries)))
+            run_table = (run_table_name(settings.supabase_table_name)
+                         if settings.supabase_table_name
+                         else run_table_name(run_label(list(queries))))
         ready, detail = ensure_schema(config, run_table=run_table)
     except SupabaseError as exc:
         echo(f"[yellow]Supabase: {exc}[/yellow]")
@@ -989,7 +1097,16 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 # --- presentation ----------------------------------------------------------
-def _make_progress():
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def _make_progress(exporter: Optional["_Exporter"] = None):
     state = {"sites": 0}
 
     def hook(event: str, data: dict) -> None:
@@ -999,8 +1116,17 @@ def _make_progress():
             echo(f"  [bold]{data['businesses']}[/bold] unique businesses to process")
         elif event == "site_done":
             state["sites"] += 1
-            if state["sites"] % 10 == 0 or data["done"] == data["total"]:
+            if state["sites"] % 25 == 0 or data["done"] == data["total"]:
                 echo(f"  crawled {data['done']}/{data['total']} websites")
+        elif event == "batch_done":
+            echo(f"  [bold]checkpoint[/bold] batch {data['batch']}/{data['batches']} · "
+                 f"{data['done']}/{data['total']} businesses · {_fmt_duration(data['elapsed'])} elapsed"
+                 + (f" · ~{_fmt_duration(data['eta'])} left" if data['batch'] < data['batches'] else ""))
+            if exporter is not None:
+                try:
+                    exporter.export(data["results"])
+                except Exception as exc:  # noqa: BLE001 - never let an export break a run
+                    echo(f"  [yellow]partial export failed: {exc}[/yellow]")
     return hook
 
 
@@ -1112,6 +1238,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "probe-maps": cmd_probe_maps,
         "probe-mcp": cmd_probe_mcp,
         "setup": cmd_setup,
+        "resume": cmd_resume,
+        "runs": cmd_runs,
         "keys": cmd_keys,
         "search": cmd_search,
         "owner": cmd_owner,

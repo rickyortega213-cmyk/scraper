@@ -96,7 +96,7 @@ class Settings:
     discover_websites: bool = True      # search for a site when Maps has none
     find_owners: bool = True            # look for the owner on the website
     owner_search: bool = True           # ...and via web search when the site is silent
-    web_search_concurrency: int = 6
+    web_search_concurrency: int = 8
     search_cache_ttl_hours: int = 720
     website_min_confidence: int = 60    # accept a discovered site at/above this
     owner_min_confidence: int = 60      # guess owner addresses at/above this
@@ -111,12 +111,15 @@ class Settings:
     language: str = "en"
     country: str = "us"
     maps_max_pages: int = 5
+    maps_concurrency: int = 4          # queries fetched in parallel
+    maps_cache_ttl_hours: int = 168    # a crash never re-buys the same search
+    batch_size: int = 100              # businesses per checkpoint
 
     # --- website crawling --------------------------------------------------
     crawl_websites: bool = True
     max_pages_per_site: int = 6
     http_timeout: float = 20.0
-    http_concurrency: int = 12
+    http_concurrency: int = 16
     per_host_concurrency: int = 2
     http_retries: int = 2
     http_max_bytes: int = 3_000_000
@@ -140,7 +143,7 @@ class Settings:
     verify_emails: bool = True
     verify_found: bool = True
     verify_permutations: bool = True
-    verify_concurrency: int = 4
+    verify_concurrency: int = 6
     verify_budget: int = 0            # 0 = unlimited API calls for the run
     keep_risky: bool = True
     keep_invalid: bool = False
@@ -160,6 +163,7 @@ class Settings:
     supabase_access_token: str = ""      # the one credential needed: sbp_... access token
     supabase_project_ref: str = ""       # which project, when the token can see several
     supabase_run_tables: bool = True     # a fresh table per run, named after the search + date
+    supabase_table_name: str = ""        # name for this run's table (default: from the search)
     supabase: bool = True                # on whenever URL + key are configured
 
     # --- output / storage --------------------------------------------------

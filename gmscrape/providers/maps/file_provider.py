@@ -68,3 +68,19 @@ class FileMaps(MapsProvider):
             seen += 1
             if seen >= limit:
                 return
+
+
+class CacheOnlyMaps(MapsProvider):
+    """Used when resuming: every query's listings are already in the maps
+    cache, so no provider is needed. A query that somehow is not cached is a
+    clear error rather than a silent empty result."""
+
+    name = "cache"
+    requires_key = False
+
+    def search(self, spec: QuerySpec, limit: int) -> Iterator[Place]:
+        raise ProviderError(
+            f"{spec.search_string!r} is not in the maps cache and no maps provider is "
+            "configured - save your Maps key (`scraper buddy`) and resume again"
+        )
+        yield  # pragma: no cover - makes this a generator

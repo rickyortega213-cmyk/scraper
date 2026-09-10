@@ -355,12 +355,21 @@ def run_table_name(label: str, prefix: str = "") -> str:
     """'dentist in austin tx · 2026-09-10' -> 'run_2026_09_10_dentist_in_austin_tx'."""
     import re
 
-    text, _, date_part = label.rpartition(" · ")
-    text = text or label
+    if " · " in label:
+        text, date_part = label.rsplit(" · ", 1)
+    else:
+        text, date_part = label, ""
     text = re.sub(r"\s\+\d+\s+more$", "", text)          # "dentist ... +2 more"
     date_slug = date_part.replace("-", "_") if date_part else ""
     slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-    name = f"run_{date_slug}_{slug}" if date_slug else f"run_{slug}"
+    if date_slug:
+        name = f"run_{date_slug}_{slug}"
+    elif slug.startswith("run_") or not slug:
+        name = slug or "run"
+    else:
+        name = slug                                      # a name the user typed
+    if name[0].isdigit():
+        name = "run_" + name
     name = re.sub(r"_+", "_", name).strip("_")[:60]
     return f"{prefix}{name}"
 

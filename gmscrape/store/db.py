@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from ..models import BusinessResult, VerificationResult
+from ..models import BusinessResult, EmailCandidate, Person, Place, VerificationResult
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS web_searches (
     provider    TEXT,
     query       TEXT,
     payload     TEXT,
+    fetched_at  REAL
+);
+CREATE TABLE IF NOT EXISTS maps_cache (
+    query_key   TEXT PRIMARY KEY,
+    provider    TEXT,
+    query       TEXT,
+    places      TEXT,
+    complete    INTEGER,
     fetched_at  REAL
 );
 CREATE TABLE IF NOT EXISTS domain_facts (
@@ -115,7 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_businesses_run ON businesses(run_id);
 CREATE INDEX IF NOT EXISTS idx_businesses_domain ON businesses(domain);
 """
 
-
 class Store:
     """Thin SQLite wrapper.
 
@@ -135,7 +142,26 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        wanted = {
+            "runs": {"status": "TEXT", "run_table": "TEXT", "total": "INTEGER", "done": "INTEGER",
+                     "updated_at": "REAL"},
+            "businesses": {"stage": "TEXT", "website_source": "TEXT", "website_confidence": "INTEGER",
+                           "owner_name": "TEXT", "owner_title": "TEXT", "owner_source": "TEXT",
+                           "owner_confidence": "INTEGER", "chain_kind": "TEXT", "target_role": "TEXT",
+                           "domain_is_catch_all": "INTEGER"},
+            "emails": {"contact_type": "TEXT", "contact_name": "TEXT", "contact_title": "TEXT",
+                       "lead_eligible": "INTEGER", "is_personal_domain": "INTEGER"},
+        }
+        for table, columns in wanted.items():
+            existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for column, ctype in columns.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
 
     # --- page cache --------------------------------------------------------
     def get_page(self, url: str, ttl_hours: int) -> Optional[tuple[int, str, str]]:
@@ -235,6 +261,47 @@ class Store:
             )
             self.conn.commit()
 
+    # --- maps results cache (a crash must never cost the same search twice) ---
+    def get_maps(self, provider: str, query: str, ttl_hours: int) -> Optional[tuple[list[dict], bool]]:
+        with self._lock:
+            cutoff = time.time() - max(0, ttl_hours) * 3600
+            row = self.conn.execute(
+                "SELECT places, complete FROM maps_cache WHERE query_key = ? AND fetched_at >= ?",
+                (self._search_key(provider, query), cutoff),
+            ).fetchone()
+            if row is None or not row["places"]:
+                return None
+            try:
+                return json.loads(row["places"]), bool(row["complete"])
+            except ValueError:
+                return None
+
+    def get_maps_any(self, query: str, ttl_hours: int) -> Optional[tuple[list[dict], bool]]:
+        """Cached listings for a query from whichever provider fetched them."""
+        with self._lock:
+            cutoff = time.time() - max(0, ttl_hours) * 3600
+            row = self.conn.execute(
+                "SELECT places, complete FROM maps_cache WHERE query = ? AND fetched_at >= ? "
+                "ORDER BY fetched_at DESC LIMIT 1", (query, cutoff),
+            ).fetchone()
+            if row is None or not row["places"]:
+                return None
+            try:
+                return json.loads(row["places"]), bool(row["complete"])
+            except ValueError:
+                return None
+
+    def put_maps(self, provider: str, query: str, places: list[dict], complete: bool) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO maps_cache(query_key, provider, query, places, complete, fetched_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(query_key) DO UPDATE SET places=excluded.places, "
+                "complete=excluded.complete, fetched_at=excluded.fetched_at",
+                (self._search_key(provider, query), provider, query, json.dumps(places, default=str),
+                 int(complete), time.time()),
+            )
+            self.conn.commit()
+
     # --- domain facts ------------------------------------------------------
     def get_domain_facts(self, domain: str) -> Optional[tuple[Optional[bool], Optional[bool]]]:
         with self._lock:
@@ -267,23 +334,31 @@ class Store:
             self.conn.commit()
 
     # --- results -----------------------------------------------------------
-    def save_business(self, result: BusinessResult, run_id: str) -> None:
+    def save_business(self, result: BusinessResult, run_id: str, stage: str = "done") -> None:
         with self._lock:
             place = result.place
             key = place.dedupe_key()
+            owner = result.owner
             self.conn.execute(
                 "INSERT INTO businesses(key, run_id, query, name, place_id, category, address, city, "
                 "state, postal_code, phone, website, domain, rating, reviews, latitude, longitude, "
                 "google_url, is_chain, chain_score, chain_reasons, website_status, pages_crawled, "
-                "domain_has_mx, permutations_skipped_reason, notes, place_raw, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "domain_has_mx, permutations_skipped_reason, notes, place_raw, updated_at, "
+                "stage, website_source, website_confidence, owner_name, owner_title, owner_source, "
+                "owner_confidence, chain_kind, target_role, domain_is_catch_all) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET run_id=excluded.run_id, query=excluded.query, "
                 "name=excluded.name, website=excluded.website, domain=excluded.domain, "
                 "is_chain=excluded.is_chain, chain_score=excluded.chain_score, "
                 "chain_reasons=excluded.chain_reasons, website_status=excluded.website_status, "
                 "pages_crawled=excluded.pages_crawled, domain_has_mx=excluded.domain_has_mx, "
                 "permutations_skipped_reason=excluded.permutations_skipped_reason, "
-                "notes=excluded.notes, updated_at=excluded.updated_at",
+                "notes=excluded.notes, updated_at=excluded.updated_at, stage=excluded.stage, "
+                "website_source=excluded.website_source, "
+                "website_confidence=excluded.website_confidence, owner_name=excluded.owner_name, "
+                "owner_title=excluded.owner_title, owner_source=excluded.owner_source, "
+                "owner_confidence=excluded.owner_confidence, chain_kind=excluded.chain_kind, "
+                "target_role=excluded.target_role, domain_is_catch_all=excluded.domain_is_catch_all",
                 (
                     key, run_id, place.query, place.name, place.place_id, place.category,
                     place.address, place.city, place.state, place.postal_code, place.phone,
@@ -294,20 +369,24 @@ class Store:
                     None if result.domain_has_mx is None else int(result.domain_has_mx),
                     result.permutations_skipped_reason, json.dumps(result.notes),
                     json.dumps(place.raw)[:40000], time.time(),
+                    stage, result.website_source, result.website_confidence,
+                    owner.name if owner else None, owner.title if owner else None,
+                    owner.source if owner else None, owner.confidence if owner else None,
+                    result.chain_kind, result.target_role,
+                    None if result.domain_is_catch_all is None else int(result.domain_is_catch_all),
                 ),
             )
+            # Replace the address list wholesale: candidates dropped by filtering
+            # must not linger from an earlier save.
+            self.conn.execute("DELETE FROM emails WHERE business_key = ?", (key,))
             for candidate in result.emails:
                 verification = candidate.verification
                 self.conn.execute(
                     "INSERT INTO emails(business_key, email, source, source_url, pattern, context, "
                     "is_role, is_personal_domain, is_low_value, on_business_domain, status, "
-                    "sub_status, provider, score, confidence, notes, updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(business_key, email) DO UPDATE SET source=excluded.source, "
-                    "source_url=excluded.source_url, status=excluded.status, "
-                    "sub_status=excluded.sub_status, provider=excluded.provider, "
-                    "score=excluded.score, confidence=excluded.confidence, notes=excluded.notes, "
-                    "updated_at=excluded.updated_at",
+                    "sub_status, provider, score, confidence, notes, updated_at, "
+                    "contact_type, contact_name, contact_title, lead_eligible) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         key, candidate.email, candidate.source, candidate.source_url,
                         candidate.pattern, candidate.context[:300], int(candidate.is_role),
@@ -317,9 +396,109 @@ class Store:
                         verification.provider if verification else "",
                         verification.score if verification else None,
                         candidate.confidence, json.dumps(candidate.notes), time.time(),
+                        candidate.contact_type, candidate.contact_name, candidate.contact_title,
+                        int(candidate.lead_eligible),
                     ),
                 )
             self.conn.commit()
+
+    def done_business_keys(self, run_id: str) -> set[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT key FROM businesses WHERE run_id = ? AND stage = 'done'", (run_id,)
+            ).fetchall()
+            return {str(r["key"]) for r in rows}
+
+    def load_business(self, key: str) -> Optional[BusinessResult]:
+        """Rebuild a finished business - enough to export and publish it again."""
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM businesses WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                return None
+            email_rows = self.conn.execute(
+                "SELECT * FROM emails WHERE business_key = ? ORDER BY confidence DESC", (key,)
+            ).fetchall()
+        try:
+            raw = json.loads(row["place_raw"] or "{}")
+        except ValueError:
+            raw = {}
+        place = Place(
+            name=row["name"] or "", query=row["query"] or "", source="db",
+            place_id=row["place_id"] or "", category=row["category"] or "",
+            address=row["address"] or "", city=row["city"] or "", state=row["state"] or "",
+            postal_code=row["postal_code"] or "", phone=row["phone"] or "",
+            website=row["website"] or "", domain=row["domain"] or "",
+            latitude=row["latitude"], longitude=row["longitude"], rating=row["rating"],
+            reviews=row["reviews"], google_url=row["google_url"] or "", raw=raw,
+        )
+        owner = None
+        if row["owner_name"]:
+            owner = Person(name=row["owner_name"], title=row["owner_title"] or "",
+                           source=row["owner_source"] or "", confidence=row["owner_confidence"] or 0)
+        result = BusinessResult(
+            place=place, is_chain=bool(row["is_chain"]), chain_score=row["chain_score"] or 0,
+            chain_reasons=json.loads(row["chain_reasons"] or "[]"),
+            chain_kind=row["chain_kind"] or "", target_role=row["target_role"] or "",
+            website_status=row["website_status"] or "", website_source=row["website_source"] or "",
+            website_confidence=row["website_confidence"] or 0, owner=owner,
+            pages_crawled=json.loads(row["pages_crawled"] or "[]"),
+            domain_has_mx=None if row["domain_has_mx"] is None else bool(row["domain_has_mx"]),
+            domain_is_catch_all=None if row["domain_is_catch_all"] is None else bool(row["domain_is_catch_all"]),
+            permutations_skipped_reason=row["permutations_skipped_reason"] or "",
+            notes=json.loads(row["notes"] or "[]"),
+        )
+        for e in email_rows:
+            verification = None
+            if e["status"] and e["status"] != "skipped":
+                verification = VerificationResult(status=e["status"], provider=e["provider"] or "",
+                                                  score=e["score"], sub_status=e["sub_status"] or "")
+            result.emails.append(EmailCandidate(
+                email=e["email"], source=e["source"] or "", source_url=e["source_url"] or "",
+                pattern=e["pattern"] or "", context=e["context"] or "",
+                is_role=bool(e["is_role"]), is_personal_domain=bool(e["is_personal_domain"]),
+                is_low_value=bool(e["is_low_value"]), on_business_domain=bool(e["on_business_domain"]),
+                verification=verification, confidence=e["confidence"] or 0,
+                contact_type=e["contact_type"] or "general", contact_name=e["contact_name"] or "",
+                contact_title=e["contact_title"] or "",
+                lead_eligible=bool(e["lead_eligible"]) if e["lead_eligible"] is not None else True,
+                notes=json.loads(e["notes"] or "[]"),
+            ))
+        return result
+
+    def set_run_state(self, run_id: str, status: str, *, total: Optional[int] = None,
+                      done: Optional[int] = None, run_table: Optional[str] = None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE runs SET status = ?, total = COALESCE(?, total), done = COALESCE(?, done), "
+                "run_table = COALESCE(?, run_table), updated_at = ? WHERE run_id = ?",
+                (status, total, done, run_table, time.time(), run_id),
+            )
+            self.conn.commit()
+
+    def list_runs(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT run_id, started_at, finished_at, queries, status, total, done, run_table "
+                "FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                queries = json.loads(r["queries"] or "[]")
+            except ValueError:
+                queries = []
+            out.append({"run_id": r["run_id"], "started_at": r["started_at"] or 0.0,
+                        "finished_at": r["finished_at"], "queries": queries,
+                        "status": r["status"] or ("done" if r["finished_at"] else "unknown"),
+                        "total": r["total"] or 0, "done": r["done"] or 0,
+                        "run_table": r["run_table"] or ""})
+        return out
+
+    def latest_unfinished_run(self) -> Optional[dict]:
+        for run in self.list_runs(50):
+            if run["status"] in ("running", "interrupted", "failed"):
+                return run
+        return None
 
     def seen_business_keys(self, run_id: Optional[str] = None) -> set[str]:
         with self._lock:
@@ -346,7 +525,7 @@ class Store:
     def finish_run(self, run_id: str, stats: dict[str, Any]) -> None:
         with self._lock:
             self.conn.execute(
-                "UPDATE runs SET finished_at = ?, stats = ? WHERE run_id = ?",
+                "UPDATE runs SET finished_at = ?, stats = ?, status = 'done' WHERE run_id = ?",
                 (time.time(), json.dumps(stats, default=str), run_id),
             )
             self.conn.commit()
@@ -363,6 +542,7 @@ class Store:
                 "cached_pages": count("SELECT COUNT(*) FROM pages"),
                 "cached_verifications": count("SELECT COUNT(*) FROM verifications"),
             "cached_searches": count("SELECT COUNT(*) FROM web_searches"),
+            "cached_maps_queries": count("SELECT COUNT(*) FROM maps_cache"),
             }
 
     def vacuum(self) -> None:

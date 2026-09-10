@@ -15,6 +15,8 @@ from gmscrape import keys as K
 def clean_env(tmp_path, monkeypatch):
     snapshot = dict(os.environ)
     monkeypatch.setenv("GMSCRAPE_CONFIG", str(tmp_path / "cfg" / "config.env"))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "t.sqlite"))     # never the repo's database
+    monkeypatch.chdir(tmp_path)                                    # never the repo's .env
     for key in B.BUDDY_KEYS:
         monkeypatch.delenv(key.env, raising=False)
     monkeypatch.delenv("GENERIC_MAPS_CONFIG", raising=False)
@@ -112,7 +114,7 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
     monkeypatch.setattr("gmscrape.cli.cmd_run", fake_run)
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
     script = Script(
-        "", "", "", "", "", "",                  # keep / skip every key
+        "", "", "", "",                          # keep / skip every key
         "dentist in austin tx", "plumber in miami fl", "",   # searches
         "25",                                    # businesses per search
         "",                                      # Start? -> yes
