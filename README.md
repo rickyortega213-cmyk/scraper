@@ -82,8 +82,19 @@ environment variables beat both.
 Both API layers are adapters, so nothing in the pipeline changes when you swap
 vendors. Set **one** key and `MAPS_PROVIDER=auto` picks it up.
 
-**Google Maps** — built-in support for `scraperapi`, `serpapi`, `serper`,
-`outscraper`, `apify`, `scrapingdog`.
+**Google Maps** — the simplest route is an **MCP link**: paste
+`https://mcp.scraper.tech/<your key>` and nothing else needs configuring. The
+server describes its own tools, so gmscrape picks the maps-search tool, maps
+the query/limit/page arguments from its schema, and finds the listings in
+whatever it returns. `gmscrape probe-mcp --call` shows the tools, the exact
+call it would make, and the fields it recognised.
+
+```bash
+MCP_MAPS_URL=https://mcp.scraper.tech/…     # or paste it in `scraper buddy`
+```
+
+Also built in: `scraperapi`, `serpapi`, `serper`, `outscraper`, `apify`,
+`scrapingdog`.
 
 ```bash
 SCRAPERAPI_KEY=...     # or SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY /
@@ -487,7 +498,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 171 tests, no network or API keys needed
+make test     # 181 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -505,8 +516,9 @@ gmscrape/
   query.py            "business type in location" parsing
   probe.py            discover an unknown maps API's request/response shape
   core/pipeline.py    orchestration
-  providers/maps/     scraperapi, serpapi, serper, outscraper, apify,
-                      scrapingdog, generic, file
+  providers/maps/     mcp (scraper.tech), scraperapi, serpapi, serper, outscraper,
+                      apify, scrapingdog, generic, file
+  providers/mcp.py    minimal MCP client (Streamable HTTP, JSON or SSE replies)
   providers/verify/   mailtester, millionverifier, zerobounce, neverbounce,
                       reoon, emaillistverify, bouncer, generic, local
   providers/search/   openwebninja (web search: site discovery + owner lookup)

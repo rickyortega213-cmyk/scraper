@@ -232,6 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
     probe_cmd.add_argument("--show-sample", action="store_true",
                            help="print the full first result row")
 
+    # --- MCP debugging ---------------------------------------------------
+    mcp_cmd = sub.add_parser("probe-mcp", parents=[common],
+                             help="list the tools an MCP server offers, and try the maps search")
+    mcp_cmd.add_argument("url", nargs="?", help="MCP URL (default: saved MCP_MAPS_URL)")
+    mcp_cmd.add_argument("--query", default="dentist in austin tx")
+    mcp_cmd.add_argument("--call", action="store_true", help="also run one search and show the result")
+    mcp_cmd.add_argument("--tool", help="tool to call (default: auto-picked)")
+    mcp_cmd.add_argument("--raw", action="store_true", help="dump the raw result JSON")
+
     # --- web search debugging --------------------------------------------
     search_cmd = sub.add_parser("search", parents=[common],
                                 help="run one web search and show what the API returned")
@@ -726,6 +735,69 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_mcp(args: argparse.Namespace) -> int:
+    from .probe import describe_mapping, find_result_rows
+    from .providers.maps.mcp_provider import build_arguments, pick_maps_tool
+    from .providers.mcp import MCPClient, MCPError
+    from .query import parse_query
+
+    settings = settings_from_args(args)
+    url = args.url or settings.mcp_maps_url
+    if not url:
+        echo("[red]No MCP URL.[/red] Pass it, or save it with `gmscrape setup --only maps`")
+        return 2
+    client = MCPClient(url)
+    try:
+        info = client.initialize()
+        tools = client.list_tools()
+    except MCPError as exc:
+        echo(f"[red]{exc}[/red]")
+        return 1
+    echo(f"server: [green]{info.get('name', '?')} {info.get('version', '')}[/green]   "
+         f"{len(tools)} tool{'s' if len(tools) != 1 else ''}")
+    picked = pick_maps_tool(tools, args.tool or settings.mcp_maps_tool)
+    _print_table(
+        "Tools",
+        ("tool", "parameters", "description"),
+        [
+            (("→ " if picked and t.name == picked.name else "  ") + t.name,
+             ", ".join(f"{p}{'*' if p in t.required else ''}" for p in t.properties)[:60],
+             t.description[:70])
+            for t in tools
+        ],
+    )
+    if picked is None:
+        echo("[yellow]no tool looks like a maps search - pass --tool <name>[/yellow]")
+        return 1
+    spec = parse_query(args.query)
+    arguments = build_arguments(picked, spec, 5, 1)
+    echo(f"\nwould call [cyan]{picked.name}[/cyan] with {json.dumps(arguments)}")
+    if not args.call:
+        echo("[dim]add --call to run it (uses one credit) and see the listings[/dim]")
+        return 0
+    try:
+        payload = client.call_tool(picked.name, arguments)
+    except MCPError as exc:
+        echo(f"[red]{exc}[/red]")
+        return 1
+    finally:
+        client.close()
+    if args.raw:
+        print(json.dumps(payload, indent=2, default=str)[:20000])
+        return 0
+    path, rows = find_result_rows(payload)
+    if not rows:
+        echo("[yellow]no listings found in the result[/yellow] - run with --raw to see it")
+        return 1
+    echo(f"[green]✓ {len(rows)} listings[/green] at {path or '(top level)'}")
+    resolved, unresolved = describe_mapping(rows[0])
+    _print_table("Fields recognized in the first listing", ("place field", "value"), list(resolved.items()))
+    if unresolved:
+        echo(f"[dim]not found: {', '.join(unresolved)}   row keys: {', '.join(sorted(rows[0])[:24])}[/dim]")
+    echo("\nSave the link with [cyan]gmscrape setup --only maps[/cyan] (or `scraper buddy`) and you're set.")
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     from .providers import get_web_search
 
@@ -1013,6 +1085,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "extract": cmd_extract,
         "guess": cmd_guess,
         "probe-maps": cmd_probe_maps,
+        "probe-mcp": cmd_probe_mcp,
         "setup": cmd_setup,
         "keys": cmd_keys,
         "search": cmd_search,

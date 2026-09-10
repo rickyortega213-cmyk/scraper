@@ -40,7 +40,8 @@ class Script:
 
 
 def test_review_keys_keep_replace_add_remove(clean_env):
-    K.save_keys({"MAPS_API_KEY": "a25e0000000000000000000000000ce8", "MAILTESTER_KEY": "sub_old_key_1"})
+    K.save_keys({"MCP_MAPS_URL": "https://mcp.scraper.tech/a25e0000000000000000000000000ce8",
+                 "MAILTESTER_KEY": "sub_old_key_1"})
     K.load_saved_keys_into_env()
     script = Script(
         "",                     # Scraper Tech: keep (Enter = yes)
@@ -52,7 +53,7 @@ def test_review_keys_keep_replace_add_remove(clean_env):
     updates = B.review_keys(script.prompt, script.echo)
     assert updates == {"MAILTESTER_KEY": "sub_new_key_2", "OPENWEBNINJA_KEY": "ak_new"}
     assert os.environ["MAILTESTER_KEY"] == "sub_new_key_2"
-    assert K.read_saved_keys()["MAPS_API_KEY"].endswith("ce8")          # kept
+    assert K.read_saved_keys()["MCP_MAPS_URL"].endswith("ce8")          # kept
     # keys are shown masked, never in full
     assert not any("sub_old_key_1" in t for t in script.asked)
     assert any("sub_…y_1" in t and "keep it? [Y/n]" in t for t in script.asked)
@@ -99,8 +100,7 @@ def test_collect_queries_from_txt_and_csv(tmp_path: Path):
 
 
 def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_path):
-    K.save_keys({"MAPS_API_KEY": "k", "GENERIC_MAPS_CONFIG": str(tmp_path / "maps.json"),
-                 "MAILTESTER_KEY": "sub_x"})
+    K.save_keys({"MCP_MAPS_URL": "https://mcp.example/key", "MAILTESTER_KEY": "sub_x"})
     captured: dict = {}
 
     def fake_run(args):
@@ -127,9 +127,9 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
 
 def test_buddy_explains_when_maps_is_not_set_up(clean_env, monkeypatch):
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
-    script = Script("y", "abc123", "", "", "", "", "")     # adds a maps key, nothing else
+    script = Script("n", "n", "", "", "", "")               # declines every key
     assert B.buddy(script.prompt, script.echo) == 2
-    assert any("probe-maps" in line for line in script.said)
+    assert any("mcp.scraper.tech" in line for line in script.said)
 
 
 def test_scraper_command_routes(monkeypatch):

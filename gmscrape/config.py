@@ -78,6 +78,9 @@ class Settings:
     apify_actor: str = "compass~crawler-google-places"
     scrapingdog_key: str = ""
     scraperapi_key: str = ""
+    mcp_maps_url: str = ""            # e.g. https://mcp.scraper.tech/<key>
+    mcp_maps_tool: str = ""           # override the auto-picked tool name
+    mcp_maps_args: str = ""           # JSON template overriding the argument mapping
 
     mailtester_key: str = ""
     millionverifier_key: str = ""
@@ -221,6 +224,7 @@ class Settings:
             "apify": self.apify_token,
             "scrapingdog": self.scrapingdog_key,
             "scraperapi": self.scraperapi_key,
+            "mcp": self.mcp_maps_url,
             "generic": self.generic_maps_config,
             "file": self.places_file,
         }

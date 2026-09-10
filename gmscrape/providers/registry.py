@@ -10,6 +10,7 @@ from .base import EmailVerifier, MapsProvider, ProviderError
 from .maps.apify import ApifyMaps
 from .maps.file_provider import FileMaps
 from .maps.generic import GenericMaps
+from .maps.mcp_provider import MCPMaps
 from .maps.outscraper import OutscraperMaps
 from .maps.scraperapi import ScraperApiMaps
 from .maps.scrapingdog import ScrapingDogMaps
@@ -31,6 +32,7 @@ MAPS_PROVIDERS: dict[str, Type[MapsProvider]] = {
     ApifyMaps.name: ApifyMaps,
     ScrapingDogMaps.name: ScrapingDogMaps,
     ScraperApiMaps.name: ScraperApiMaps,
+    MCPMaps.name: MCPMaps,
     "generic": GenericMaps,
     "file": FileMaps,
 }
@@ -45,7 +47,7 @@ VERIFY_PROVIDERS: dict[str, Type[EmailVerifier]] = {
 # Auto-detection order: whichever credential is present wins, most specific
 # (a real maps API) before the local-file fallback.
 MAPS_AUTO_ORDER = (
-    "generic", "scraperapi", "serpapi", "serper", "outscraper", "apify",
+    "mcp", "generic", "scraperapi", "serpapi", "serper", "outscraper", "apify",
     "scrapingdog", "file",
 )
 VERIFY_AUTO_ORDER = (
@@ -90,8 +92,8 @@ def detect_maps_provider(settings: Settings) -> str:
         if keys.get(name):
             return name
     raise ProviderError(
-        "No Google Maps provider configured. Set one of "
-        "SCRAPERAPI_KEY / SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY / "
+        "No Google Maps provider configured. Set MCP_MAPS_URL (your scraper.tech MCP "
+        "link), or one of SCRAPERAPI_KEY / SERPAPI_KEY / SERPER_KEY / OUTSCRAPER_KEY / "
         "APIFY_TOKEN / SCRAPINGDOG_KEY, or describe your own API with "
         "GENERIC_MAPS_CONFIG "
         "(see examples/maps_api.example.json), or pass "

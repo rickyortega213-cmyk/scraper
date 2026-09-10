@@ -48,7 +48,7 @@ class BuddyKey:
 
 # Only the keys this product actually uses, in the order they matter.
 BUDDY_KEYS: tuple[BuddyKey, ...] = (
-    BuddyKey("Scraper Tech (Google Maps)", "MAPS_API_KEY", "finds the businesses"),
+    BuddyKey("Scraper Tech MCP link (Google Maps)", "MCP_MAPS_URL", "finds the businesses"),
     BuddyKey("MailTester Ninja (email verification)", "MAILTESTER_KEY", "confirms emails are real"),
     BuddyKey("OpenWeb Ninja (web search)", "OPENWEBNINJA_KEY",
              "finds missing websites and owners", optional=True),
@@ -161,15 +161,12 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
     K.load_saved_keys_into_env()
     review_keys(prompt, rich_echo if echo is print else echo)
 
-    if not os.getenv("MAPS_API_KEY") and not os.getenv("GENERIC_MAPS_CONFIG"):
+    if not any(os.getenv(k) for k in ("MCP_MAPS_URL", "GENERIC_MAPS_CONFIG", "SCRAPERAPI_KEY",
+                                       "SERPAPI_KEY", "SERPER_KEY", "OUTSCRAPER_KEY",
+                                       "APIFY_TOKEN", "SCRAPINGDOG_KEY")):
         echo("")
-        echo("No Google Maps key saved - the scrape cannot find businesses without one.")
-        return 2
-    if os.getenv("MAPS_API_KEY") and not os.getenv("GENERIC_MAPS_CONFIG"):
-        echo("")
-        echo("The Scraper Tech key is saved but its API address is not set up yet.")
-        echo("Run once:  gmscrape probe-maps https://<api host from the docs> --write scrapertech_maps.json")
-        echo("then:      gmscrape setup --only maps   (put that file under 'Custom maps API config file')")
+        echo("No Google Maps link saved - the scrape cannot find businesses without one.")
+        echo("Paste your scraper.tech MCP link (https://mcp.scraper.tech/<key>) at the first question.")
         return 2
 
     queries = collect_queries(prompt, echo)

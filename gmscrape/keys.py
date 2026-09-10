@@ -38,6 +38,8 @@ class KeyField:
 
 
 KEY_FIELDS: tuple[KeyField, ...] = (
+    KeyField("MCP_MAPS_URL", "Scraper Tech MCP link",
+             "https://mcp.scraper.tech/<your key> - from your scraper.tech panel", "maps"),
     KeyField("SCRAPERAPI_KEY", "ScraperAPI key", "32-char hex, from scraperapi.com dashboard", "maps"),
     KeyField("SERPAPI_KEY", "SerpApi key", "serpapi.com/manage-api-key", "maps"),
     KeyField("SERPER_KEY", "Serper.dev key", "serper.dev/api-key", "maps"),
