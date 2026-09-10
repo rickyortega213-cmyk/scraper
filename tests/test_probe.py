@@ -168,5 +168,5 @@ def test_describe_mapping_flags_unmapped_fields():
 
 
 def test_keys_are_redacted_in_output():
-    assert redact(f"https://x/?apikey={API_KEY}", API_KEY) == "https://x/?apikey=a25e…00"
+    assert redact(f"https://x/?apikey={API_KEY}", API_KEY) == "https://x/?apikey=0123…ef"
     assert redact("no key here", "short") == "no key here"
