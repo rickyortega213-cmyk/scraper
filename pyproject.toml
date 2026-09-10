@@ -24,6 +24,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 gmscrape = "gmscrape.cli:main"
+scraper = "gmscrape.buddy:main"
 
 [tool.setuptools.packages.find]
 include = ["gmscrape*"]

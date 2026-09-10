@@ -33,11 +33,34 @@ publishes none, and verifies everything before it lands in your CSV.
 ## Quick start
 
 ```bash
-make dev                      # venv + install + dev deps
-gmscrape setup                # paste your API keys once - they're saved
-gmscrape run "dentist in austin tx" "plumber in miami fl"
-gmscrape run -f examples/queries.txt --limit 60 --format all
+make dev                      # venv + install (one time)
+source .venv/bin/activate
+scraper buddy                 # that's it
 ```
+
+`scraper buddy` walks you through everything:
+
+```
+  API keys on file
+    Scraper Tech (Google Maps) ............ a25e…ce8   keep it? [Y/n]
+    MailTester Ninja (email verification)  sub_…ABC   keep it? [Y/n]
+    OpenWeb Ninja (web search) ............ not set    add it now? [y/N]
+    Supabase URL (live table) ............. not set    add it now? [y/N]
+
+  Searches - paste them, one per line (business type in location),
+  then press Enter on an empty line. Or type the path to a .txt / .csv file.
+    > dentist in austin tx
+    > plumber in miami fl
+    >
+
+  2 searches. Businesses per search [40]:
+  Start? [Y/n]
+```
+
+Then it runs, fills the live table, prints the finished leads and writes
+`out/leads.csv`. Keys are remembered between runs. The full CLI is still there
+for scripting: `gmscrape run "dentist in austin tx" -n 40`, `gmscrape run -f
+queries.txt`, `gmscrape setup`, and everything below.
 
 Keys are saved to `~/.config/gmscrape/config.env` (owner-only permissions), so
 they work from any folder and survive a fresh clone. The first `run` with no
@@ -464,7 +487,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 164 tests, no network or API keys needed
+make test     # 171 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
