@@ -206,6 +206,53 @@ class RunStopped(Exception):
 DEFERRED = "deferred_guess"      # planned in pass 1, checked in the guess pass
 
 
+class AdaptiveGate:
+    """A concurrency limit that shrinks on HTTP 429 and grows back on success.
+
+    The search provider's plan limit is unknown up front, so start at the
+    configured ceiling, halve the open slots (never below `floor`) when it
+    pushes back, and add a slot back after every `recover_after` clean calls.
+    """
+
+    def __init__(self, limit: int, floor: int = 4, recover_after: int = 100) -> None:
+        self.ceiling = max(1, limit)
+        self.limit = self.ceiling
+        self.floor = max(1, min(floor, self.ceiling))
+        self.recover_after = recover_after
+        self._active = 0
+        self._clean = 0
+        self._hold_until = 0.0
+        self._cv = threading.Condition()
+
+    def __enter__(self) -> "AdaptiveGate":
+        with self._cv:
+            while self._active >= self.limit or time.monotonic() < self._hold_until:
+                pause = max(0.05, self._hold_until - time.monotonic()) if self._active < self.limit else None
+                self._cv.wait(timeout=pause)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._cv:
+            self._active -= 1
+            self._cv.notify_all()
+
+    def penalize(self, hold: float = 3.0) -> None:
+        with self._cv:
+            self.limit = max(self.floor, self.limit // 2)
+            self._hold_until = max(self._hold_until, time.monotonic() + hold)
+            self._clean = 0
+            self._cv.notify_all()
+
+    def reward(self) -> None:
+        with self._cv:
+            self._clean += 1
+            if self._clean >= self.recover_after and self.limit < self.ceiling:
+                self.limit += 1
+                self._clean = 0
+                self._cv.notify_all()
+
+
 @dataclass
 class _Work:
     """One batch on the conveyor; `chunk_end` marks the last batch of a chunk."""
@@ -241,6 +288,7 @@ class Pipeline:
         # at a dozen threads, which silently capped WEB_SEARCH_CONCURRENCY.
         self._search_pool = ThreadPoolExecutor(
             max_workers=max(1, settings.web_search_concurrency), thread_name_prefix="gmscrape-search")
+        self._search_gate = AdaptiveGate(max(1, settings.web_search_concurrency))
         self._window: collections.deque = collections.deque(maxlen=12)   # (time, done) per batch
         self.web_search = web_search if web_search is not None else get_web_search(settings)
         self.progress = progress or (lambda event, data: None)
@@ -569,6 +617,10 @@ class Pipeline:
             "searches": st["search_n"],
             "fetch_avg": (st["fetch_s"] / st["fetch_n"]) if st["fetch_n"] else 0.0,
             "fetches": st["fetch_n"],
+            "checks": self._verify_calls,
+            "check_gap": float(getattr(self.verifier, "current_interval", 0.0) or 0.0),
+            "keys": int(getattr(self.verifier, "working_keys", 1) or 1),
+            "search_slots": self._search_gate.limit,
         }
 
     # --- pass 2: the guesses, most valuable first, while time allows ----------
@@ -1062,16 +1114,22 @@ class Pipeline:
         disabled = getattr(self, "_search_disabled", "")
         if disabled:
             return SearchResponse(query=query, error=disabled)
-        try:
-            response = self.web_search.search(query, limit=10)
-        except ProviderError as exc:
-            # A rejected key fails every call the same way - stop asking.
-            self._search_disabled = str(exc)
-            log.error("web search disabled for this run: %s", exc)
-            return SearchResponse(query=query, error=str(exc))
-        except Exception as exc:  # noqa: BLE001 - search is best effort
-            log.warning("web search failed for %r: %s", query, exc)
-            return SearchResponse(query=query, error=f"{type(exc).__name__}: {exc}")
+        with self._search_gate:
+            try:
+                response = self.web_search.search(query, limit=10)
+            except ProviderError as exc:
+                # A rejected key fails every call the same way - stop asking.
+                self._search_disabled = str(exc)
+                log.error("web search disabled for this run: %s", exc)
+                return SearchResponse(query=query, error=str(exc))
+            except Exception as exc:  # noqa: BLE001 - search is best effort
+                log.warning("web search failed for %r: %s", query, exc)
+                return SearchResponse(query=query, error=f"{type(exc).__name__}: {exc}")
+        if response.error and ("429" in response.error or "rate" in response.error.lower()):
+            self._search_gate.penalize()
+            log.info("web search throttled; now %d searches at a time", self._search_gate.limit)
+        elif not response.error:
+            self._search_gate.reward()
         self._search_calls += 1
         if response.ok and response.raw:
             self.store.put_search(self.web_search.name, query, response.raw)

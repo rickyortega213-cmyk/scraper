@@ -566,7 +566,7 @@ keeps the rest of the machine busy around them:
    check per contact type per business, best candidate first (a company-domain
    address before a free-mail one), stopping at the first deliverable one. A
    site listing twenty staff mailboxes costs one check. Several batches are
-   crawled at once (`PREPARE_AHEAD`, default 4, sharing `HTTP_CONCURRENCY`
+   crawled at once (`PREPARE_AHEAD`, default 8, sharing `HTTP_CONCURRENCY`
    sockets) while earlier ones are being checked, so one dead host that hangs
    through its timeouts only delays its own batch; each site gets
    `SITE_TIMEOUT` (45 s) for discovery, crawl and owner search combined, then
@@ -664,7 +664,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 245 tests, no network or API keys needed
+make test     # 246 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

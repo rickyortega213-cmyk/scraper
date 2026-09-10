@@ -227,3 +227,38 @@ def test_progress_reports_pace_by_stage_and_a_settled_eta(settings, site_server)
     assert set(stages) >= {"maps", "crawl", "verify", "search_avg", "fetch_avg", "fetches"}
     assert stages["crawl"] > 0 and stages["fetches"] > 0 and stages["fetch_avg"] > 0
     assert stages["maps"] >= 0 and "time_left" in batches[-1]
+
+
+def test_search_gate_backs_off_on_429_and_recovers():
+    import threading
+    from gmscrape.core.pipeline import AdaptiveGate
+
+    gate = AdaptiveGate(8, floor=2, recover_after=3)
+    assert gate.limit == 8
+    gate.penalize(hold=0.05)
+    gate.penalize(hold=0.05)
+    assert gate.limit == 2                         # halved twice
+    gate.penalize(hold=0.05)
+    assert gate.limit == 2                         # never below the floor
+    for _ in range(3):
+        gate.reward()
+    assert gate.limit == 3                         # one slot back after three clean calls
+
+    # Only `limit` callers get in at once.
+    inside, peak, lock = [0], [0], threading.Lock()
+
+    def worker():
+        with gate:
+            with lock:
+                inside[0] += 1
+                peak[0] = max(peak[0], inside[0])
+            threading.Event().wait(0.05)
+            with lock:
+                inside[0] -= 1
+
+    threads = [threading.Thread(target=worker) for _ in range(9)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert peak[0] <= 3

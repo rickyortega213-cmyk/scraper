@@ -1343,9 +1343,13 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
             stages = data.get("stages") or {}
             if stages and state["batches"] % 5 == 0:
                 n = state["batches"]
+                gap = f", {stages['check_gap']:.2f}s apart" if stages.get("check_gap") else ""
+                keys = f" on {stages['keys']} key{'s' if stages['keys'] != 1 else ''}" if stages.get("checks") else ""
                 echo(f"  [dim]pace per batch: crawl+search {_fmt_duration(stages['crawl'] / n)} "
-                     f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg) · "
-                     f"verify {_fmt_duration(stages['verify'] / n)} · maps {_fmt_duration(stages['maps'])} total[/dim]")
+                     f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg, "
+                     f"{stages.get('search_slots', 0)} at a time) · "
+                     f"verify {_fmt_duration(stages['verify'] / n)} ({stages.get('checks', 0) // n} checks{gap}{keys}) · "
+                     f"maps {_fmt_duration(stages['maps'])} total[/dim]")
             budget = data.get("time_left")
             if (data.get("eta_settled") and data["eta"] and budget not in (None, float("inf"))
                     and data["eta"] > budget and not state.get("budget_warned")):

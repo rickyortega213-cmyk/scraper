@@ -210,6 +210,12 @@ class MailTesterNinja(EmailVerifier):
         return len(self._slots)
 
     @property
+    def current_interval(self) -> float:
+        """Seconds between checks on the busiest key right now (0 = unmetered)."""
+        live = [s.limiter.interval for s in self._slots if not s.auth_error]
+        return max(live) if live else 0.0
+
+    @property
     def working_keys(self) -> int:
         return sum(1 for s in self._slots if not s.auth_error)
 
