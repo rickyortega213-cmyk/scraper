@@ -73,6 +73,23 @@ class PageCache(Protocol):
     def put_page(self, url: str, status: int, final_url: str, html: str) -> None: ...
 
 
+class _NoCookieJar(__import__("http.cookiejar").cookiejar.CookieJar):
+    """A jar that keeps nothing and sends nothing."""
+
+    def extract_cookies(self, response, request) -> None:  # noqa: D401
+        return None
+
+    def add_cookie_header(self, request) -> None:
+        return None
+
+    def set_cookie(self, cookie) -> None:
+        return None
+
+
+def no_cookie_jar():
+    return _NoCookieJar()
+
+
 class Fetcher:
     """Async HTTP client with politeness controls."""
 
@@ -92,6 +109,9 @@ class Fetcher:
             max_connections=max(4, self.settings.http_concurrency * 2),
             max_keepalive_connections=self.settings.http_concurrency,
         )
+        # No cookie jar: a crawler gains nothing from cookies, and a site that
+        # sets one with a non-ASCII value (seen in the wild) made every later
+        # request to it fail with "'ascii' codec can't encode character".
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.http_timeout),
             follow_redirects=True,
@@ -102,6 +122,8 @@ class Fetcher:
             },
             verify=True,
         )
+        # httpx re-wraps any jar it is handed at construction; set ours afterwards.
+        self._client.cookies.jar = no_cookie_jar()
         return self
 
     async def __aexit__(self, *exc: object) -> None:

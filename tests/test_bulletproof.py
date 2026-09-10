@@ -241,3 +241,59 @@ def test_mcp_client_retries_transient_errors(monkeypatch):
     client = MCPClient("http://mcp.test/key", client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert client.initialize()["name"] == "ok"
     assert attempts["n"] >= 3
+
+
+# --- cookies never come back to bite -------------------------------------------
+def test_a_sites_non_ascii_cookie_does_not_break_its_next_page(tmp_path, monkeypatch):
+    """Seen in the wild: a Set-Cookie with an accented value made every later
+    request to that site fail with "'ascii' codec can't encode character".
+    The crawler keeps no cookies at all."""
+    import asyncio
+
+    import httpx
+
+    import gmscrape.web.fetch as F
+
+    def handler(request):
+        if request.url.path == "/":
+            raw = [(b"content-type", b"text/html"),
+                   (b"set-cookie", ("sesion=" + "x" * 400 + "ó; Path=/").encode("utf-8"))]
+            return httpx.Response(200, headers=raw, text="<html><a href='/about'>about</a></html>")
+        assert "cookie" not in {k.lower() for k in request.headers}
+        return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>about</html>")
+
+    real_client = httpx.AsyncClient
+
+    def client_with_fake_transport(**kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(F.httpx, "AsyncClient", client_with_fake_transport)
+    settings = Settings.from_env(db_path=str(tmp_path / "t.sqlite"), obey_robots=False, cache_http=False,
+                                 http_retries=0)
+
+    async def crawl():
+        async with F.Fetcher(settings) as fetcher:
+            home = await fetcher.get("http://site.test/")
+            about = await fetcher.get("http://site.test/about")
+            return home, about
+
+    home, about = asyncio.run(crawl())
+    assert home.ok and about.ok and "about" in about.html
+
+
+def test_runs_also_log_to_a_file(tmp_path):
+    import logging
+
+    from gmscrape.cli import add_log_file
+
+    path = tmp_path / "out" / "scraper.log"
+    add_log_file(str(path))
+    logging.getLogger("gmscrape.test").warning("something worth keeping")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    assert path.exists() and "something worth keeping" in path.read_text(encoding="utf-8")
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if getattr(handler, "baseFilename", "") == str(path):
+            root.removeHandler(handler)
+            handler.close()

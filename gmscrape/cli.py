@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -338,7 +339,7 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     return Settings.from_env(**overrides)
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: str, log_file: Optional[str] = None) -> None:
     logging.basicConfig(
         level=getattr(logging, (level or "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -347,6 +348,44 @@ def configure_logging(level: str) -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    if log_file:
+        add_log_file(log_file)
+
+
+def add_log_file(path: str) -> None:
+    """Everything the terminal shows (and the debug lines it does not) also goes
+    to a file, so a run that ends without a trace still leaves one."""
+    import logging.handlers
+
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(path, maxBytes=20_000_000, backupCount=3,
+                                                       encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
+        root.addHandler(handler)
+        logging.getLogger(__name__).info("log file: %s", path)
+
+
+def _keep_awake() -> None:
+    """On a Mac, stop idle sleep for as long as this process lives (caffeinate
+    exits by itself when the run does). A closed lid still sleeps the machine."""
+    if sys.platform != "darwin":
+        return
+    import shutil
+    import subprocess
+
+    if not shutil.which("caffeinate"):
+        return
+    try:
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 # --- commands --------------------------------------------------------------
@@ -366,6 +405,7 @@ def _raise_open_file_limit() -> None:
 
 def _launch() -> None:
     _raise_open_file_limit()
+    _keep_awake()
     from .banner import print_banner
 
     print_banner(_console)
@@ -572,6 +612,7 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
         echo(f"resuming run [cyan]{run_id}[/cyan]: {previous['done']}/{previous['total']} businesses "
              f"already done, {len(queries)} search{'es' if len(queries) != 1 else ''}")
 
+    add_log_file(str(Path(settings.out_dir) / "scraper.log"))
     exporter = _Exporter(settings, basename)
     maps = None
     if resume:

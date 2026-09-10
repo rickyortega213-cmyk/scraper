@@ -628,6 +628,11 @@ Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
   of zero, and the end of the run lists the searches that found nothing with
   the command that shows the provider's raw answer:
   `gmscrape probe-mcp --call --raw --query "hotels in banning ca"`.
+- **Every run also writes `out/scraper.log`** (rotating, 20 MB × 3), so a
+  run that ends without a word on the terminal still leaves a record of its
+  last minutes. On a Mac the program also runs `caffeinate` for as long as it
+  lives, so the machine will not idle-sleep mid-run (a closed lid still
+  sleeps it; `scraper resume` picks up afterwards).
 - **`scraper resume`** restores the finished businesses from the database and
   continues with the rest — no re-crawling, no re-verifying, no second Maps
   call. `scraper buddy` offers this itself when it finds an unfinished run.
@@ -669,7 +674,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 249 tests, no network or API keys needed
+make test     # 252 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
