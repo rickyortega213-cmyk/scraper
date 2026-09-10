@@ -26,7 +26,7 @@ from gmscrape.probe import (
 from gmscrape.providers.maps.generic import GenericMaps
 from gmscrape.query import parse_query
 
-API_KEY = "a25e81925a234be01f25f4dedd3c7ce8000"   # shape only, not a real key
+API_KEY = "0123456789abcdef0123456789abcdef"   # 32 hex chars, like a real key
 
 LISTINGS = [
     {
