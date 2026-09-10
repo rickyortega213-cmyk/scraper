@@ -589,6 +589,14 @@ def cmd_probe_maps(args: argparse.Namespace) -> int:
     )
 
     if winner is None:
+        from .probe import looks_like_website
+
+        if looks_like_website(attempts):
+            echo(f"[yellow]{args.endpoint} is a website, not an API host[/yellow] - every reply "
+                 "was an HTML page. Open the provider's docs or API playground, copy the request "
+                 "URL from a code sample (it is usually on a different host, e.g. api.<domain>), "
+                 "and re-run probe-maps with that URL.")
+            return 1
         echo("[yellow]No request shape returned business listings.[/yellow]")
         echo("The status codes above usually say why:")
         echo("  • 401/403 everywhere → the key is not being accepted in any of "

@@ -138,7 +138,11 @@ def _record(
     try:
         payload = response.json()
     except ValueError:
-        attempt.error = "response was not JSON"
+        body = (response.text or "").lstrip()[:200].lower()
+        attempt.error = (
+            "HTML page, not an API (wrong host - find the API base URL in the docs or playground)"
+            if body.startswith(("<!doctype", "<html", "<head")) else "response was not JSON"
+        )
         return attempt
     path, rows = find_result_rows(payload)
     attempt.results_path = path
@@ -233,6 +237,11 @@ def probe_maps_api(
 def _is_missing(attempt: Attempt) -> bool:
     """Whether this attempt says "no endpoint here"."""
     return bool(attempt.error) or attempt.status in NOT_FOUND_STATUS
+
+
+def looks_like_website(attempts: list[Attempt]) -> bool:
+    """Every reply was an HTML page: we were pointed at a site, not an API."""
+    return bool(attempts) and all(a.error.startswith("HTML page") for a in attempts)
 
 
 def _candidate_urls(endpoint: str) -> list[str]:
