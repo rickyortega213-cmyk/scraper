@@ -98,7 +98,7 @@ class Settings:
     discover_websites: bool = True      # search for a site when Maps has none
     find_owners: bool = True            # look for the owner on the website
     owner_search: bool = True           # ...and via web search when the site is silent
-    web_search_concurrency: int = 10
+    web_search_concurrency: int = 16
     search_cache_ttl_hours: int = 720
     website_min_confidence: int = 60    # accept a discovered site at/above this
     owner_min_confidence: int = 60      # guess owner addresses at/above this
@@ -113,7 +113,7 @@ class Settings:
     language: str = "en"
     country: str = "us"
     maps_max_pages: int = 5
-    maps_concurrency: int = 6          # queries fetched in parallel
+    maps_concurrency: int = 8          # queries fetched in parallel
     maps_cache_ttl_hours: int = 168    # a crash never re-buys the same search
     batch_size: int = 100              # businesses per checkpoint
     query_chunk_size: int = 25         # queries fetched, then enriched, at a time (streaming)
@@ -123,8 +123,8 @@ class Settings:
     # --- website crawling --------------------------------------------------
     crawl_websites: bool = True
     max_pages_per_site: int = 6
-    http_timeout: float = 20.0
-    http_concurrency: int = 24
+    http_timeout: float = 15.0
+    http_concurrency: int = 48
     per_host_concurrency: int = 2
     http_retries: int = 2
     http_max_bytes: int = 3_000_000
@@ -137,16 +137,18 @@ class Settings:
     # --- permutations ------------------------------------------------------
     permutations: bool = True
     permutation_tier: int = 2         # 1=safest few, 2=common, 3=aggressive
-    permutation_max: int = 12
+    permutation_max: int = 6          # guesses checked per business before giving up
     permutation_require_mx: bool = True
     permutations_for_chains: bool = False
     stop_on_first_valid: bool = True
-    owner_permutation_max: int = 8
+    owner_permutation_max: int = 4    # first@, first.last@, flast@, firstl@
     require_verified_guesses: bool = True   # a guess must verify `valid` to become a lead row
 
     # --- verification ------------------------------------------------------
     verify_emails: bool = True
     verify_found: bool = True
+    verify_found_max: int = 3         # found addresses verified per business per contact type (0 = all)
+    prepare_ahead: int = 2            # batches crawled while the current one is being verified
     verify_permutations: bool = True
     verify_concurrency: int = 16      # enough in flight to use the Ultimate rate
     verify_budget: int = 0            # 0 = unlimited API calls for the run

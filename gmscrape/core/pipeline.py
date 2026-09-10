@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,6 +44,7 @@ from ..models import (
     Place,
     QuerySpec,
     SOURCE_MAPS,
+    SOURCE_WEIGHT,
     SOURCE_SEARCH,
     VerificationResult,
     V_CATCH_ALL,
@@ -193,6 +196,14 @@ class RunStopped(Exception):
         self.cause = cause
 
 
+@dataclass
+class _Work:
+    """One batch on the conveyor; `chunk_end` marks the last batch of a chunk."""
+
+    batch: list[BusinessResult]
+    chunk_end: Optional[tuple[list[QuerySpec], dict[str, int]]] = None
+
+
 class Pipeline:
     def __init__(
         self,
@@ -211,6 +222,7 @@ class Pipeline:
         self._owns_store = store is None
         self.maps = maps or get_maps_provider(settings)
         self.verifier = verifier or get_verifier(settings)
+        self._outstanding = 0               # businesses handed out but not yet finished
         self.web_search = web_search if web_search is not None else get_web_search(settings)
         self.progress = progress or (lambda event, data: None)
         self._search_calls = 0
@@ -268,6 +280,7 @@ class Pipeline:
 
         seen_keys: set[str] = set()
         pending_specs = list(specs)
+        self._outstanding = 0
         try:
             if resume:
                 done_queries = self.store.done_queries(report.run_id)
@@ -287,26 +300,12 @@ class Pipeline:
             chunk_size = max(1, self.settings.query_chunk_size)
             batch_size = max(1, self.settings.batch_size)
             started = time.time()
-            businesses_per_query: list[int] = []
-            for offset in range(0, len(pending_specs), chunk_size):
-                chunk = pending_specs[offset: offset + chunk_size]
-                found_per_query: dict[str, int] = {}
-                places = self._collect_places(chunk, report, found_per_query)
-                fresh = [p for p in places if p.dedupe_key() not in seen_keys]
-                seen_keys.update(p.dedupe_key() for p in fresh)
-                results = self._classify(fresh)
-                businesses_per_query.extend(found_per_query.values())
-                remaining_queries = len(pending_specs) - offset - len(chunk)
-                avg = (sum(businesses_per_query) / len(businesses_per_query)) if businesses_per_query else 0
-                report.total = report.done + len(results) + int(avg * remaining_queries)
-
-                if results:
-                    self._publish(results, STATUS_QUEUED)
-                    self._sink_call("flush")
-                for b in range(0, len(results), batch_size):
-                    batch = results[b: b + batch_size]
-                    self._process_batch(batch, report)
-                    report.absorb(batch)
+            items = self._work_items(pending_specs, report, seen_keys, chunk_size, batch_size)
+            for work in self._prepared(items, self.settings.prepare_ahead):
+                if work.batch:
+                    self._finish_batch(work.batch, report)
+                    report.absorb(work.batch)
+                    self._outstanding -= len(work.batch)
                     self.store.set_run_state(report.run_id, "running", total=report.total, done=report.done)
                     elapsed = time.time() - started
                     rate = (report.done - report.resumed) / elapsed if elapsed > 0 else 0.0
@@ -316,15 +315,17 @@ class Pipeline:
                         "elapsed": elapsed,
                         "eta": ((report.total - report.done) / rate) if rate > 0 else 0.0,
                         "rate_per_hour": rate * 3600,
-                        "batch_results": batch,
+                        "batch_results": work.batch,
                         "results": report.results,
                     })
                     if lean:
-                        for r in batch:
+                        for r in work.batch:
                             r.place.raw = {}
-                self.store.mark_queries_done(report.run_id, [c.search_string for c in chunk], found_per_query)
-                report.queries_done += len(chunk)
-                self.progress("chunk_done", {"queries_done": report.queries_done, "queries": len(specs)})
+                if work.chunk_end is not None:
+                    chunk, found_per_query = work.chunk_end
+                    self.store.mark_queries_done(report.run_id, [c.search_string for c in chunk], found_per_query)
+                    report.queries_done += len(chunk)
+                    self.progress("chunk_done", {"queries_done": report.queries_done, "queries": len(specs)})
         except BaseException as exc:
             status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             report.status = status
@@ -351,14 +352,97 @@ class Pipeline:
         self.progress("run_finished", {"stats": stats})
         return report
 
-    def _process_batch(self, batch: list[BusinessResult], report: RunReport) -> None:
-        """Crawl, guess, verify, score and checkpoint one batch of businesses."""
+    # --- the batch conveyor -------------------------------------------------
+    def _work_items(self, pending_specs: list[QuerySpec], report: RunReport, seen_keys: set[str],
+                    chunk_size: int, batch_size: int):
+        """Fetch Maps results chunk by chunk and hand out batches of new
+        businesses. The last batch of a chunk carries the chunk so the caller
+        can mark its searches done once that batch is finished."""
+        businesses_per_query: list[int] = []
+        for offset in range(0, len(pending_specs), chunk_size):
+            chunk = pending_specs[offset: offset + chunk_size]
+            found_per_query: dict[str, int] = {}
+            places = self._collect_places(chunk, report, found_per_query)
+            fresh = [p for p in places if p.dedupe_key() not in seen_keys]
+            seen_keys.update(p.dedupe_key() for p in fresh)
+            results = self._classify(fresh)
+            businesses_per_query.extend(found_per_query.values())
+            remaining_queries = len(pending_specs) - offset - len(chunk)
+            avg = (sum(businesses_per_query) / len(businesses_per_query)) if businesses_per_query else 0
+            self._outstanding += len(results)
+            report.total = report.done + self._outstanding + int(avg * remaining_queries)
+            if results:
+                self._publish(results, STATUS_QUEUED)
+                self._sink_call("flush")
+            batches = [results[b: b + batch_size] for b in range(0, len(results), batch_size)] or [[]]
+            for index, batch in enumerate(batches):
+                last = index == len(batches) - 1
+                yield _Work(batch, (chunk, found_per_query) if last else None)
+
+    def _prepared(self, items, ahead: int):
+        """Yield work with its crawl/guess stage done. With `ahead` > 0 that
+        stage runs on a helper thread up to `ahead` batches in front, so the
+        rate-limited verification of one batch overlaps the crawling of the
+        next instead of the whole run being the sum of both."""
+        if ahead <= 0:
+            for work in items:
+                self._prepare_batch(work.batch)
+                yield work
+            return
+
+        handoff: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=ahead)
+        stop = threading.Event()
+
+        def hand(kind: str, item: object) -> None:
+            while not stop.is_set():
+                try:
+                    handoff.put((kind, item), timeout=0.5)
+                    return
+                except queue.Full:
+                    continue
+
+        def producer() -> None:
+            try:
+                for work in items:
+                    if stop.is_set():
+                        return
+                    self._prepare_batch(work.batch)
+                    hand("work", work)
+                hand("done", None)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                hand("error", exc)
+
+        thread = threading.Thread(target=producer, name="gmscrape-prepare", daemon=True)
+        thread.start()
+        try:
+            while True:
+                kind, item = handoff.get()
+                if kind == "error":
+                    raise item  # type: ignore[misc]
+                if kind == "done":
+                    return
+                yield item  # type: ignore[misc]
+        finally:
+            stop.set()
+
+    def _prepare_batch(self, batch: list[BusinessResult]) -> None:
+        """Everything that is not metered: crawl, discover, find the owner, plan guesses."""
         if not batch:
             return
         asyncio.run(self._scrape_websites(batch))
         self._publish(batch, STATUS_CRAWLED)
         self._plan_permutations(batch)
         self._publish([r for r in batch if r.guessed_emails], STATUS_GUESSED)
+
+    def _process_batch(self, batch: list[BusinessResult], report: RunReport) -> None:
+        """Crawl, guess, verify, score and checkpoint one batch of businesses."""
+        self._prepare_batch(batch)
+        self._finish_batch(batch, report)
+
+    def _finish_batch(self, batch: list[BusinessResult], report: RunReport) -> None:
+        """The metered half: verify, score, checkpoint."""
+        if not batch:
+            return
         self._verify_all(batch)
         self._publish(batch, STATUS_VERIFIED)
 
@@ -903,11 +987,14 @@ class Pipeline:
             return
         paid = self.verifier.requires_key
 
-        # Found addresses: verify each unique address once.
+        # Found addresses: verify each unique address once - but only the few
+        # most promising per business. A site listing twenty staff mailboxes
+        # would otherwise cost twenty metered calls for one lead.
         if self.settings.verify_found:
+            cap = self.settings.verify_found_max if paid else 0
             unique: dict[str, list[EmailCandidate]] = {}
             for result in results:
-                for candidate in result.found_emails:
+                for candidate in self._found_worth_verifying(result, cap):
                     unique.setdefault(candidate.email, []).append(candidate)
             self._verify_batch(list(unique.keys()), unique)
 
@@ -931,6 +1018,31 @@ class Pipeline:
         workers = max(1, self.settings.verify_concurrency)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(self._verify_guesses_for, pending))
+
+    @staticmethod
+    def _found_worth_verifying(result: BusinessResult, cap: int) -> list[EmailCandidate]:
+        """The found addresses to spend credits on: never the low-value ones
+        (they are dropped from the output anyway), at most `cap` per contact
+        type, best first. The rest stay in the emails export, flagged."""
+        worth = [c for c in result.found_emails if not c.is_low_value]
+        if cap <= 0:
+            return worth
+
+        def rank(c: EmailCandidate) -> tuple:
+            return (
+                0 if c.on_business_domain else 1 if c.is_personal_domain else 2,
+                -SOURCE_WEIGHT.get(c.source, 0),
+                len(c.email),
+            )
+
+        chosen: list[EmailCandidate] = []
+        for pool in ([c for c in worth if c.is_owner], [c for c in worth if not c.is_owner]):
+            ranked = sorted(pool, key=rank)
+            chosen.extend(ranked[:cap])
+            for extra in ranked[cap:]:
+                extra.lead_eligible = False
+                extra.notes.append("not_verified:over_cap")
+        return chosen
 
     def _verify_guesses_for(self, result: BusinessResult) -> None:
         """Walk each contact type's guesses in order; stop at the first hit."""

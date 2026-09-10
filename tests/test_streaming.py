@@ -104,11 +104,15 @@ def test_resume_skips_finished_queries_and_businesses(settings, site_server):
     assert partial.queries_done == 2 and partial.done == 3          # Biz 0,1,2
     assert store.done_queries(partial.run_id) == set(QUERIES[:2])
 
+    first_calls = list(maps.calls)
     maps.calls.clear()
     with Pipeline(settings, store=Store(settings.db_path), maps=maps, verifier=StubVerifier(settings)) as pipeline:
         report = pipeline.run(QUERIES, run_id=partial.run_id, resume=True)
     assert report.status == "done"
-    assert maps.calls == QUERIES[2:]                                  # finished queries not re-fetched
+    # Every search is bought exactly once across both attempts: finished ones
+    # are skipped, and the ones fetched ahead before the interrupt come from cache.
+    assert sorted(first_calls + maps.calls) == sorted(QUERIES)
+    assert not set(maps.calls) & set(QUERIES[:2])
     assert report.resumed == 3 and report.done == 7
     assert report.stats()["with_any_email"] == 7
 
@@ -130,3 +134,81 @@ def test_lean_run_exports_by_appending(settings, site_server, tmp_path, monkeypa
     rows = list(csv.DictReader((tmp_path / "out" / "leads.csv").open(encoding="utf-8-sig")))
     assert len(rows) == 5 and list(rows[0])[:3] == ["company_name", "city", "state"]
     assert not (tmp_path / "out" / "leads.json").exists()          # no full-memory formats in lean mode
+
+
+def test_next_batch_is_crawled_while_the_current_one_verifies(settings, site_server):
+    """Verification is metered by the vendor; crawling must not wait for it.
+    The 'crawled' publish of batch 2 lands before batch 1 is 'done'."""
+    import threading
+    import time as _time
+
+    class SlowVerifier(StubVerifier):
+        def verify(self, email):
+            _time.sleep(0.15)
+            return super().verify(email)
+
+    class OrderSink:
+        name = "order"
+        events: list[tuple[str, str]] = []
+        lock = threading.Lock()
+
+        def start_run(self, run_id, meta): pass
+        def finish_run(self, run_id, stats): pass
+        def flush(self): pass
+        def close(self): pass
+
+        def upsert(self, results, status):
+            with self.lock:
+                for r in results:
+                    self.events.append((status, r.place.dedupe_key()))
+
+    settings.batch_size = 2
+    settings.query_chunk_size = 3
+    settings.prepare_ahead = 2
+    sink = OrderSink()
+    with Pipeline(settings, store=Store(settings.db_path), maps=ManyQueriesMaps(settings, site_server),
+                  verifier=SlowVerifier(settings), sinks=[sink]) as pipeline:
+        report = pipeline.run(QUERIES)
+    assert report.status == "done" and report.done == 7
+    first_done = next(i for i, (s, k) in enumerate(sink.events) if s == "done")
+    first_batch = {k for s, k in sink.events[:first_done + 1] if s == "done"}
+    later_crawled = [i for i, (s, k) in enumerate(sink.events) if s == "crawled" and k not in first_batch]
+    assert later_crawled and later_crawled[0] < first_done      # overlap actually happened
+    # and nothing is lost or doubled: every business reaches 'done' exactly once
+    assert sorted(k for s, k in sink.events if s == "done") == sorted({k for _, k in sink.events})
+
+
+def test_sequential_mode_gives_the_same_result(settings, site_server):
+    settings.prepare_ahead = 0
+    with Pipeline(settings, store=Store(settings.db_path), maps=ManyQueriesMaps(settings, site_server),
+                  verifier=StubVerifier(settings)) as pipeline:
+        report = pipeline.run(QUERIES)
+    assert report.status == "done" and report.done == 7 and report.stats()["queries_done"] == 6
+
+
+def test_only_the_best_few_found_addresses_are_verified(settings, site_server):
+    """A page listing many mailboxes must not cost many metered calls."""
+    from gmscrape.models import Place
+    from gmscrape.providers.base import MapsProvider
+
+    class OneSite(MapsProvider):
+        name = "one"
+        requires_key = False
+
+        def search(self, spec, limit):
+            yield Place(name="Joe's Plumbing", place_id="p1", website=f"{site_server}/site1/",
+                        domain="joesplumbing.com", city="Austin", state="TX", category="Plumber",
+                        query=spec.search_string)
+
+    settings.verify_found_max = 1
+    verifier = StubVerifier(settings)
+    with Pipeline(settings, store=Store(settings.db_path), maps=OneSite(settings), verifier=verifier) as pipeline:
+        report = pipeline.run(["plumber in austin tx"])
+    result = report.results[0]
+    found = [c for c in result.emails if not c.from_permutation]
+    assert len(found) >= 2
+    verified_found = [c for c in found if c.email in verifier.calls]
+    skipped = [c for c in found if "not_verified:over_cap" in c.notes]
+    assert len(verified_found) <= 2 and skipped                  # at most one general + one owner
+    assert all(not c.lead_eligible for c in skipped)
+    assert result.best_email is not None and result.best_email.email in verifier.calls

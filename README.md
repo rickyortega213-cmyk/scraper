@@ -550,8 +550,28 @@ checkpoint 41,300/612,000 businesses · searches 1,032/25,000 · 1,410/h · 29h 
 The throughput ceiling is not the program, it's the three providers: how fast
 scraper.tech, MailTester Ninja and OpenWeb Ninja answer, and their plan limits.
 Roughly, per 1,000 businesses: ~1,000 Maps results, ~2,500 page fetches,
-~700 web searches, ~1,500 verifications. Check your plans against that before
+~700 web searches, ~2,000 verifications. Check your plans against that before
 a 25,000-search run, and start with 500 searches to measure your own rate.
+
+**Verification is the floor.** MailTester Ninja's Ultimate plan allows 57
+checks per 10 seconds, about 20,000 an hour, and no amount of parallelism
+changes that. So the program spends those checks carefully and keeps the rest
+of the machine busy around them:
+
+- crawling, website discovery and owner search for the next batches run
+  **while** the current batch is being verified (`PREPARE_AHEAD`, default 2)
+- at most `VERIFY_FOUND_MAX` (3) found addresses per business per contact
+  type are checked, best first; a page listing twenty staff mailboxes no
+  longer costs twenty checks
+- guesses stop at the first deliverable address and are capped at 6 general
+  (`PERMUTATION_MAX`) and 4 owner patterns (`OWNER_PERMUTATION_MAX`)
+- low-value addresses (noreply@, privacy@, …) are never checked
+
+With those defaults a business costs about 2 checks on average, so 150,000
+businesses need ~300,000 checks ≈ 15 hours on one Ultimate key. That is the
+real bound: to finish faster, verify fewer addresses (`VERIFY_PERMUTATIONS=false`
+keeps only addresses found on sites, about 1 check per business), or bring a
+verifier with a higher rate.
 
 ## If something breaks mid-run
 
@@ -612,7 +632,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 226 tests, no network or API keys needed
+make test     # 229 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
