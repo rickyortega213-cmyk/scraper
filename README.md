@@ -554,40 +554,40 @@ Roughly, per 1,000 businesses: ~1,000 Maps results, ~2,500 page fetches,
 a 25,000-search run, and start with 500 searches to measure your own rate.
 
 **Verification is the floor.** MailTester Ninja's Ultimate plan allows 57
-checks per 10 seconds, about 20,000 an hour, and no amount of parallelism
-changes that. So the program spends those checks carefully and keeps the rest
-of the machine busy around them:
+checks per 10 seconds per key, about 20,000 an hour, and no amount of
+parallelism changes that. So the run spends those checks in a fixed order and
+keeps the rest of the machine busy around them:
 
-- crawling, website discovery and owner search for the next batches run
-  **while** the current batch is being verified (`PREPARE_AHEAD`, default 2)
-- at most `VERIFY_FOUND_MAX` (3) found addresses per business per contact
-  type are checked, best first; a page listing twenty staff mailboxes no
-  longer costs twenty checks
-- guesses stop at the first deliverable address and are capped at 6 general
-  (`PERMUTATION_MAX`) and 4 owner patterns (`OWNER_PERMUTATION_MAX`)
-- low-value addresses (noreply@, privacy@, …) are never checked
-
-With those defaults a business costs about 2 checks on average, so 150,000
-businesses need ~300,000 checks ≈ 15 hours on one Ultimate key. That is the
-real bound, so there are two speeds and `scraper buddy` asks which you want,
-with a time estimate for your search list:
+1. **Addresses published on websites come first, and always get done.** One
+   check per contact type per business, best candidate first (a company-domain
+   address before a free-mail one), stopping at the first deliverable one. A
+   site listing twenty staff mailboxes costs one check. Crawling, website
+   discovery and the owner search for the next batches run *while* this batch
+   is being checked (`PREPARE_AHEAD`), and Maps results for the next 25
+   searches are fetched meanwhile.
+2. **Then the guesses, in a second pass, most valuable first.** Businesses
+   whose site named an owner but not their mailbox (`first@`, `first.last@`,
+   the most confidently named owner first), then sites that published nothing
+   at all (`info@`, `contact@`, `hello@`). A guess never becomes a lead until
+   the verifier accepts it. Nothing is ever guessed for a business whose site
+   already published an address.
+3. **The time budget cuts the guess pass, never the found addresses.**
+   `scraper buddy` asks for it (`--hours`, default 2) and shows what it buys:
 
 ```
-About 150,000 businesses. How deep should it go?
-  1) fast          ~2.6 h   addresses published on websites, verified; no info@/owner guessing, no owner search
-  2) thorough       ~15 h   + guesses info@/owner mailboxes and searches for the owner of every business
-Choose [1/2] (1):
+About 150,000 businesses. Time budget in hours [2]:
+  1 MailTester key = ~20,520 checks/hour
+  addresses published on websites: ~45,000 checks, ~2.2 h - always done
+  + owner mailbox guesses:         ~22,500 checks
+  + info@ guesses (nothing found): ~67,500 checks
+  everything would take ~7 h: guessing stops at ~2.0 h, owner guesses first. 4 keys would fit it all (MAILTESTER_KEY=key1,key2,...).
 ```
 
-**fast** (`--profile fast`, or `PROFILE=fast`) checks only what sites
-publish - one address per contact type, best first - and skips the
-per-business owner web search and the info@/owner guessing; owners still come
-from the sites themselves. About a third of a check per business, so the
-metered verifier and the crawl finish together. **thorough** is everything.
-Any setting you set explicitly (`PERMUTATIONS=true`, say) still wins over the
-profile. Found addresses are always checked best-first and the walk stops at
-the first deliverable one per contact type: the others stay in the emails
-export, flagged, never as a lead.
+When time runs out the unchecked guesses stay flagged in the database and
+`scraper resume` continues them later, re-buying nothing. **Several keys
+share the work**: `MAILTESTER_KEY=key1,key2` gives each its own plan-rate
+limiter and every check goes to whichever key is free soonest, so two keys
+finish in half the time.
 
 ## If something breaks mid-run
 
@@ -648,7 +648,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 230 tests, no network or API keys needed
+make test     # 235 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

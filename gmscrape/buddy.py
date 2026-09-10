@@ -178,21 +178,29 @@ def _hours(value: float) -> str:
     return f"~{value:.0f} h" if value >= 3 else f"~{value:.1f} h"
 
 
-def choose_profile(prompt: Prompt, echo: Echo, businesses: int) -> str:
-    """Fast or thorough, with what each will roughly cost in time."""
-    from .config import estimate_hours
+def choose_hours(prompt: Prompt, echo: Echo, businesses: int) -> float:
+    """Ask for the time budget and say what it buys for this list."""
+    from .config import run_plan
 
     rate = int(os.getenv("MAILTESTER_RATE") or 57)
-    fast = estimate_hours(businesses, "fast", rate)
-    thorough = estimate_hours(businesses, "thorough", rate)
-    echo("")
-    echo(f"About {businesses:,} businesses. How deep should it go?")
-    echo(f"  1) fast      {_hours(fast):>8}   addresses published on websites, verified; "
-         "no info@/owner guessing, no owner search")
-    echo(f"  2) thorough  {_hours(thorough):>8}   + guesses info@/owner mailboxes and searches "
-         "for the owner of every business")
-    answer = prompt("Choose [1/2] (1): ").strip().lower()
-    return "thorough" if answer in ("2", "thorough", "t") else "fast"
+    keys = len([k for k in (os.getenv("MAILTESTER_KEY") or "").split(",") if k.strip()]) or 1
+    answer = prompt(f"\nAbout {businesses:,} businesses. Time budget in hours [2]: ").strip().lower()
+    try:
+        hours = float(answer) if answer else 2.0
+    except ValueError:
+        hours = 2.0
+    plan = run_plan(businesses, keys, rate, hours)
+    echo(f"  {keys} MailTester key{'s' if keys != 1 else ''} = ~{int(plan['checks_per_hour']):,} checks/hour")
+    echo(f"  addresses published on websites: ~{int(plan['found']):,} checks, {_hours(plan['hours_found'])} - always done")
+    echo(f"  + owner mailbox guesses:         ~{int(plan['owner_guesses']):,} checks")
+    echo(f"  + info@ guesses (nothing found): ~{int(plan['generic_guesses']):,} checks")
+    if hours > 0 and plan["hours_all"] > hours:
+        echo(f"  everything would take {_hours(plan['hours_all'])}: guessing stops at {_hours(hours)}, "
+             f"owner guesses first. {int(plan['keys_for_all'])} keys would fit it all "
+             "(MAILTESTER_KEY=key1,key2,...).")
+    else:
+        echo(f"  everything fits: {_hours(plan['hours_all'])}")
+    return hours
 
 
 def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] = None) -> int:
@@ -247,7 +255,7 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         limit = 40
 
     extra: list[str] = []
-    extra += ["--profile", choose_profile(prompt, echo, len(queries) * min(limit, 20))]
+    extra += ["--hours", str(choose_hours(prompt, echo, len(queries) * min(limit, 20)))]
     if os.getenv("SUPABASE_ACCESS_TOKEN") or (os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY")):
         from .store.supabase import run_label, run_table_name
 

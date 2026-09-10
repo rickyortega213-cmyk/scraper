@@ -559,6 +559,22 @@ class Store:
                     "SELECT COUNT(*) FROM emails e JOIN businesses b ON e.business_key=b.key WHERE b.run_id=?", run_id),
             }
 
+    def deferred_guess_keys(self, run_id: str) -> list[str]:
+        """Businesses of a run whose guessed addresses were planned but not yet
+        checked - the ones that name an owner first (their guesses are the
+        most valuable), the most confidently named owner first."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT b.key, "
+                "MAX(CASE WHEN e.contact_type IN ('owner','manager') THEN 1 ELSE 0 END) AS owner_guess, "
+                "COALESCE(b.owner_confidence, 0) AS oc "
+                "FROM businesses b JOIN emails e ON e.business_key = b.key "
+                "WHERE b.run_id = ? AND e.notes LIKE '%deferred_guess%' "
+                "GROUP BY b.key ORDER BY owner_guess DESC, oc DESC, b.updated_at",
+                (run_id,),
+            ).fetchall()
+        return [str(r["key"]) for r in rows]
+
     def iter_run_businesses(self, run_id: str):
         """Stream every finished business of a run (for re-exporting on resume)."""
         with self._lock:

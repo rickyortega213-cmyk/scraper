@@ -101,9 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="continue an interrupted run (default: the latest one)")
     run.add_argument("--table-name", dest="supabase_table_name",
                      help="name for this run's Supabase table (default: from the search)")
-    run.add_argument("--profile", choices=["thorough", "fast"], dest="profile", default=None,
-                     help="fast: check only addresses found on sites, no guessing or owner search "
-                          "(~7x fewer metered checks); thorough: everything (default)")
+    run.add_argument("--hours", type=float, dest="run_hours", default=None,
+                     help="time budget: addresses found on sites are always checked; guessing "
+                          "owner/info@ mailboxes stops when this runs out (default 2, 0 = no limit)")
     run.add_argument("--batch-size", type=int, dest="batch_size",
                      help="businesses per checkpoint (default 100)")
     run.add_argument("-o", "--out-dir", dest="out_dir", help="export directory (default out/)")
@@ -322,7 +322,7 @@ SETTINGS_KEYS = {
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
     "chain_people", "chain_person_guesses", "chain_crawl_pages", "confirm_keys_on_start",
-    "supabase_run_tables", "supabase_table_name", "batch_size", "maps_concurrency", "profile",
+    "supabase_run_tables", "supabase_table_name", "batch_size", "maps_concurrency", "run_hours",
 }
 
 
@@ -616,7 +616,7 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
             echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
                  f"(run id {report.run_id})")
             return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
-        paths = exporter.finish(report)
+        paths = exporter.finish(report, getattr(pipeline, "store", None))
     _print_report(report, paths)
     _print_final_table(report)
     _print_supabase_link(settings, report)
@@ -658,8 +658,18 @@ class _Exporter:
         else:
             self.export(data["results"])
 
-    def finish(self, report: RunReport) -> list[Path]:
+    def finish(self, report: RunReport, store: Optional[Store] = None) -> list[Path]:
         if self.appender is not None:
+            if store is not None and report.guesses_checked:
+                # The guess pass changed rows already written: rebuild from the database.
+                self.appender.start(fresh=True)
+                buffer: list = []
+                for result in store.iter_run_businesses(report.run_id):
+                    buffer.append(result)
+                    if len(buffer) >= 500:
+                        self.appender.append(buffer)
+                        buffer = []
+                self.appender.append(buffer)
             return self.appender.written()
         return self.export(report.results)
 
@@ -1289,6 +1299,18 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
                 echo(f"  crawled {data['done']}/{data['total']} websites")
         elif event == "resumed":
             echo(f"  restored {data['businesses']} finished businesses, {data['queries']} finished searches")
+        elif event == "guess_pass_start":
+            budget = (f", {_fmt_duration(data['time_left'])} of the time budget left"
+                      if data["time_left"] != float("inf") else "")
+            echo(f"  [bold]guess pass:[/bold] checking owner / info@ mailboxes for "
+                 f"{data['businesses']:,} businesses{budget}")
+        elif event == "guess_pass":
+            if data["done"] % 500 == 0 or data["done"] == data["total"]:
+                eta = f" · ~{_fmt_duration(data['eta'])} left" if data["eta"] else ""
+                echo(f"  guesses {data['done']:,}/{data['total']:,} · {_fmt_duration(data['elapsed'])} elapsed{eta}")
+        elif event == "guess_pass_cut":
+            echo(f"  [yellow]time budget used up:[/yellow] {data['left']:,} businesses still have unchecked "
+                 f"guesses (found addresses are all done). `scraper resume` continues them.")
         elif event == "batch_done":
             eta = f" · ~{_fmt_duration(data['eta'])} left" if data["eta"] else ""
             echo(f"  [bold]checkpoint[/bold] {data['done']}/{data['total']} businesses · "

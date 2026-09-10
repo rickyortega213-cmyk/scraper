@@ -109,6 +109,8 @@ class RunReport:
     sample_size: int = 200
     counters: dict[str, int] = field(default_factory=dict)
     queries_done: int = 0
+    guesses_checked: int = 0         # businesses whose deferred guesses were checked in the guess pass
+    guesses_left: int = 0            # businesses still waiting when the time budget ran out
 
     @property
     def done(self) -> int:
@@ -178,6 +180,8 @@ class RunReport:
             "web_search_calls": self.search_calls,
             "web_search_cache_hits": self.search_cache_hits,
             "maps_cache_hits": self.maps_cache_hits,
+            "guess_pass_businesses": self.guesses_checked,
+            "guess_pass_left": self.guesses_left,
             "resumed_businesses": self.resumed,
             "status": self.status,
             "lean_mode": self.lean,
@@ -194,6 +198,9 @@ class RunStopped(Exception):
         super().__init__(str(cause))
         self.report = report
         self.cause = cause
+
+
+DEFERRED = "deferred_guess"      # planned in pass 1, checked in the guess pass
 
 
 @dataclass
@@ -223,6 +230,7 @@ class Pipeline:
         self.maps = maps or get_maps_provider(settings)
         self.verifier = verifier or get_verifier(settings)
         self._outstanding = 0               # businesses handed out but not yet finished
+        self._deadline = 0.0                # run_hours turned into a wall-clock deadline
         self.web_search = web_search if web_search is not None else get_web_search(settings)
         self.progress = progress or (lambda event, data: None)
         self._search_calls = 0
@@ -281,6 +289,8 @@ class Pipeline:
         seen_keys: set[str] = set()
         pending_specs = list(specs)
         self._outstanding = 0
+        hours = float(self.settings.run_hours or 0)
+        self._deadline = (time.time() + hours * 3600) if hours > 0 else 0.0
         try:
             if resume:
                 done_queries = self.store.done_queries(report.run_id)
@@ -326,6 +336,7 @@ class Pipeline:
                     self.store.mark_queries_done(report.run_id, [c.search_string for c in chunk], found_per_query)
                     report.queries_done += len(chunk)
                     self.progress("chunk_done", {"queries_done": report.queries_done, "queries": len(specs)})
+            self._guess_pass(report)
         except BaseException as exc:
             status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             report.status = status
@@ -452,12 +463,21 @@ class Pipeline:
         self._finish_batch(batch, report)
 
     def _finish_batch(self, batch: list[BusinessResult], report: RunReport) -> None:
-        """The metered half: verify, score, checkpoint."""
+        """The metered half: verify what the sites published, score, checkpoint.
+        Guessed addresses are planned here but checked later, in the guess
+        pass, so the whole list gets its found addresses before any budget
+        goes to guessing."""
         if not batch:
             return
-        self._verify_all(batch)
+        self._verify_all(batch, guesses=False)
         self._publish(batch, STATUS_VERIFIED)
+        for result in batch:
+            for candidate in result.guessed_emails:
+                if candidate.verification is None and DEFERRED not in candidate.notes:
+                    candidate.notes.append(DEFERRED)
+        self._score_and_save(batch, report)
 
+    def _score_and_save(self, batch: list[BusinessResult], report: RunReport) -> None:
         strict_guesses = self.settings.require_verified_guesses and self.verifier.requires_key
         for result in batch:
             score_business(result)
@@ -482,6 +502,62 @@ class Pipeline:
                         candidate.notes.append("not_lead_eligible:unverified_guess")
         self.store.save_businesses(batch, report.run_id, stage="done")
         self._publish(batch, STATUS_DONE)
+
+    # --- pass 2: the guesses, most valuable first, while time allows ----------
+    def _time_left(self) -> float:
+        return float("inf") if not self._deadline else self._deadline - time.time()
+
+    def _guess_pass(self, report: RunReport) -> None:
+        """Check the deferred guesses: owner mailboxes first (the businesses
+        that named an owner, most confident first), then info@-style ones for
+        sites that published nothing. Stops when the run's time budget is
+        used up; whatever is left can be picked up by `scraper resume`."""
+        if not (self.settings.verify_emails and self.settings.verify_permutations
+                and self.verifier.requires_key and self.settings.permutations):
+            return
+        keys = self.store.deferred_guess_keys(report.run_id)
+        if not keys:
+            return
+        started = time.time()
+        total = len(keys)
+        batch_size = max(1, self.settings.batch_size)
+        in_memory = {} if report.lean else {r.place.dedupe_key(): r for r in report.results}
+        self.progress("guess_pass_start", {"businesses": total, "time_left": self._time_left()})
+        done = 0
+        for offset in range(0, total, batch_size):
+            if self._time_left() <= 0:
+                break
+            batch = [
+                r for r in (in_memory.get(k) or self.store.load_business(k) for k in keys[offset: offset + batch_size])
+                if r
+            ]
+            for result in batch:
+                for candidate in result.guessed_emails:
+                    if DEFERRED in candidate.notes:
+                        candidate.notes.remove(DEFERRED)
+                        candidate.lead_eligible = True
+            self._verify_all(batch, found=False)
+            self._score_and_save(batch, report)
+            done += len(batch)
+            report.guesses_checked = done
+            elapsed = time.time() - started
+            rate = done / elapsed if elapsed > 0 else 0.0
+            self.progress("guess_pass", {
+                "done": done, "total": total, "elapsed": elapsed,
+                "eta": ((total - done) / rate) if rate > 0 else 0.0,
+                "time_left": self._time_left(),
+            })
+        report.guesses_left = total - done
+        if report.guesses_left:
+            self.progress("guess_pass_cut", {"left": report.guesses_left, "done": done, "total": total})
+        # Recount: the guess pass changed what counts as a lead.
+        if report.lean:
+            report.counters.update(self.store.run_counters(report.run_id))
+        else:
+            kept = list(report.results)
+            report.counters = {}
+            report.results = []
+            report.absorb(kept)
 
     def _publish(self, results: Sequence[BusinessResult], status: str) -> None:
         """Push a stage's results to every sink. A sink must never break a run."""
@@ -994,7 +1070,8 @@ class Pipeline:
                 result.notes.append(f"owner_guess_skipped:{plan.skipped_reason}")
 
     # --- stage 5: verification --------------------------------------------
-    def _verify_all(self, results: Sequence[BusinessResult]) -> None:
+    def _verify_all(self, results: Sequence[BusinessResult], *, found: bool = True,
+                    guesses: bool = True) -> None:
         if not self.settings.verify_emails:
             return
         paid = self.verifier.requires_key
@@ -1002,7 +1079,7 @@ class Pipeline:
         # Found addresses: verify each unique address once - but only the few
         # most promising per business. A site listing twenty staff mailboxes
         # would otherwise cost twenty metered calls for one lead.
-        if self.settings.verify_found:
+        if self.settings.verify_found and found:
             cap = self.settings.verify_found_max if paid else 0
             if paid:
                 # Metered: walk each business's found addresses best-first and
@@ -1019,7 +1096,7 @@ class Pipeline:
                         unique.setdefault(candidate.email, []).append(candidate)
                 self._verify_batch(list(unique.keys()), unique)
 
-        if not self.settings.verify_permutations:
+        if not self.settings.verify_permutations or not guesses:
             return
 
         if not paid:

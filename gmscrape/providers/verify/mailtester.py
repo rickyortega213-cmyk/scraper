@@ -156,33 +156,68 @@ class RateLimiter:
                 self._clean = 0
 
 
+class _KeySlot:
+    """One API key with its own auth state and its own rate limit."""
+
+    def __init__(self, key: str, mode: str, rate: int) -> None:
+        self.key = key
+        self.mode = mode                    # auto | direct | token
+        self.key_param = ""                 # the spelling the direct endpoint accepted
+        self.token = ""
+        self.token_expires_at = 0.0
+        self.auth_error = ""
+        self.limiter = RateLimiter(rate)
+        self.lock = threading.Lock()
+        self.calls = 0
+
+    @property
+    def ready(self) -> bool:
+        return not self.auth_error and self.mode in ("direct", "token") and bool(self.key_param or self.token)
+
+    @property
+    def next_free(self) -> float:
+        lim = self.limiter
+        return max(lim._next_slot, lim._hold_until)
+
+
 class MailTesterNinja(EmailVerifier):
     name = "mailtester"
 
     def __init__(self, settings: Any) -> None:
         super().__init__(settings)
-        self._token: str = ""
-        self._token_expires_at: float = 0.0
-        self._token_lock = threading.Lock()
-        self._auth_error: str = ""          # once the key is refused, stop asking
-        self._mode: str = (getattr(settings, "mailtester_auth", "") or "auto").lower()
-        self._key_param: str = ""           # the key variant the direct endpoint accepted
-        self._limiter = RateLimiter(int(getattr(settings, "mailtester_rate", 0) or 0))
+        mode = (getattr(settings, "mailtester_auth", "") or "auto").lower()
+        rate = int(getattr(settings, "mailtester_rate", 0) or 0)
+        raw = str(settings.mailtester_key or settings.verify_api_key or "")
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        # Several keys (MAILTESTER_KEY=key1,key2) each get their own plan-rate
+        # limiter; every call goes to whichever key is free soonest.
+        self._slots: list[_KeySlot] = [_KeySlot(k, mode, rate) for k in keys]
+        self._pick_lock = threading.Lock()
         # 429 is handled here (a global pause + a longer gap), not by blind per-call retries.
         self.client.close()
         self.client = ApiClient(timeout=45.0, retries=2, retry_statuses=RETRY_STATUS - {429})
 
     @property
     def auth_mode(self) -> str:
-        """'direct' or 'token' once known, else 'auto'."""
-        return self._mode
+        """'direct' or 'token' once known, else 'auto' (first working key)."""
+        for slot in self._slots:
+            if slot.ready:
+                return slot.mode
+        return self._slots[0].mode if self._slots else "auto"
+
+    @property
+    def key_count(self) -> int:
+        return len(self._slots)
+
+    @property
+    def working_keys(self) -> int:
+        return sum(1 for s in self._slots if not s.auth_error)
 
     # --- token handling ----------------------------------------------------
     def _api_key(self) -> str:
-        key = self.settings.mailtester_key or self.settings.verify_api_key
-        if not key:
+        if not self._slots:
             raise ProviderError("MAILTESTER_KEY is not set")
-        return str(key)
+        return self._slots[0].key
 
     @staticmethod
     def _auth_message(refusals: list[str]) -> str:
@@ -195,11 +230,38 @@ class MailTesterNinja(EmailVerifier):
         )
 
     def preflight(self) -> None:
-        self._resolve_auth()
+        """Every key must answer; a refused one is dropped with a warning as
+        long as another works, and the last one refused is a hard error."""
+        if not self._slots:
+            raise ProviderError("MAILTESTER_KEY is not set")
+        errors: list[str] = []
+        for slot in self._slots:
+            try:
+                self._resolve_auth(slot)
+            except ProviderAuthError as exc:
+                errors.append(str(exc))
+        if errors and len(errors) == len(self._slots):
+            raise ProviderAuthError(errors[0])
+        for slot in self._slots:
+            if slot.auth_error:
+                log.warning("mailtester: key %s… refused, continuing with %d working key(s)",
+                            slot.key[:6], self.working_keys)
+
+    def _pick(self) -> _KeySlot:
+        """The working key whose rate limiter frees up soonest."""
+        with self._pick_lock:
+            live = [s for s in self._slots if not s.auth_error]
+            if not live:
+                raise ProviderAuthError(self._slots[0].auth_error if self._slots
+                                        else "MAILTESTER_KEY is not set")
+            chosen = min(live, key=lambda s: (s.next_free, s.calls))
+            chosen.calls += 1
+            return chosen
 
     # --- which door does this key open? --------------------------------------
-    def _key_variants(self) -> list[str]:
-        key = self._api_key().strip()
+    @staticmethod
+    def _key_variants(key: str) -> list[str]:
+        key = key.strip()
         bare = key.strip("{}").strip()
         variants = [key]
         if bare != key:
@@ -208,41 +270,41 @@ class MailTesterNinja(EmailVerifier):
             variants.append("{" + key + "}")  # or without them, if the API wants them
         return variants
 
-    def _resolve_auth(self) -> None:
-        """Settle on direct-key or token auth (once per run). Raises
-        ProviderAuthError when the service refuses the key both ways."""
-        with self._token_lock:
-            if self._auth_error:
-                raise ProviderAuthError(self._auth_error)
-            if self._mode in ("direct", "token") and (self._key_param or self._token):
+    def _resolve_auth(self, slot: _KeySlot) -> None:
+        """Settle on direct-key or token auth for one key (once per run).
+        Raises ProviderAuthError when the service refuses it both ways."""
+        with slot.lock:
+            if slot.auth_error:
+                raise ProviderAuthError(slot.auth_error)
+            if slot.ready:
                 return
             refusals: list[str] = []
-            if self._mode in ("auto", "direct"):
-                for variant in self._key_variants():
-                    verdict, detail = self._try_direct(variant)
+            if slot.mode in ("auto", "direct"):
+                for variant in self._key_variants(slot.key):
+                    verdict, detail = self._try_direct(slot, variant)
                     if verdict == "ok":
-                        self._key_param = variant
-                        self._mode = "direct"
+                        slot.key_param = variant
+                        slot.mode = "direct"
                         log.debug("mailtester: direct key auth accepted")
                         return
                     refusals.append(f"direct key: {detail}")
                     if verdict == "error":
                         raise ProviderError(detail)
-            if self._mode in ("auto", "token"):
+            if slot.mode in ("auto", "token"):
                 try:
-                    self._token = self._fetch_token()
-                    self._mode = "token"
+                    slot.token = self._fetch_token(slot)
+                    slot.mode = "token"
                     log.debug("mailtester: token auth accepted")
                     return
                 except ProviderAuthError as exc:
                     refusals.append(f"token: {exc}")
-            self._auth_error = self._auth_message(refusals)
-            raise ProviderAuthError(self._auth_error)
+            slot.auth_error = self._auth_message(refusals)
+            raise ProviderAuthError(slot.auth_error)
 
-    def _try_direct(self, key: str) -> tuple[str, str]:
+    def _try_direct(self, slot: _KeySlot, key: str) -> tuple[str, str]:
         """Probe the direct endpoint with one throwaway address.
         Returns ('ok' | 'refused' | 'error', detail)."""
-        self._limiter.wait()
+        slot.limiter.wait()
         response = self.client.request("GET", VERIFY_URL, params={"email": PROBE_EMAIL, "key": key})
         if response.status_code in (401, 403):
             return "refused", f"HTTP {response.status_code} {response.text[:120].strip()}"
@@ -261,8 +323,8 @@ class MailTesterNinja(EmailVerifier):
             return "ok", ""
         return "refused", message or str(payload)[:120]
 
-    def _fetch_token(self) -> str:
-        response = self.client.request("GET", TOKEN_URL, params={"key": self._api_key()})
+    def _fetch_token(self, slot: _KeySlot) -> str:
+        response = self.client.request("GET", TOKEN_URL, params={"key": slot.key})
         if response.status_code in (401, 403):
             raise ProviderAuthError(f"HTTP {response.status_code} {response.text[:120].strip()}")
         if response.status_code >= 400:
@@ -289,38 +351,45 @@ class MailTesterNinja(EmailVerifier):
                 f"mailtester token response contained no token: {response.text[:200]}"
             )
         expiry = _jwt_expiry(token)
-        self._token_expires_at = (
+        slot.token_expires_at = (
             expiry - TOKEN_SAFETY_MARGIN if expiry else time.time() + TOKEN_FALLBACK_TTL
         )
-        log.debug("mailtester token acquired, valid for %.0fs", self._token_expires_at - time.time())
+        log.debug("mailtester token acquired, valid for %.0fs", slot.token_expires_at - time.time())
         return token
 
-    def _get_token(self, force: bool = False) -> str:
-        with self._token_lock:
-            if self._auth_error:
-                raise ProviderAuthError(self._auth_error)
-            if force or not self._token or time.time() >= self._token_expires_at:
+    def _get_token(self, slot: Optional[_KeySlot] = None, force: bool = False) -> str:
+        slot = slot or self._pick()
+        with slot.lock:
+            if slot.auth_error:
+                raise ProviderAuthError(slot.auth_error)
+            if force or not slot.token or time.time() >= slot.token_expires_at:
                 try:
-                    self._token = self._fetch_token()
+                    slot.token = self._fetch_token(slot)
                 except ProviderAuthError as exc:
-                    self._auth_error = self._auth_message([f"token: {exc}"])
-                    raise ProviderAuthError(self._auth_error) from exc
-            return self._token
+                    slot.auth_error = self._auth_message([f"token: {exc}"])
+                    raise ProviderAuthError(slot.auth_error) from exc
+            return slot.token
 
     # --- verification ------------------------------------------------------
     def verify(self, email: str) -> VerificationResult:
         email = (email or "").strip().lower()
-        self._resolve_auth()
+        if not self._slots:
+            raise ProviderError("MAILTESTER_KEY is not set")
+        slot = self._pick()
+        self._resolve_auth(slot)
+        outcome, payload = "error", None
         for attempt in range(LIMITED_RETRIES + 1):
-            payload, outcome = self._request(email)
+            payload, outcome = self._request(slot, email)
             if outcome == "limited" and attempt < LIMITED_RETRIES:
                 pause = LIMITED_BACKOFF[min(attempt, len(LIMITED_BACKOFF) - 1)]
-                self._limiter.penalize(pause)          # every thread slows down, not just this one
+                slot.limiter.penalize(pause)          # every thread on this key slows down
                 log.info("mailtester rate-limited; pausing %.0fs and spacing calls further apart", pause)
                 time.sleep(pause)
+                slot = self._pick()                   # another key may be free meanwhile
+                self._resolve_auth(slot)
                 continue
             if outcome == "ok":
-                self._limiter.reward()
+                slot.limiter.reward()
             break
         if outcome == "limited":
             return self._unknown("mailtester_rate_limited")
@@ -328,28 +397,28 @@ class MailTesterNinja(EmailVerifier):
             return self._unknown("mailtester did not return a usable response")
         return self._to_result(email, payload)
 
-    def _auth_params(self, force: bool = False) -> dict[str, str]:
-        if self._mode == "direct":
-            return {"key": self._key_param}
-        return {"token": self._get_token(force=force)}
+    def _auth_params(self, slot: _KeySlot, force: bool = False) -> dict[str, str]:
+        if slot.mode == "direct":
+            return {"key": slot.key_param}
+        return {"token": self._get_token(slot, force=force)}
 
-    def _request(self, email: str) -> tuple[Optional[dict[str, Any]], str]:
-        """One metered call. Returns (payload, outcome) where outcome is
-        'ok', 'limited', 'refused' or 'error'."""
-        params = self._auth_params()
+    def _request(self, slot: _KeySlot, email: str) -> tuple[Optional[dict[str, Any]], str]:
+        """One metered call on one key. Returns (payload, outcome) where
+        outcome is 'ok', 'limited', 'refused' or 'error'."""
+        params = self._auth_params(slot)
         for retry_auth in (False, True):
-            self._limiter.wait()
+            slot.limiter.wait()
             response = self.client.request("GET", VERIFY_URL, params={"email": email, **params})
             if response.status_code == 429:
                 return None, "limited"
             if response.status_code in (401, 403):
-                if self._mode == "token" and not retry_auth:
+                if slot.mode == "token" and not retry_auth:
                     # The token may have lapsed mid-run: one fresh token, one more try.
-                    params = self._auth_params(force=True)
+                    params = self._auth_params(slot, force=True)
                     continue
-                self._auth_error = self._auth_message(
-                    [f"{self._mode}: HTTP {response.status_code} {response.text[:120].strip()}"])
-                raise ProviderAuthError(self._auth_error)
+                slot.auth_error = self._auth_message(
+                    [f"{slot.mode}: HTTP {response.status_code} {response.text[:120].strip()}"])
+                raise ProviderAuthError(slot.auth_error)
             if response.status_code >= 400:
                 log.warning("mailtester HTTP %s for %s: %s", response.status_code, email,
                             response.text[:160])
@@ -363,11 +432,11 @@ class MailTesterNinja(EmailVerifier):
                 return None, "error"
             message = str(payload.get("message") or "").lower()
             if not payload.get("code") and any(hint in message for hint in UNAUTHORIZED_HINTS):
-                if self._mode == "token" and not retry_auth:
-                    params = self._auth_params(force=True)
+                if slot.mode == "token" and not retry_auth:
+                    params = self._auth_params(slot, force=True)
                     continue
-                self._auth_error = self._auth_message([f"{self._mode}: {message}"])
-                raise ProviderAuthError(self._auth_error)
+                slot.auth_error = self._auth_message([f"{slot.mode}: {message}"])
+                raise ProviderAuthError(slot.auth_error)
             if any(hint in message for hint in LIMITED_HINTS) and payload.get("code") != "ok":
                 return None, "limited"
             return payload, "ok"

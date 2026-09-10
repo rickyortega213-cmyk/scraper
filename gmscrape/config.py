@@ -122,9 +122,9 @@ class Settings:
 
     # --- website crawling --------------------------------------------------
     crawl_websites: bool = True
-    max_pages_per_site: int = 6
+    max_pages_per_site: int = 5
     http_timeout: float = 15.0
-    http_concurrency: int = 64
+    http_concurrency: int = 96
     per_host_concurrency: int = 2
     http_retries: int = 2
     http_max_bytes: int = 3_000_000
@@ -137,17 +137,17 @@ class Settings:
     # --- permutations ------------------------------------------------------
     permutations: bool = True
     permutation_tier: int = 2         # 1=safest few, 2=common, 3=aggressive
-    permutation_max: int = 6          # guesses checked per business before giving up
+    permutation_max: int = 3          # info@, contact@, hello@ - only when a site published nothing
     permutation_require_mx: bool = True
     permutations_for_chains: bool = False
     stop_on_first_valid: bool = True
-    owner_permutation_max: int = 4    # first@, first.last@, flast@, firstl@
+    owner_permutation_max: int = 2    # first@, first.last@ - only when the owner's address was not published
     require_verified_guesses: bool = True   # a guess must verify `valid` to become a lead row
 
     # --- verification ------------------------------------------------------
     verify_emails: bool = True
     verify_found: bool = True
-    verify_found_max: int = 3         # found addresses verified per business per contact type (0 = all)
+    verify_found_max: int = 1         # found addresses checked per business per contact type, best first (0 = all)
     prepare_ahead: int = 2            # batches crawled while the current one is being verified
     verify_permutations: bool = True
     verify_concurrency: int = 16      # enough in flight to use the Ultimate rate
@@ -182,7 +182,7 @@ class Settings:
     export_formats: tuple[str, ...] = ("csv", "json")
     min_confidence: int = 0
     log_level: str = "INFO"
-    profile: str = "thorough"         # thorough | fast (see apply_profile)
+    run_hours: float = 2.0            # time budget: guessing stops when it runs out (0 = no limit)
     confirm_keys_on_start: bool = True   # show keys before a run and offer to change them
 
     extra: dict[str, Any] = field(default_factory=dict)
@@ -214,9 +214,7 @@ class Settings:
             else:
                 values.setdefault("extra", {})
                 values["extra"][key] = value
-        settings = cls(**values)
-        apply_profile(settings, settings.profile)
-        return settings
+        return cls(**values)
 
     # --- convenience -------------------------------------------------------
     def ensure_dirs(self) -> None:
@@ -260,47 +258,29 @@ class Settings:
         }
 
 
-PROFILES = ("thorough", "fast")
 
-# Metered checks per business, measured on real runs - used for the estimate.
-CHECKS_PER_BUSINESS = {"thorough": 2.0, "fast": 0.35}
-
-
-def apply_profile(settings: "Settings", name: str) -> "Settings":
-    """`fast` spends the verifier's metered checks only on addresses actually
-    found on websites (no info@/owner guessing, no per-business owner search)
-    and crawls a page less; that is the difference between a 150,000-business
-    run taking ~2 hours and ~15 hours on one MailTester key. `thorough` is the
-    default: everything on. Explicit env/CLI values still win because the
-    profile is applied to the defaults only."""
-    name = (name or "thorough").lower()
-    if name not in PROFILES:
-        raise ValueError(f"unknown profile {name!r}; choose one of {', '.join(PROFILES)}")
-    settings.profile = name
-    if name == "fast":
-        if settings.permutations is True and os.getenv("PERMUTATIONS") is None:
-            settings.permutations = False
-        if settings.owner_search is True and os.getenv("OWNER_SEARCH") is None:
-            settings.owner_search = False
-        if settings.verify_found_max == 3 and os.getenv("VERIFY_FOUND_MAX") is None:
-            settings.verify_found_max = 1
-        if settings.max_pages_per_site == 6 and os.getenv("MAX_PAGES_PER_SITE") is None:
-            settings.max_pages_per_site = 4
-        if settings.http_concurrency == 64 and os.getenv("HTTP_CONCURRENCY") is None:
-            settings.http_concurrency = 96
-    return settings
+# Rough metered checks per business, by what they buy - used only for the plan
+# shown before a run. Measured on local-business lists; yours will differ.
+CHECKS_FOUND = 0.30          # ~30% of businesses publish an address; one check each
+CHECKS_OWNER_GUESS = 0.15    # owner named but no owner address: first@, first.last@
+CHECKS_GENERIC_GUESS = 0.45  # site published nothing: info@, contact@, hello@
 
 
-def estimate_hours(businesses: int, profile: str, checks_per_10s: int, *,
-                   http_concurrency: int = 64) -> float:
-    """Rough wall-clock for a run: the metered verifier and the crawl run in
-    parallel, so the slower of the two sets the pace."""
-    checks = businesses * CHECKS_PER_BUSINESS.get(profile, 2.0)
-    per_hour = max(1, checks_per_10s) * 360
-    verify_hours = checks / per_hour
-    pages = 3.5 if profile == "fast" else 4.5
-    fetches = businesses * 0.55 * pages                  # ~55% have a site
-    if profile == "fast" and http_concurrency == 64:
-        http_concurrency = 96
-    crawl_hours = fetches / (max(1, http_concurrency) * 0.5 * 3600)   # ~2 s per fetch per slot
-    return max(verify_hours, crawl_hours, businesses / 150_000)         # never under ~1 h per 150k
+def run_plan(businesses: int, keys: int, checks_per_10s: int, hours: float) -> dict[str, float]:
+    """What a time budget buys. Found addresses are always checked; the
+    guesses are checked afterwards, most valuable first, until time runs out."""
+    per_hour = max(1, keys) * max(1, checks_per_10s) * 360
+    capacity = per_hour * hours if hours > 0 else float("inf")
+    found = businesses * CHECKS_FOUND
+    owner = businesses * CHECKS_OWNER_GUESS
+    generic = businesses * CHECKS_GENERIC_GUESS
+    return {
+        "capacity": capacity,
+        "checks_per_hour": per_hour,
+        "found": found,
+        "owner_guesses": owner,
+        "generic_guesses": generic,
+        "hours_found": found / per_hour,
+        "hours_all": (found + owner + generic) / per_hour,
+        "keys_for_all": max(1, -(-(found + owner + generic) // (max(1, checks_per_10s) * 360 * hours))) if hours > 0 else 1,
+    }

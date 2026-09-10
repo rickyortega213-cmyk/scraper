@@ -250,3 +250,46 @@ def test_rate_limiter_spreads_calls_evenly_and_backs_off():
     for _ in range(limiter.RECOVER_AFTER):
         limiter.reward()
     assert limiter.interval == pytest.approx(0.12)      # relaxing back toward the plan rate
+
+
+def test_several_keys_share_the_work_each_at_its_own_rate():
+    """MAILTESTER_KEY=key1,key2: calls go to whichever key is free soonest."""
+    seen: list[str] = []
+
+    class TwoKeys(Api):
+        def handler(self, request):
+            key = request.url.params.get("key", "")
+            if request.url.host != "token.mailtester.ninja" and key in ("k1", "k2"):
+                if request.url.params.get("email") != "probe@example.com":
+                    seen.append(key)
+                return httpx.Response(200, json={"code": "ok", "message": "Accepted"})
+            return super().handler(request)
+
+    api = TwoKeys({})
+    settings = Settings.from_env(mailtester_key="k1, k2", mailtester_rate=0)
+    verifier = MailTesterNinja(settings)
+    verifier.client._client = httpx.Client(transport=httpx.MockTransport(api.handler))
+    verifier.preflight()
+    assert verifier.key_count == 2 and verifier.working_keys == 2
+    for i in range(4):
+        assert verifier.verify(f"a{i}@x.com").status == V_VALID
+    assert seen.count("k1") == 2 and seen.count("k2") == 2      # both keys carry the traffic
+
+
+def test_a_refused_key_is_dropped_when_another_works():
+    class OneGood(Api):
+        def handler(self, request):
+            key = request.url.params.get("key", "")
+            if request.url.host == "token.mailtester.ninja":
+                self.token_calls += 1
+                return httpx.Response(401, text="https://mailtester.ninja/subscribe")
+            if key in ("good", "{good}"):
+                return httpx.Response(200, json={"code": "ok", "message": "Accepted"})
+            return httpx.Response(401, text="https://mailtester.ninja/subscribe")
+
+    api = OneGood({})
+    verifier = MailTesterNinja(Settings.from_env(mailtester_key="dead,good", mailtester_rate=0))
+    verifier.client._client = httpx.Client(transport=httpx.MockTransport(api.handler))
+    verifier.preflight()                              # warns, does not raise
+    assert verifier.working_keys == 1
+    assert verifier.verify("a@x.com").status == V_VALID

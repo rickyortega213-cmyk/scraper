@@ -109,7 +109,7 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
         captured["queries"] = list(args.queries)
         captured["limit"] = args.results_per_query
         captured["confirm"] = args.confirm_keys_on_start
-        captured["profile"] = args.profile
+        captured["hours"] = args.run_hours
         return 0
 
     monkeypatch.setattr("gmscrape.cli.cmd_run", fake_run)
@@ -118,7 +118,7 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
         "", "", "", "", "",                      # keep / skip every key
         "dentist in austin tx", "plumber in miami fl", "",   # searches
         "25",                                    # businesses per search
-        "2",                                     # speed: thorough
+        "3",                                     # time budget: 3 hours
         "",                                      # Start? -> yes
     )
     assert B.buddy(script.prompt, script.echo) == 0
@@ -126,10 +126,10 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
         "queries": ["dentist in austin tx", "plumber in miami fl"],
         "limit": 25,
         "confirm": False,                        # keys were just reviewed - no second prompt
-        "profile": "thorough",
+        "hours": 3.0,
     }
-    shown = script.asked + script.said
-    assert any("fast" in t for t in shown) and any("thorough" in t for t in shown)
+    assert any("Time budget" in t for t in script.asked)
+    assert any("checks/hour" in t for t in script.said)
 
 
 def test_buddy_explains_when_maps_is_not_set_up(clean_env, monkeypatch):
@@ -186,18 +186,14 @@ def test_review_keys_warns_about_the_wrong_kind_of_key(clean_env):
     assert any("warning" in t and "access token" in t for t in script.said)
 
 
-def test_fast_profile_trades_guessing_for_time(monkeypatch):
-    from gmscrape.config import Settings, apply_profile, estimate_hours
+def test_run_plan_says_what_a_time_budget_buys():
+    from gmscrape.config import run_plan
 
-    for name in ("PERMUTATIONS", "OWNER_SEARCH", "VERIFY_FOUND_MAX", "MAX_PAGES_PER_SITE", "HTTP_CONCURRENCY"):
-        monkeypatch.delenv(name, raising=False)
-    fast = Settings.from_env(profile="fast")
-    assert (fast.permutations, fast.owner_search, fast.verify_found_max) == (False, False, 1)
-    thorough = Settings.from_env()
-    assert (thorough.permutations, thorough.owner_search, thorough.profile) == (True, True, "thorough")
-    monkeypatch.setenv("PERMUTATIONS", "true")               # an explicit choice still wins
-    assert Settings.from_env(profile="fast").permutations is True
-    with pytest.raises(ValueError):
-        apply_profile(Settings.from_env(), "turbo")
-    assert estimate_hours(150_000, "fast", 57) < estimate_hours(150_000, "thorough", 57) / 3
-    assert 1.5 <= estimate_hours(150_000, "fast", 57) <= 3.5
+    one_key = run_plan(150_000, 1, 57, 2.0)
+    assert one_key["checks_per_hour"] == 57 * 360
+    assert one_key["hours_found"] < 2.5                      # found addresses fit a 2-3 h budget
+    assert one_key["hours_all"] > one_key["hours_found"] * 2  # guessing is the expensive part
+    assert one_key["keys_for_all"] >= 2
+    two_keys = run_plan(150_000, 2, 57, 2.0)
+    assert two_keys["hours_all"] == one_key["hours_all"] / 2
+    assert run_plan(100, 1, 57, 0)["capacity"] == float("inf")
