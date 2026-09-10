@@ -1,80 +1,123 @@
 """Launch banner: the Profit Systems mark with the SCRAPER BUDDY wordmark
-beside it (or below it when the terminal is too narrow for both)."""
+beside it - full-size on very wide terminals, half-size on normal ones, and
+stacked (mark above, words below) when the window is narrow."""
 
 from __future__ import annotations
 
 import shutil
 import sys
 
-# The mark, cropped from the full-size art and sampled every other row so it
-# keeps its shape in terminal cells (which are about twice as tall as wide).
-_MARK = (
-    '                  @@@@@@@@@@       @@@@@@@@@@@@@@@@@@@@@@@@@@@',
-    '             @@@@@@@@@@       @@@@@@@@@@@@@@@@@@@@@@@@@@@',
-    '        @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@       @@@@',
-    '   @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@',
-    '@@@@@@@@-      @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@@@@@',
-    '@@@@@@    @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@   @@@@@@',
-    '@@@@@@@@@@@@@@@-      @@@@@@@@@@       @@@@@@@@@@       @@@@@@@',
-    '@@@@@@@@@@-      @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@',
-    '@@@@@*      @@@@@@@@@@-      @@@@@@@@@@       @@@@@@@@@@',
-    '*      @@@@@@@@@@*      @@@@@@@@@@       @@@@@@@@@@       @@@@@',
-    '  @@@@@@@@@@-      @@@@@@@@@@       @@@@@@@@@@       @@@@@@@@@@',
-    '@@@@@@@@      @@@@@@@@@@-      @@@@@@@@@@-      @@@@@@@@@@@@@@@',
-    '@@@@@@   *@@@@@@@@@*      @@@@@@@@@@-      @@@@@@@@@@    @@@@@@',
-    '@@@@@@@@@@@@@@*      @@@@@@@@@@*      @@@@@@@@@@-      @@@@@@@@',
-    '@@@@@@@@@@      @@@@@@@@@@@      @@@@@@@@@@@      @@@@@@@@@@-',
-    '@@@@@      *@@@@@@@@@*      @@@@@@@@@@-      @@@@@@@@@@',
-    '      @@@@@@@@@@@@@@@@@@@@@@@@@@@@      @@@@@@@@@@*',
-    '  @@@@@@@@@@@@@@@@@@@@@@@@@@@      @@@@@@@@@@*',
+# The mark, cropped from the full-size art. Terminal cells are about twice as
+# tall as wide, so every other row is kept; the small version also keeps every
+# other column.
+_MARK_LARGE = (
+    '                      +++++++++++-       =+++++++++++++++++++++++++++++=:',
+    '                .#@@@@@@@@@@@%.     +@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*',
+    '            *@@@@@@@@@@@@.     =@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#      *@@-',
+    '       *@@@@@@@@@@@@      -@@@@@@@@@@@@-     .@@@@@@@@@@@@*      *@@@@@@@-',
+    '  #@@@@@@@@@@@@.     -@@@@@@@@@@@@=      @@@@@@@@@@@@*      *@@@@@@@@@@@@-',
+    '@@@@@@@@@@:     =@@@@@@@@@@@@=     .@@@@@@@@@@@@*      *@@@@@@@@@@@@@@@@@-',
+    '@@@@@@@#   -@@@@@@@@@@@@+     .#@@@@@@@@@@@#.     +@@@@@@@@@@@@-  @@@@@@@-',
+    '@@@@@@@@@@@@@@@@@@@+     .#@@@@@@@@@@@#.     +@@@@@@@@@@@@-     -@@@@@@@@-',
+    '@@@@@@@@@@@@@@*      *@@@@@@@@@@@%.     =@@@@@@@@@@@@-     :@@@@@@@@@@@@*',
+    '@@@@@@@@@*      #@@@@@@@@@@@%.     =@@@@@@@@@@@@-     :@@@@@@@@@@@@*',
+    '@@@@*      %@@@@@@@@@@@%      =@@@@@@@@@@@@-     :@@@@@@@@@@@@*      #@@@-',
+    '      #@@@@@@@@@@@%.     =@@@@@@@@@@@@-     :@@@@@@@@@@@@*      *@@@@@@@@-',
+    ' #@@@@@@@@@@@%:     +@@@@@@@@@@@@-     :@@@@@@@@@@@@*      #@@@@@@@@@@@@@-',
+    '@@@@@@@@@:     =@@@@@@@@@@@@=     :%@@@@@@@@@@@*.     *@@@@@@@@@@@@@@@@@@-',
+    '@@@@@@@#  =@@@@@@@@@@@@+     .%@@@@@@@@@@@#.     *@@@@@@@@@@@@-   @@@@@@@-',
+    '@@@@@@@@@@@@@@@@@@+      #@@@@@@@@@@@%      =@@@@@@@@@@@@:     :@@@@@@@@@-',
+    '@@@@@@@@@@@@@+      %@@@@@@@@@@@#      =@@@@@@@@@@@@-     .@@@@@@@@@@@@+',
+    '@@@@@@@@+      %@@@@@@@@@@@%      +@@@@@@@@@@@@-     :@@@@@@@@@@@@*',
+    '@@@+      #@@@@@@@@@@@@@#****%@@@@@@@@@@@@:     :@@@@@@@@@@@@+',
+    '     #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@=     :%@@@@@@@@@@@*',
+    ' +**#####***********************-       ***#######*+',
 )
+
+_MARK_SMALL = (
+    '           ++++++    +++++++++++++++:',
+    '        .@@@@@@.  +@@@@@@@@@@@@@@@*',
+    '      *@@@@@@   @@@@@@@@@@@@@@@@   *@',
+    '    @@@@@@   -@@@@@@   @@@@@@*   @@@@',
+    ' #@@@@@@   @@@@@@=   @@@@@@   *@@@@@@',
+    '@@@@@:  =@@@@@@   @@@@@@*   @@@@@@@@@',
+    '@@@@  @@@@@@+  .@@@@@@.  +@@@@@@ @@@@',
+    '@@@@@@@@@@   #@@@@@#   @@@@@@-  -@@@@',
+    '@@@@@@@*   @@@@@@.  =@@@@@@   @@@@@@*',
+    '@@@@@   #@@@@@%   @@@@@@-  :@@@@@@',
+    '@@*   @@@@@@   =@@@@@@   @@@@@@*   @@',
+    '   #@@@@@%   @@@@@@-  :@@@@@@   *@@@@',
+    ' @@@@@@:  +@@@@@@   @@@@@@*   @@@@@@@',
+    '@@@@@   @@@@@@=  :@@@@@@.  *@@@@@@@@@',
+    '@@@@ =@@@@@@   %@@@@@#   @@@@@@- @@@@',
+    '@@@@@@@@@+   @@@@@@   =@@@@@@   @@@@@',
+    '@@@@@@@   %@@@@@#   @@@@@@-  .@@@@@@',
+    '@@@@+   @@@@@@   +@@@@@@   @@@@@@*',
+    '@@   #@@@@@@#**@@@@@@:  :@@@@@@',
+    '   @@@@@@@@@@@@@@@@   %@@@@@*',
+    ' *###***********-   **###*',
+)
+
 _WORDMARK = (
-    "███████╗ ██████╗██████╗  █████╗ ██████╗ ███████╗██████╗ ",
-    "██╔════╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗",
-    "███████╗██║     ██████╔╝███████║██████╔╝█████╗  ██████╔╝",
-    "╚════██║██║     ██╔══██╗██╔══██║██╔═══╝ ██╔══╝  ██╔══██╗",
-    "███████║╚██████╗██║  ██║██║  ██║██║     ███████╗██║  ██║",
-    "╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝",
-    "",
-    "B U D D Y   2 . 0",
+    '███████╗ ██████╗██████╗  █████╗ ██████╗ ███████╗██████╗',
+    '██╔════╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗',
+    '███████╗██║     ██████╔╝███████║██████╔╝█████╗  ██████╔╝',
+    '╚════██║██║     ██╔══██╗██╔══██║██╔═══╝ ██╔══╝  ██╔══██╗',
+    '███████║╚██████╗██║  ██║██║  ██║██║     ███████╗██║  ██║',
+    '╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝',
+    '',
+    '██████╗ ██╗   ██╗██████╗ ██████╗ ██╗   ██╗',
+    '██╔══██╗██║   ██║██╔══██╗██╔══██╗╚██╗ ██╔╝',
+    '██████╔╝██║   ██║██║  ██║██║  ██║ ╚████╔╝',
+    '██╔══██╗██║   ██║██║  ██║██║  ██║  ╚██╔╝',
+    '██████╔╝╚██████╔╝██████╔╝██████╔╝   ██║',
+    '╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝    ╚═╝',
+)
+
+_TAGLINES = (
     "",
     "P R O F I T   S Y S T E M S",
     "P R O P R I E T A R Y   T E C H N O L O G Y",
     "2 0 2 6",
 )
 _GAP = 4
-MARK_WIDTH = max(len(r) for r in _MARK)
-WORD_WIDTH = max(len(r) for r in _WORDMARK)
-WIDE = MARK_WIDTH + _GAP + WORD_WIDTH        # columns the side-by-side layout needs
+WORD_BLOCK = tuple(_WORDMARK) + _TAGLINES
+WORD_WIDTH = max(len(r) for r in WORD_BLOCK)
+
+
+def _width(rows) -> int:
+    return max(len(r) for r in rows)
 
 
 def banner(columns: int | None = None) -> str:
-    """Side by side when the terminal is wide enough, stacked otherwise."""
+    """Pick the layout for the terminal width."""
     if columns is None:
         columns = shutil.get_terminal_size((100, 40)).columns
-    if columns >= WIDE + 2:
-        return _side_by_side()
-    return _stacked(min(columns, 100))
+    for mark in (_MARK_LARGE, _MARK_SMALL):
+        if columns >= _width(mark) + _GAP + WORD_WIDTH + 2:
+            return _side_by_side(mark)
+    return _stacked(_MARK_SMALL, min(columns, 100))
 
 
-def _side_by_side() -> str:
-    height = max(len(_MARK), len(_WORDMARK))
-    top = (height - len(_WORDMARK)) // 2
-    words = [""] * top + list(_WORDMARK)
+def _side_by_side(mark) -> str:
+    mark_width = _width(mark)
+    height = max(len(mark), len(WORD_BLOCK))
+    top = (height - len(WORD_BLOCK)) // 2
+    words = [""] * top + list(WORD_BLOCK)
     words += [""] * (height - len(words))
     rows = []
     for i in range(height):
-        left = (_MARK[i] if i < len(_MARK) else "").ljust(MARK_WIDTH)
+        left = (mark[i] if i < len(mark) else "").ljust(mark_width)
         rows.append((left + " " * _GAP + words[i]).rstrip())
     rows.append("")
-    rows.append("─" * WIDE)
+    rows.append("─" * (mark_width + _GAP + WORD_WIDTH))
     return "\n".join(rows)
 
 
-def _stacked(width: int) -> str:
-    rows = [r.center(width).rstrip() for r in _MARK]
+def _stacked(mark, width: int) -> str:
+    rows = [r.center(width).rstrip() for r in mark]
     rows.append("")
-    rows += [r.center(width).rstrip() for r in _WORDMARK]
+    rows += [r.center(width).rstrip() for r in WORD_BLOCK]
     rows.append("")
     rows.append("─" * width)
     return "\n".join(rows)
