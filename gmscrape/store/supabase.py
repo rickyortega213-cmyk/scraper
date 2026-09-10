@@ -357,9 +357,9 @@ def run_table_name(label: str, prefix: str = "") -> str:
 
     text, _, date_part = label.rpartition(" · ")
     text = text or label
+    text = re.sub(r"\s\+\d+\s+more$", "", text)          # "dentist ... +2 more"
     date_slug = date_part.replace("-", "_") if date_part else ""
     slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-    slug = re.sub(r"_\+\d+_more$", "", slug)
     name = f"run_{date_slug}_{slug}" if date_slug else f"run_{slug}"
     name = re.sub(r"_+", "_", name).strip("_")[:60]
     return f"{prefix}{name}"

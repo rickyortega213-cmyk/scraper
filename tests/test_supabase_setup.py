@@ -216,12 +216,12 @@ def test_run_table_names():
     assert len(run_table_name("x" * 200 + " · 2026-09-10")) <= 60
 
 
-def test_a_fresh_table_is_created_for_the_run(cloud, management, monkeypatch):
+def test_a_fresh_table_is_created_for_the_run(cloud, monkeypatch):
     """Shared tables plus the per-run table, in one SQL call through the token."""
     from gmscrape.store.supabase import run_table_sql
 
     monkeypatch.setattr(SupabaseConfig, "project_ref", property(lambda self: "abcdefghijkl"))
-    config = SupabaseConfig(url=cloud, key=SERVICE_KEY, access_token="sbp_good")
+    config = SupabaseConfig(url=cloud, key=SERVICE_KEY, access_token=ACCESS_TOKEN)
     ready, detail = ensure_schema(config, run_table="run_2026_09_10_dentist_in_austin_tx")
     assert ready and "created run_2026_09_10_dentist_in_austin_tx" in detail
     sql = _Cloud.sql_received[0]
