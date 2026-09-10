@@ -262,6 +262,9 @@ class Pipeline:
             "maps_provider": report.maps_provider,
             "verify_provider": report.verify_provider,
         })
+        run_table = next((getattr(s, "run_table", "") for s in self.sinks if getattr(s, "run_table", "")), "")
+        if run_table:
+            self.store.set_run_state(report.run_id, "running", run_table=run_table)
 
         seen_keys: set[str] = set()
         pending_specs = list(specs)

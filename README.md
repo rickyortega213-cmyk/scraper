@@ -565,6 +565,11 @@ Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
   continues with the rest — no re-crawling, no re-verifying, no second Maps
   call. `scraper buddy` offers this itself when it finds an unfinished run.
   `gmscrape runs` lists recent runs and their state.
+- **The live table was off or broken?** The run still finished on disk.
+  `scraper publish` pushes the latest finished run to Supabase after the fact
+  (`scraper publish <run id> --table my_table` for a specific one). A key that
+  picked up stray characters in a copy/paste is named as such on startup and
+  by `scraper keys`, instead of an encoding error.
 
 Volume: 50–90 searches at a time is the intended scale (Maps queries fetched
 four at a time; crawls, web searches and verifications concurrent; one bad
@@ -597,7 +602,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 214 tests, no network or API keys needed
+make test     # 217 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

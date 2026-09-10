@@ -363,3 +363,48 @@ def test_lead_record_blanks_become_nulls():
     assert record["reviews"] == 87
     assert record["is_chain"] is False
     assert record["id"] == "pid:p1|general" and record["business_id"] == "pid:p1"
+
+
+def test_a_mangled_key_is_explained_not_a_codec_error(supabase):
+    """A key that picked up invisible or look-alike characters in a copy/paste
+    used to surface as "'ascii' codec can't encode characters"."""
+    config = config_for(supabase, key="eyJh" + "​" * 3 + "bGci" + "é" * 5)
+    with pytest.raises(SupabaseError) as err:
+        check_connection(config)
+    assert "copy/paste" in str(err.value) and "scraper keys set SUPABASE_KEY" in str(err.value)
+    assert "codec" not in str(err.value)
+
+
+def test_publish_pushes_a_finished_run_after_the_fact(tmp_path, settings, site_server, supabase, monkeypatch):
+    """A run scraped while the live table was off can be sent to Supabase later."""
+    from gmscrape import cli
+
+    places = tmp_path / "places.csv"
+    places.write_text(
+        "name,website,place_id,category\n"
+        f"Joe's Plumbing,{site_server}/site1/,s1,Plumber\n"
+        f"Bright Smiles Dental,{site_server}/site2/,s2,Dentist\n",
+        encoding="utf-8",
+    )
+    settings.places_file = str(places)
+    settings.supabase = False
+    store = Store(settings.db_path)
+    with Pipeline(settings, store=store, maps=FileMaps(settings), verifier=StubVerifier(settings)) as pipeline:
+        report = pipeline.run(["*"])
+    store.close()
+    assert _PostgREST.tables.get("gmscrape_leads", {}) == {}
+
+    monkeypatch.chdir(tmp_path)                                    # never the repo's .env
+    monkeypatch.setenv("GMSCRAPE_CONFIG", str(tmp_path / "cfg.env"))
+    monkeypatch.setenv("SUPABASE_URL", supabase)
+    monkeypatch.setenv("SUPABASE_KEY", SERVICE_KEY)
+    monkeypatch.setattr("gmscrape.keys.interactive", lambda: False)
+    code = cli.main(["publish", report.run_id, "--db", settings.db_path])
+    assert code == 0
+    leads = _PostgREST.tables["gmscrape_leads"]
+    assert {"pid:s1|general", "pid:s2|general"} <= set(leads)
+    assert all(row["status"] == STATUS_DONE for row in leads.values())
+    assert report.run_id in _PostgREST.tables["gmscrape_runs"]
+    # defaults to the latest finished run when no id is given
+    assert cli.main(["publish", "--db", settings.db_path]) == 0
+    assert cli.main(["publish", "nope", "--db", settings.db_path]) == 2

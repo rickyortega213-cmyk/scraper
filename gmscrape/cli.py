@@ -283,6 +283,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd.add_argument("--format", dest="export_formats")
     runs_cmd = sub.add_parser("runs", parents=[common], help="list recent runs and their state")
     runs_cmd.add_argument("--limit", type=int, default=15)
+    publish_cmd = sub.add_parser("publish", parents=[common],
+                                 help="push a finished run to Supabase (for a run made while the live table was off)")
+    publish_cmd.add_argument("run_id", nargs="?", help="run id (default: the latest finished run)")
+    publish_cmd.add_argument("--table", dest="table", help="Supabase table name for the run")
 
     # --- keys ------------------------------------------------------------
     setup_cmd = sub.add_parser("setup", parents=[common],
@@ -387,6 +391,8 @@ def cmd_keys(args: argparse.Namespace) -> int:
             echo(f"  [yellow]warning: {warning}[/yellow]")
         echo(f"saved to {user_config_path()}")
 
+    from .keys import check_value
+
     settings = settings_from_args(args)
     values = current_values()
     _print_table(
@@ -397,7 +403,67 @@ def cmd_keys(args: argparse.Namespace) -> int:
             for f in KEY_FIELDS if values[f.env]
         ] or [("(none)", "", "run `gmscrape setup`")],
     )
+    problems = [(f.env, check_value(f.env, values[f.env])) for f in KEY_FIELDS if values[f.env]]
+    for env, warning in problems:
+        if warning:
+            echo(f"  [yellow]{env}: {warning}[/yellow]")
     _print_key_status(settings)
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    """Push a finished run's leads to Supabase after the fact - for a run that
+    was scraped while the live table was off or broken."""
+    from .store.sinks import STATUS_DONE
+
+    settings = settings_from_args(args)
+    settings.supabase = True
+    with Store(settings.db_path) as store:
+        runs = store.list_runs(500)
+        if args.run_id:
+            run = next((r for r in runs if r["run_id"] == args.run_id), None)
+        else:
+            run = next((r for r in runs if r["status"] == "done"), None) or (runs[0] if runs else None)
+        if run is None:
+            echo("[red]no such run - `gmscrape runs` lists them[/red]")
+            return 2
+        if args.table:
+            settings.supabase_table_name = args.table
+        elif run["run_table"]:
+            settings.supabase_table_name = run["run_table"]
+        if not settings.supabase_configured:
+            echo("[red]Supabase is not set up - run `scraper keys set SUPABASE_URL=... SUPABASE_KEY=...`[/red]")
+            return 2
+        sinks = build_sinks(settings, run["queries"])
+        if not sinks:
+            return 1
+        sink = sinks[0]
+        sink.start_run(run["run_id"], {"queries": run["queries"]})
+        sent = 0
+        batch: list = []
+        for result in store.iter_run_businesses(run["run_id"]):
+            batch.append(result)
+            if len(batch) >= 200:
+                sink.upsert(batch, STATUS_DONE)
+                sent += len(batch)
+                batch = []
+        if batch:
+            sink.upsert(batch, STATUS_DONE)
+            sent += len(batch)
+        sink.finish_run(run["run_id"], {"businesses": sent, "republished": True})
+        sink.close()
+        run_table = getattr(sink, "run_table", "")
+        if run_table:
+            store.set_run_state(run["run_id"], run["status"], run_table=run_table)
+    stats = getattr(sink, "stats", None)
+    if stats is not None and stats.failures and not stats.leads_written:
+        echo(f"[red]nothing was written: {stats.last_error}[/red]")
+        return 1
+    echo(f"published {sent} businesses from run [cyan]{run['run_id']}[/cyan]"
+         + (f" to [green]{run_table}[/green]" if run_table else ""))
+    if stats is not None:
+        echo(f"  lead rows: {stats.leads_written}   email rows: {stats.emails_written}"
+             + (f"   failures: {stats.failures} ({stats.last_error})" if stats.failures else ""))
     return 0
 
 
@@ -871,6 +937,8 @@ def build_sinks(settings: Settings, queries: Sequence[str] = ()) -> list:
         return []
     if detail != "tables present":
         echo(f"Supabase: [green]{detail}[/green]")
+    if run_table and "paste" in detail:            # the per-run table could not be created
+        run_table = ""
     echo(f"live table: [green]{run_table or config.table('latest')}[/green]  "
          f"{config.table_editor_url or settings.supabase_url}")
     return [SupabaseSink(config, run_table=run_table)]
@@ -1312,6 +1380,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "probe-mcp": cmd_probe_mcp,
         "setup": cmd_setup,
         "resume": cmd_resume,
+        "publish": cmd_publish,
         "runs": cmd_runs,
         "keys": cmd_keys,
         "search": cmd_search,

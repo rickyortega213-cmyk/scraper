@@ -104,7 +104,27 @@ class SupabaseConfig:
     def table(self, name: str) -> str:
         return f"{self.prefix}{name}"
 
+    def problems(self) -> list[str]:
+        """Why this config cannot work, in plain words (empty = looks fine)."""
+        out: list[str] = []
+        for label, value, env in (("Supabase URL", self.url, "SUPABASE_URL"),
+                                  ("Supabase key", self.key, "SUPABASE_KEY"),
+                                  ("Supabase access token", self.access_token, "SUPABASE_ACCESS_TOKEN")):
+            bad = sum(1 for ch in value if ord(ch) > 126 or ord(ch) < 32)
+            if bad:
+                out.append(f"the {label} on file contains {bad} character(s) that cannot be in a "
+                           f"key (a copy/paste went wrong) - copy it again from the Supabase "
+                           f"dashboard and run: scraper keys set {env}=<paste>")
+        if not self.url:
+            out.append("no Supabase URL on file")
+        if not self.key and not self.access_token:
+            out.append("no Supabase key on file")
+        return out
+
     def headers(self) -> dict[str, str]:
+        problems = self.problems()
+        if problems:
+            raise SupabaseError(problems[0])
         headers = {
             "apikey": self.key,
             "Content-Type": "application/json",
@@ -655,6 +675,8 @@ def check_connection(config: SupabaseConfig) -> dict[str, Any]:
                     url, params={"select": "*", "limit": 1},
                     headers={**config.headers(), "Prefer": "count=exact"},
                 )
+            except SupabaseError:
+                raise
             except Exception as exc:
                 raise SupabaseError(f"could not reach {url}: {exc}") from exc
             if response.status_code == 404 or (

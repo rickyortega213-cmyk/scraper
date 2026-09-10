@@ -226,3 +226,11 @@ def test_cli_keys_set_saves_without_prompts(config_path, monkeypatch, tmp_path):
     assert cli.main(["keys", "set", "NOT_A_KEY=1"]) == 2
     assert cli.main(["keys", "set", "MAILTESTER_KEY"]) == 2
     assert cli.main(["keys"]) == 0
+
+
+def test_invisible_and_lookalike_characters_are_stripped_from_pasted_keys():
+    pasted = "﻿sub_1ABC​DEF­GHI 　jkl\n"
+    assert K.clean_value("MAILTESTER_KEY", pasted) == "sub_1ABCDEFGHIjkl"
+    assert K.clean_value("OPENWEBNINJA_KEY", "ａｋ_ｆｕｌｌｗｉｄｔｈ") == "ak_fullwidth"
+    assert K.check_value("SUPABASE_KEY", "sb_secret_ok") is None
+    assert "copy/paste" in K.check_value("SUPABASE_KEY", "sb_secret_éé")

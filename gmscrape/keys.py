@@ -180,10 +180,25 @@ def looks_like_value(answer: str) -> bool:
     return "://" in answer or "_" in answer or "." in answer or answer.isalnum()
 
 
+def strip_invisible(value: str) -> str:
+    """Drop what a copy/paste from a web page or chat smuggles in: zero-width
+    spaces, soft hyphens, BOMs, control characters, and fold look-alike
+    (full-width) letters back to ASCII."""
+    import unicodedata
+
+    value = unicodedata.normalize("NFKC", value or "")
+    return "".join(
+        ch for ch in value
+        if unicodedata.category(ch) not in ("Cf", "Cc", "Co", "Cn", "Zl", "Zp")
+    )
+
+
 def clean_value(env: str, value: str) -> str:
     """Normalise a pasted value: trim quotes/space; URLs are reduced to what
     the program needs (a Supabase REST or table URL becomes the project URL)."""
-    value = (value or "").strip().strip('"').strip("'").strip()
+    value = strip_invisible(value).strip().strip('"').strip("'").strip()
+    if env != "GENERIC_MAPS_CONFIG":              # a file path may legitimately contain spaces
+        value = "".join(value.split())            # keys and URLs never contain whitespace
     if env == "SUPABASE_URL":
         v = value
         if "://" not in v and v:
@@ -220,6 +235,10 @@ def check_value(env: str, value: str) -> Optional[str]:
     v = (value or "").strip()
     if not v:
         return None
+    bad = sum(1 for ch in v if ord(ch) > 126 or ord(ch) < 32)
+    if bad and env != "GENERIC_MAPS_CONFIG":
+        return (f"contains {bad} character(s) that cannot appear in a key or URL - "
+                "a copy/paste went wrong; copy it again from the provider's dashboard")
     if env == "MCP_MAPS_URL" and "mcp.scraper.tech/" not in v:
         return "expected a link like https://mcp.scraper.tech/<your key>"
     if env == "MAILTESTER_KEY" and not v.startswith("sub_"):
