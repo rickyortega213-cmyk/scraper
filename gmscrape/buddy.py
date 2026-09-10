@@ -19,6 +19,10 @@
 
 Everything after that is the normal pipeline: live table, terminal table,
 out/leads.csv.
+
+Pasting the key straight at a yes/no question saves it; values are tidied
+(`keys.clean_value`) and obviously wrong kinds of key are flagged
+(`keys.check_value`). `scraper keys set NAME=VALUE ...` loads them all at once.
 """
 
 from __future__ import annotations
@@ -78,14 +82,20 @@ def review_keys(prompt: Prompt, echo: Echo) -> dict[str, str]:
         line = f"  {key.label} ".ljust(width, ".") + f" {shown}"
         if current:
             answer = prompt(f"{line}   keep it? [Y/n] ")
-            if _yes(answer, default=True):
+            if K.looks_like_value(answer):          # pasted the new key right here
+                new = answer.strip()
+            elif _yes(answer, default=True):
                 continue
-            new = prompt(f"    paste the new {key.label} (Enter to keep, '-' to remove): ").strip()
+            else:
+                new = prompt(f"    paste the new {key.label} (Enter to keep, '-' to remove): ").strip()
         else:
             answer = prompt(f"{line}   add it now? [{'y/N' if key.optional else 'Y/n'}] ")
-            if not _yes(answer, default=not key.optional):
+            if K.looks_like_value(answer):          # pasted the key instead of answering y
+                new = answer.strip()
+            elif not _yes(answer, default=not key.optional):
                 continue
-            new = prompt(f"    paste your {key.label}: ").strip()
+            else:
+                new = prompt(f"    paste your {key.label}: ").strip()
         if not new:
             continue
         if new == "-":
@@ -93,9 +103,15 @@ def review_keys(prompt: Prompt, echo: Echo) -> dict[str, str]:
             os.environ.pop(key.env, None)
             echo("    removed")
             continue
-        updates[key.env] = new
-        os.environ[key.env] = new
-        echo(f"    saved ({K.mask(new) if key.secret else new})")
+        cleaned = K.clean_value(key.env, new)
+        updates[key.env] = cleaned
+        os.environ[key.env] = cleaned
+        if cleaned != new and not key.secret:
+            echo(f"    trimmed to {cleaned}")
+        echo(f"    saved ({K.mask(cleaned) if key.secret else cleaned})")
+        warning = K.check_value(key.env, cleaned)
+        if warning:
+            echo(f"    warning: {warning}")
     if updates:
         K.save_keys(updates)
     return updates

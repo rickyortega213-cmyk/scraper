@@ -125,6 +125,30 @@ def save_keys(updates: dict[str, str], path: Optional[Path] = None) -> Path:
     return path
 
 
+def set_keys(pairs: dict[str, str], path: Optional[Path] = None) -> tuple[dict[str, str], list[str]]:
+    """Save NAME=VALUE pairs non-interactively (cleaned); returns (saved, warnings).
+    Unknown names are rejected so a typo never becomes a silently ignored key."""
+    known = {f.env for f in KEY_FIELDS}
+    saved: dict[str, str] = {}
+    warnings: list[str] = []
+    for name, value in pairs.items():
+        name = name.strip().upper()
+        if name not in known:
+            raise KeyError(name)
+        value = clean_value(name, value)
+        saved[name] = value
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+        warning = check_value(name, value)
+        if warning:
+            warnings.append(f"{name}: {warning}")
+    if saved:
+        save_keys(saved, path)
+    return saved, warnings
+
+
 def load_saved_keys_into_env(path: Optional[Path] = None) -> int:
     """Apply saved keys as defaults - never overriding the real environment."""
     count = 0
@@ -142,6 +166,79 @@ def mask(value: str) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}…{value[-3:]}"
+
+
+# --- cleaning what people paste ---------------------------------------------
+_YES_NO_WORDS = {"", "y", "yes", "yeah", "yep", "sure", "ok", "n", "no", "nope", "-", "skip"}
+
+
+def looks_like_value(answer: str) -> bool:
+    """True when the reply to a yes/no question is really a pasted key or URL."""
+    answer = (answer or "").strip()
+    if answer.lower() in _YES_NO_WORDS or len(answer) < 8:
+        return False
+    return "://" in answer or "_" in answer or "." in answer or answer.isalnum()
+
+
+def clean_value(env: str, value: str) -> str:
+    """Normalise a pasted value: trim quotes/space; URLs are reduced to what
+    the program needs (a Supabase REST or table URL becomes the project URL)."""
+    value = (value or "").strip().strip('"').strip("'").strip()
+    if env == "SUPABASE_URL":
+        v = value
+        if "://" not in v and v:
+            v = "https://" + v
+        scheme, _, rest = v.partition("://")
+        host = rest.split("/", 1)[0].split("?", 1)[0].strip().lower()
+        if host:
+            value = f"{scheme.lower()}://{host}"      # http:// only ever means a local test server
+    elif env == "MCP_MAPS_URL":
+        value = value.rstrip("/")
+        if value and "://" not in value:
+            value = "https://" + value
+    return value
+
+
+def _jwt_role(token: str) -> str:
+    """'anon' / 'service_role' for a legacy Supabase JWT, '' otherwise."""
+    import base64
+    import json
+
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[0].startswith("eyJ"):
+        return ""
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return str(data.get("role", ""))
+    except Exception:
+        return ""
+
+
+def check_value(env: str, value: str) -> Optional[str]:
+    """A one-line warning when a value is clearly the wrong kind of key, else None."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    if env == "MCP_MAPS_URL" and "mcp.scraper.tech/" not in v:
+        return "expected a link like https://mcp.scraper.tech/<your key>"
+    if env == "MAILTESTER_KEY" and not v.startswith("sub_"):
+        return "MailTester Ninja keys start with sub_"
+    if env == "OPENWEBNINJA_KEY" and not v.startswith("ak_"):
+        return "OpenWeb Ninja keys start with ak_"
+    if env == "SUPABASE_URL" and not v.endswith(".supabase.co"):
+        return "expected https://<project>.supabase.co"
+    if env == "SUPABASE_KEY":
+        role = _jwt_role(v)
+        if role == "anon" or v.startswith("sb_publishable_"):
+            return "this is the public anon key - the live table needs the secret / service_role key"
+        if v.startswith("sbp_"):
+            return "sbp_ is an account access token, not the project API key (Project Settings → API)"
+        if not (role == "service_role" or v.startswith("sb_secret_")):
+            return "does not look like a Supabase service_role / sb_secret key"
+    if env == "SUPABASE_ACCESS_TOKEN" and not v.startswith("sbp_"):
+        return "Supabase access tokens start with sbp_"
+    return None
 
 
 def field_by_env(env: str) -> Optional[KeyField]:
@@ -207,9 +304,13 @@ def run_setup(
                 os.environ.pop(field.env, None)
                 echo(f"    cleared {field.env}")
                 continue
+            answer = clean_value(field.env, answer)
             updates[field.env] = answer
             os.environ[field.env] = answer
             echo(f"    set {field.env} = {mask(answer) if field.secret else answer}")
+            warning = check_value(field.env, answer)
+            if warning:
+                echo(f"    warning: {warning}")
     if updates:
         saved_to = save_keys(updates, path)
         echo("")

@@ -75,6 +75,19 @@ Press Enter to start, or type k to change keys:
 
 `k` opens the wizard (Enter keeps a value, typing replaces it, `-` clears it);
 `gmscrape keys` shows them masked; `-y` skips the check for scripts and cron.
+
+To load every key in one go (a new machine, a fresh install), skip the prompts:
+
+```bash
+scraper keys set MCP_MAPS_URL=https://mcp.scraper.tech/YOURKEY MAILTESTER_KEY=sub_... OPENWEBNINJA_KEY=ak_... SUPABASE_URL=https://YOURPROJECT.supabase.co SUPABASE_KEY=...
+```
+
+From then on `scraper buddy` starts with them all on file and asks `keep it?
+[Y/n]` for each. Pasted values are tidied up (a Supabase REST or table link
+becomes the project URL) and the obvious mix-ups are flagged: the anon key
+where the secret key belongs, an `sbp_` account token in the API-key slot, a
+MailTester key that doesn't start with `sub_`. Typing the key straight at an
+`add it now?` question saves it too.
 A project `.env` still works and takes precedence over saved keys, and real
 environment variables beat both.
 
@@ -584,7 +597,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 210 tests, no network or API keys needed
+make test     # 214 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

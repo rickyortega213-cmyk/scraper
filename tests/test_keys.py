@@ -194,3 +194,35 @@ def test_first_run_opens_the_wizard_automatically(config_path, monkeypatch, tmp_
     assert code == 0
     assert K.read_saved_keys() == {"SERPAPI_KEY": "just-entered"}
     assert seen["settings"].serpapi_key == "just-entered"      # the run used the new key
+
+
+def test_pasted_values_are_cleaned_and_checked():
+    assert K.clean_value("SUPABASE_URL", " https://abc.supabase.co/rest/v1/leads?x=1 ") == "https://abc.supabase.co"
+    assert K.clean_value("SUPABASE_URL", "abc.supabase.co") == "https://abc.supabase.co"
+    assert K.clean_value("MCP_MAPS_URL", '"https://mcp.scraper.tech/key/"') == "https://mcp.scraper.tech/key"
+    assert K.clean_value("MAILTESTER_KEY", "  sub_x  ") == "sub_x"
+    assert K.check_value("MAILTESTER_KEY", "sub_x") is None
+    assert "sub_" in K.check_value("MAILTESTER_KEY", "abc")
+    assert "ak_" in K.check_value("OPENWEBNINJA_KEY", "sub_x")
+    assert "sbp_" in K.check_value("SUPABASE_KEY", "sbp_token")
+    assert K.check_value("SUPABASE_KEY", "sb_secret_abc") is None
+    assert K.looks_like_value("ak_testkey0000000000000000000000000000000000000000")
+    assert not K.looks_like_value("yes") and not K.looks_like_value("n") and not K.looks_like_value("")
+
+
+def test_cli_keys_set_saves_without_prompts(config_path, monkeypatch, tmp_path):
+    from gmscrape import cli
+
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["keys", "set", "MAILTESTER_KEY=sub_abc123456",
+                     "SUPABASE_URL=https://abc.supabase.co/rest/v1/whatever",
+                     "OPENWEBNINJA_KEY=ak_x"])
+    assert code == 0
+    saved = K.read_saved_keys(config_path)
+    assert saved["MAILTESTER_KEY"] == "sub_abc123456"
+    assert saved["SUPABASE_URL"] == "https://abc.supabase.co"
+    assert cli.main(["keys", "set", "OPENWEBNINJA_KEY="]) == 0          # NAME= clears
+    assert "OPENWEBNINJA_KEY" not in K.read_saved_keys(config_path)
+    assert cli.main(["keys", "set", "NOT_A_KEY=1"]) == 2
+    assert cli.main(["keys", "set", "MAILTESTER_KEY"]) == 2
+    assert cli.main(["keys"]) == 0

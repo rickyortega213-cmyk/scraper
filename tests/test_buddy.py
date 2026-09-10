@@ -141,3 +141,41 @@ def test_scraper_command_routes(monkeypatch):
     assert B.main([]) == 0 and B.main(["buddy"]) == 0
     assert B.main(["keys"]) == 0
     assert calls == ["buddy", "buddy", ("cli", ["keys"])]
+
+
+ANON_JWT = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIn0.sig")
+SERVICE_JWT = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+               "eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJzZXJ2aWNlX3JvbGUifQ.sig")
+
+
+def test_review_keys_accepts_a_key_pasted_at_the_yes_no_prompt(clean_env):
+    """Typing the key where the program asked 'add it now? [y/N]' must save it,
+    not be read as 'no'."""
+    script = Script(
+        "https://mcp.scraper.tech/a25e0000000000000000000000000ce8",   # pasted at the y/n prompt
+        "n",                                                            # MailTester: skip
+        "ak_testkey0000000000000000000000000000000000000000",           # pasted at the y/n prompt
+        "y", "https://abc.supabase.co/rest/v1/Some Table Name",        # URL with a table path
+        "y", SERVICE_JWT,
+    )
+    updates = B.review_keys(script.prompt, script.echo)
+    assert updates == {
+        "MCP_MAPS_URL": "https://mcp.scraper.tech/a25e0000000000000000000000000ce8",
+        "OPENWEBNINJA_KEY": "ak_testkey0000000000000000000000000000000000000000",
+        "SUPABASE_URL": "https://abc.supabase.co",
+        "SUPABASE_KEY": SERVICE_JWT,
+    }
+    assert K.read_saved_keys()["SUPABASE_URL"] == "https://abc.supabase.co"
+    assert any("trimmed to https://abc.supabase.co" in t for t in script.said)
+    assert not any("warning" in t for t in script.said)
+
+
+def test_review_keys_warns_about_the_wrong_kind_of_key(clean_env):
+    script = Script("n", "n", "n", "n", "y", ANON_JWT)
+    B.review_keys(script.prompt, script.echo)
+    assert any("warning" in t and "anon" in t for t in script.said)
+    # the anon key is now on file, so the prompt is "keep it?": no -> paste a token by mistake
+    script = Script("n", "n", "n", "n", "n", "sbp_example_not_a_real_token")
+    B.review_keys(script.prompt, script.echo)
+    assert any("warning" in t and "access token" in t for t in script.said)

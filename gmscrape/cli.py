@@ -289,7 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
                                help="save or change your API keys (interactive)")
     setup_cmd.add_argument("--only", choices=["maps", "verify", "search", "supabase"],
                            help="only walk through one group")
-    sub.add_parser("keys", parents=[common], help="show which keys are saved (masked)")
+    keys_cmd = sub.add_parser("keys", parents=[common],
+                              help="show saved keys (masked), or `keys set NAME=VALUE ...`")
+    keys_cmd.add_argument("action", nargs="?", choices=["show", "set"], default="show")
+    keys_cmd.add_argument("pairs", nargs="*", metavar="NAME=VALUE",
+                          help="with `set`: keys to save, e.g. MAILTESTER_KEY=sub_... ; NAME= clears")
 
     # --- misc ------------------------------------------------------------
     sub.add_parser("providers", help="list providers and show which are configured",
@@ -357,7 +361,31 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def cmd_keys(args: argparse.Namespace) -> int:
-    from .keys import KEY_FIELDS, current_values, mask, user_config_path
+    from .keys import KEY_FIELDS, current_values, mask, set_keys, user_config_path
+
+    if getattr(args, "action", "show") == "set":
+        pairs: dict[str, str] = {}
+        for item in args.pairs:
+            name, sep, value = item.partition("=")
+            if not sep or not name.strip():
+                echo(f"[red]expected NAME=VALUE, got {item!r}[/red]")
+                return 2
+            pairs[name.strip()] = value
+        if not pairs:
+            echo("[red]nothing to set - usage: gmscrape keys set NAME=VALUE ...[/red]")
+            return 2
+        try:
+            saved, warnings = set_keys(pairs)
+        except KeyError as exc:
+            echo(f"[red]unknown key {exc.args[0]} - known names: "
+                 f"{', '.join(f.env for f in KEY_FIELDS)}[/red]")
+            return 2
+        for name, value in saved.items():
+            field = next(f for f in KEY_FIELDS if f.env == name)
+            echo(f"  {name} = {(mask(value) if field.secret else value) if value else 'cleared'}")
+        for warning in warnings:
+            echo(f"  [yellow]warning: {warning}[/yellow]")
+        echo(f"saved to {user_config_path()}")
 
     settings = settings_from_args(args)
     values = current_values()

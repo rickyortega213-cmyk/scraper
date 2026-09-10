@@ -71,6 +71,14 @@ class SupabaseConfig:
     timeout: float = 20.0
     access_token: str = ""      # Management API token (sbp_...) - lets us create tables
 
+    def __post_init__(self) -> None:
+        # People paste REST endpoints and table links; only the project origin matters.
+        from ..keys import clean_value
+
+        self.url = clean_value("SUPABASE_URL", self.url)
+        self.key = (self.key or "").strip()
+        self.access_token = (self.access_token or "").strip()
+
     @property
     def rest_url(self) -> str:
         return self.url.rstrip("/") + "/rest/v1"
