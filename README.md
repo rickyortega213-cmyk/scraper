@@ -12,14 +12,20 @@ publishes none, and verifies everything before it lands in your CSV.
         │                    │
         │                    ├─▶ chain check      Walmart / McDonald's / Great Clips → flagged
         │                    │
+        │                    ├─▶ no website?      web search → pick their site → confirm it
+        │                    │                     (phone / name / address must be on the page)
+        │                    │
         │                    ├─▶ website crawl    homepage → contact / about / team
-        │                    │      └─▶ parse     mailto:, text, entities, Cloudflare,
-        │                    │                     "info [at] domain (dot) com", JSON-LD
+        │                    │      ├─▶ emails    mailto:, text, entities, Cloudflare,
+        │                    │      │             "info [at] domain (dot) com", JSON-LD
+        │                    │      └─▶ owner     "Jane Doe, Owner" · "founded by" · JSON-LD
+        │                    │                     → not named? web search + AI Overview
         │                    │
-        │                    ├─▶ permutations     only when nothing was found:
-        │                    │                     info@ contact@ hello@ office@ …
+        │                    ├─▶ permutations     general: only when nothing was found
+        │                    │                     owner:   jane@ jane.doe@ jdoe@ …
         │                    │
-        │                    └─▶ verification     cached, budgeted, stops at first hit
+        │                    └─▶ verification     cached, budgeted, stops at first hit;
+        │                                          a guess is a lead only once it verifies
         │
         └─▶ leads.csv · leads_emails.csv · leads.json · leads.xlsx · SQLite
 ```
@@ -140,6 +146,18 @@ With **no verification key at all** the pipeline still runs: it falls back to
 local syntax + MX + disposable/junk checks, which can rule an address out but
 never confirm a mailbox — those come back `risky`, never `valid`.
 
+**Web search** (website discovery + owner lookup) — OpenWeb Ninja's Real-Time
+Web Search, which returns Google organic results plus the AI Overview:
+
+```bash
+OPENWEBNINJA_KEY=ak_...
+```
+
+Without it, both features are simply off and everything else runs unchanged.
+`gmscrape search "any query"` shows exactly what the API returned — organic
+hits, AI Overview text, knowledge panel — so you can see the shape on a live
+call; `--raw` dumps the JSON.
+
 Already have places from elsewhere? Skip the Maps call:
 
 ```bash
@@ -169,6 +187,68 @@ minified-JS artefacts, and `noreply@`/`postmaster@` mailboxes.
 **Personal mailboxes are kept.** For local businesses a `@gmail.com` or
 `@hotmail.com` address is often the only inbox anyone reads, so they are
 reported and tagged `is_personal_domain` rather than filtered out.
+
+## No website on Maps? Find it
+
+Plenty of local businesses have a site Google Maps doesn't link. When the
+listing has none, the business is searched (`"Bluebonnet Roofing" Austin TX`)
+and every organic hit is scored: does the domain spell the business name, does
+the title name it, is the listing's phone number in the snippet? Directories
+and social platforms (Yelp, Facebook, YellowPages, Nextdoor…) are excluded
+outright, and if two sites are equally plausible nothing is chosen.
+
+Then the winner has to **prove itself**: after the page is fetched it must
+contain the business's phone number, name, or street address, or it is thrown
+away — `website_status = discovered_unconfirmed`, no emails, no guesses. A
+short generic name ("Smile Dental") only counts alongside the phone or address,
+because every Smile Dental in the country says "Smile Dental" on its homepage.
+A plausible-looking wrong site is worse than none: every address scraped from
+it would be a confident, verified, wrong lead.
+
+## Who's in charge
+
+Every business gets **one** decision-maker — the most senior person the
+evidence names: owner › founder › CEO › president › principal › managing
+partner › director › manager. On medical, dental, legal and vet sites,
+"Dr. Jane Doe, DDS" counts as the practice principal.
+
+Names come from explicit statements only — `Jane Doe, Owner`, `Owner: Jane
+Doe`, `founded by Jane Doe`, JSON-LD `founder` — never from a bare capitalized
+pair. A candidate must look like a person (no page furniture: "Our Team",
+"Owner Response", "Director Of Operations" are all rejected), and must not be
+the business name itself. When the site doesn't name anyone, the fallback is a
+web search (`who is the owner of Joe's Plumbing in Austin`), reading Google's
+AI Overview, the knowledge panel and snippets — but **only sentences that also
+name the business**, so the owner of the taqueria next door can't be picked up.
+If two different people have equal support, nobody is chosen.
+
+```bash
+gmscrape owner "Joe's Plumbing" --city Austin     # shows every mention and the verdict
+```
+
+Once the owner is known, their mailbox is guessed on the business domain even
+when a general address was found, in order of how common each pattern is:
+
+```
+jane@   jane.doe@   jdoe@   janed@   jane_doe@   janedoe@   doe@   j.doe@
+```
+
+An address already on the site that spells the owner's name (`jdoe@…`) is
+recognised as theirs and no guessing happens.
+
+## Two rows when there are two contacts
+
+The leads export has **one row per contact**. A business with both a general
+inbox and an owner address gets two rows that are identical in every column —
+name, phone, address, city, query — except the contact ones:
+
+| name | contact_type | contact_name | email | email_status |
+|---|---|---|---|---|
+| Hill Country Landscaping | owner | Maria Lopez | maria.lopez@hillcountrylandscaping.com | valid |
+| Hill Country Landscaping | general | | info@hillcountrylandscaping.com | valid |
+
+A business with no email still gets one row, so nothing is silently dropped.
+The Supabase table follows the same shape (`<business>|general`, `<business>|owner`).
 
 ## Guessing addresses (permutations)
 
@@ -205,6 +285,13 @@ one**, so a lead costs one or two credits instead of a dozen. If the domain
 turns out to be **catch-all**, guessing stops immediately and the address is
 flagged `catch_all_domain_guess_unproven` — a catch-all accepts anything, so a
 "pass" there proves nothing.
+
+**A guess becomes a lead only once a verifier said the mailbox exists.** With a
+verification key configured, guessed addresses that came back anything other
+than `valid` (unknown, risky, catch-all, never checked) stay in
+`leads_emails.csv` flagged `lead_eligible = no`, and never appear in the leads
+rows. `--allow-unverified-guesses` relaxes this; without any verification key
+it is relaxed automatically, since nothing could ever verify.
 
 ## Local businesses vs. national chains
 
@@ -305,6 +392,8 @@ gmscrape run "med spa in scottsdale az"    # full pipeline
 gmscrape enrich --places-file places.csv   # email stages only, no Maps call
 gmscrape extract https://acme.com          # crawl one site, print what's found
 gmscrape guess acme.com --business-name "Joe's Plumbing"
+gmscrape owner "Joe's Plumbing" --city Austin      # who runs it, with evidence
+gmscrape search "who is the owner of Joe's Plumbing"   # raw web search
 gmscrape verify info@acme.com sales@acme.com
 gmscrape probe-maps https://api.example.com --key KEY   # discover an API's shape
 gmscrape supabase-init --write schema.sql   # SQL for the live lead table
@@ -327,19 +416,27 @@ Useful flags on `run`:
 --min-confidence N     drop weak addresses
 --format all           csv + json + jsonl + xlsx
 --no-robots            ignore robots.txt
+--no-discover          don't search for a website when Maps has none
+--no-owners            skip owner lookup and owner-address guessing
+--no-owner-search      find owners on the site only, never via web search
+--allow-unverified-guesses   let unverified guesses become lead rows
 --supabase             mirror leads into Supabase live as the run progresses
 ```
 
 ## Re-runs are cheap
 
 SQLite caches fetched pages (`CACHE_TTL_HOURS`, default a week), every
-verification result, and per-domain MX/catch-all facts. Re-running the same
+verification result, every web search (30 days), and per-domain MX/catch-all
+facts. Re-running the same
 queries re-fetches nothing and re-verifies nothing — a second identical run
 spends zero API credits. Businesses are deduplicated across overlapping
 queries by place ID, then domain, then phone.
 
 ## Politeness and compliance
 
+Website crawls, web searches and verifications all run concurrently
+(`HTTP_CONCURRENCY`, `WEB_SEARCH_CONCURRENCY`, `VERIFY_CONCURRENCY`), and the
+crawl stops the moment it has both an on-domain address and a named owner.
 Concurrency is capped globally and per host, `robots.txt` is honoured by
 default, requests retry with backoff, responses are size-capped, and user
 agents rotate. Scraped contact data is still regulated — CAN-SPAM, GDPR/ePrivacy
@@ -348,7 +445,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 78 tests, no network or API keys needed
+make test     # 109 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
@@ -370,8 +467,10 @@ gmscrape/
                       scrapingdog, generic, file
   providers/verify/   mailtester, millionverifier, zerobounce, neverbounce,
                       reoon, emaillistverify, bouncer, generic, local
-  web/                fetch (async, robots, cache) · crawl · extract
-  emails/             patterns (permutations) · score (confidence)
+  providers/search/   openwebninja (web search: site discovery + owner lookup)
+  web/                fetch (async, robots, cache) · crawl · extract · discover
+  emails/             patterns (permutations) · people (owner extraction)
+                      score (confidence)
   filters/chains.py   local business vs. national chain
   store/              SQLite cache + results · CSV/JSON/XLSX export
                       sinks (live publishing) · supabase (live lead table)

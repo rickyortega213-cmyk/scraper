@@ -25,7 +25,7 @@ from typing import Any, Optional, Sequence
 import httpx
 
 from ..models import BusinessResult
-from .sinks import email_records, lead_record
+from .sinks import email_records, lead_records
 
 log = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class SupabaseSink:
     def upsert(self, results: Sequence[BusinessResult], status: str) -> None:
         if not results:
             return
-        leads = [lead_record(r, self._run_id, status) for r in results]
+        leads = [rec for r in results for rec in lead_records(r, self._run_id, status)]
         self._enqueue("leads", leads)
         # Only publish addresses once they exist; `queued` rows have none yet.
         emails = [rec for r in results for rec in email_records(r, self._run_id)]
@@ -300,22 +300,32 @@ create table if not exists {p}runs (
     updated_at      timestamptz default now()
 );
 
+-- One row per contact: `<business>|general` and, when found, `<business>|owner`.
 create table if not exists {p}leads (
     id                          text primary key,
+    business_id                 text,
     run_id                      text,
     status                      text,
+    contact_type                text,
+    contact_name                text,
+    contact_title               text,
+    email                       text,
+    email_source                text,
+    email_status                text,
+    email_confidence            int,
     name                        text not null,
     query                       text,
     category                    text,
-    best_email                  text,
-    best_email_source           text,
-    best_email_status           text,
-    best_email_confidence       int,
+    owner_name                  text,
+    owner_title                 text,
+    owner_source                text,
+    owner_confidence            int,
     emails_found                int default 0,
     emails_guessed              int default 0,
     all_emails                  text,
     phone                       text,
     website                     text,
+    website_source              text,
     domain                      text,
     address                     text,
     city                        text,
@@ -344,6 +354,9 @@ create table if not exists {p}emails (
     run_id             text,
     email              text not null,
     business_name      text,
+    contact_type       text,
+    contact_name       text,
+    lead_eligible      boolean default true,
     confidence         int,
     status             text,
     sub_status         text,
@@ -363,7 +376,9 @@ create table if not exists {p}emails (
 create index if not exists {p}leads_run_idx      on {p}leads(run_id);
 create index if not exists {p}leads_status_idx   on {p}leads(status);
 create index if not exists {p}leads_domain_idx   on {p}leads(domain);
-create index if not exists {p}leads_best_idx     on {p}leads(best_email_status, best_email_confidence desc);
+create index if not exists {p}leads_business_idx on {p}leads(business_id);
+create index if not exists {p}leads_email_idx    on {p}leads(email_status, email_confidence desc);
+create index if not exists {p}leads_contact_idx  on {p}leads(contact_type);
 create index if not exists {p}emails_lead_idx    on {p}emails(lead_id);
 create index if not exists {p}emails_status_idx  on {p}emails(status);
 
@@ -372,28 +387,52 @@ create or replace view {p}table as
 select
     status,
     name              as business,
-    best_email        as email,
-    best_email_status as email_status,
-    best_email_confidence as confidence,
-    best_email_source as found_via,
-    phone, website, city, state, category,
+    contact_type,
+    contact_name,
+    contact_title,
+    email,
+    email_status,
+    email_confidence  as confidence,
+    email_source      as found_via,
+    phone, website, website_source, city, state, category,
     reviews, rating,
     is_chain,
+    owner_name, owner_title, owner_source,
     emails_found, emails_guessed,
     website_status,
     permutations_skipped_reason as no_guess_reason,
     query, run_id, domain, all_emails, updated_at
 from {p}leads
-order by best_email_confidence desc nulls last, updated_at desc;
+order by name, contact_type desc, email_confidence desc nulls last;
 
 -- Live progress: how far the current run has got.
 create or replace view {p}progress as
-select run_id, status, count(*) as leads,
-       count(best_email) as with_email,
-       count(*) filter (where best_email_status = 'valid') as verified_valid
+select run_id, status,
+       count(distinct business_id) as businesses,
+       count(email) as emails,
+       count(*) filter (where email_status = 'valid') as verified_valid,
+       count(*) filter (where contact_type = 'owner' and email is not null) as owner_emails
 from {p}leads
 group by run_id, status
 order by run_id, status;
+
+-- Upgrading from an earlier schema? These are safe to run on existing tables.
+alter table {p}leads  add column if not exists business_id text;
+alter table {p}leads  add column if not exists contact_type text;
+alter table {p}leads  add column if not exists contact_name text;
+alter table {p}leads  add column if not exists contact_title text;
+alter table {p}leads  add column if not exists email text;
+alter table {p}leads  add column if not exists email_source text;
+alter table {p}leads  add column if not exists email_status text;
+alter table {p}leads  add column if not exists email_confidence int;
+alter table {p}leads  add column if not exists website_source text;
+alter table {p}leads  add column if not exists owner_name text;
+alter table {p}leads  add column if not exists owner_title text;
+alter table {p}leads  add column if not exists owner_source text;
+alter table {p}leads  add column if not exists owner_confidence int;
+alter table {p}emails add column if not exists contact_type text;
+alter table {p}emails add column if not exists contact_name text;
+alter table {p}emails add column if not exists lead_eligible boolean default true;
 
 -- Writes use the service_role key, which bypasses RLS. Keep RLS on so the
 -- anon key cannot read your leads; add your own policies if you want to

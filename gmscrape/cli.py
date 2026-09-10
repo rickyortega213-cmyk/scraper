@@ -7,6 +7,8 @@
     gmscrape extract https://example.com
     gmscrape guess acme.com --business-name "Joe's Plumbing"
     gmscrape probe-maps https://api.example.com/maps --key KEY
+    gmscrape search "who is the owner of Joe's Plumbing in Austin"
+    gmscrape owner "Joe's Plumbing" --city Austin
     gmscrape supabase-init --write supabase_schema.sql
     gmscrape run "dentist in austin tx" --supabase
     gmscrape doctor
@@ -109,6 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--no-cache", dest="cache_http", action="store_false", default=None,
                        help="ignore the page cache")
 
+    people = run.add_argument_group("website discovery & owners (needs OPENWEBNINJA_KEY)")
+    people.add_argument("--no-discover", dest="discover_websites", action="store_false",
+                        default=None, help="don't search for a site when Maps has none")
+    people.add_argument("--no-owners", dest="find_owners", action="store_false", default=None,
+                        help="skip owner lookup and owner-address guessing")
+    people.add_argument("--no-owner-search", dest="owner_search", action="store_false",
+                        default=None, help="find owners on the site only, never via web search")
+    people.add_argument("--owner-min-confidence", type=int, dest="owner_min_confidence")
+    people.add_argument("--website-min-confidence", type=int, dest="website_min_confidence")
+
     guess = run.add_argument_group("permutations")
     guess.add_argument("--no-permutations", dest="permutations", action="store_false",
                        default=None, help="never guess addresses")
@@ -118,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="cap guesses per domain (default 12)")
     guess.add_argument("--guess-all", dest="stop_on_first_valid", action="store_false",
                        default=None, help="verify every guess instead of stopping at the first hit")
+    guess.add_argument("--allow-unverified-guesses", dest="require_verified_guesses",
+                       action="store_false", default=None,
+                       help="let guesses that did not verify `valid` become lead rows")
 
     verify = run.add_argument_group("verification")
     verify.add_argument("--no-verify", dest="verify_emails", action="store_false", default=None,
@@ -204,6 +219,19 @@ def build_parser() -> argparse.ArgumentParser:
     probe_cmd.add_argument("--show-sample", action="store_true",
                            help="print the full first result row")
 
+    # --- web search debugging --------------------------------------------
+    search_cmd = sub.add_parser("search", parents=[common],
+                                help="run one web search and show what the API returned")
+    search_cmd.add_argument("query")
+    search_cmd.add_argument("--limit", type=int, default=10)
+    search_cmd.add_argument("--raw", action="store_true", help="dump the raw JSON")
+
+    owner_cmd = sub.add_parser("owner", parents=[common],
+                               help="find a business's owner via web search and show the evidence")
+    owner_cmd.add_argument("name")
+    owner_cmd.add_argument("--city", default="")
+    owner_cmd.add_argument("--min-confidence", type=int, dest="owner_min_confidence")
+
     # --- supabase --------------------------------------------------------
     init_cmd = sub.add_parser(
         "supabase-init", parents=[common],
@@ -233,6 +261,8 @@ SETTINGS_KEYS = {
     "permutation_max", "permutation_require_mx", "stop_on_first_valid", "verify_emails",
     "verify_budget", "verify_concurrency", "keep_invalid", "keep_risky", "min_confidence",
     "chain_mode", "permutations_for_chains", "db_path", "log_level",
+    "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
+    "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
 }
 
 
@@ -283,7 +313,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     with pipeline:
         echo(f"maps: [green]{pipeline.maps.name}[/green]   "
-             f"verification: [green]{pipeline.verifier.name}[/green]")
+             f"verification: [green]{pipeline.verifier.name}[/green]   "
+             f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]")
         report = pipeline.run([s.search_string for s in specs])
         paths = export_results(
             report.results, settings.out_dir,
@@ -549,6 +580,77 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search(args: argparse.Namespace) -> int:
+    from .providers import get_web_search
+
+    settings = settings_from_args(args)
+    provider = get_web_search(settings)
+    if provider is None:
+        echo("[red]No web search provider configured.[/red] Set OPENWEBNINJA_KEY in .env")
+        return 2
+    response = provider.search(args.query, limit=args.limit)
+    provider.close()
+    if response.error:
+        echo(f"[red]search failed:[/red] {response.error}")
+        return 1
+    if args.raw:
+        print(json.dumps(response.raw, indent=2)[:20000])
+        return 0
+    echo(f"provider: [green]{provider.name}[/green]   "
+         f"top-level keys: {', '.join(list(response.raw)[:12])}")
+    if response.ai_overview:
+        echo(f"\n[bold]AI overview:[/bold] {response.ai_overview[:700]}")
+    if response.answer:
+        echo(f"\n[bold]Answer box:[/bold] {response.answer[:400]}")
+    if response.knowledge:
+        echo("\n[bold]Knowledge panel:[/bold]")
+        for key, value in list(response.knowledge.items())[:12]:
+            echo(f"  {key}: {str(value)[:100]}")
+    if response.hits:
+        _print_table(
+            f"Organic results ({len(response.hits)})",
+            ("#", "domain", "title", "snippet"),
+            [(str(h.position), h.domain, h.title[:50], h.snippet[:70]) for h in response.hits],
+        )
+    else:
+        echo("[yellow]no organic results parsed[/yellow] - run with --raw to see the shape")
+    return 0
+
+
+def cmd_owner(args: argparse.Namespace) -> int:
+    from .emails.people import choose_owner, owner_candidates_from_search, owner_local_parts
+    from .providers import get_web_search
+
+    settings = settings_from_args(args)
+    provider = get_web_search(settings)
+    if provider is None:
+        echo("[red]No web search provider configured.[/red] Set OPENWEBNINJA_KEY in .env")
+        return 2
+    query = f"who is the owner of {args.name}" + (f" in {args.city}" if args.city else "")
+    echo(f"searching: [cyan]{query}[/cyan]")
+    response = provider.search(query, limit=10)
+    provider.close()
+    if response.error:
+        echo(f"[red]search failed:[/red] {response.error}")
+        return 1
+    candidates = owner_candidates_from_search(response.all_text_blocks(), args.name, args.city)
+    if candidates:
+        _print_table(
+            "Owner mentions (only where the business is named)",
+            ("name", "title", "rank", "source", "evidence"),
+            [(c.name, c.title, str(c.rank), c.source, c.evidence[:70]) for c in candidates],
+        )
+    else:
+        echo("[yellow]no ownership statements mention this business[/yellow]")
+    person = choose_owner(candidates, min_confidence=settings.owner_min_confidence)
+    if person is None:
+        echo("[yellow]→ no confident single owner; nothing would be guessed[/yellow]")
+        return 0
+    echo(f"\n[green]→ {person.name}[/green] ({person.title}, {person.confidence}% via {person.source})")
+    echo(f"  would try: {', '.join(l + '@<domain>' for l in owner_local_parts(person)[:6])}")
+    return 0
+
+
 def cmd_providers(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     maps_keys = settings.configured_maps_keys()
@@ -577,6 +679,14 @@ def cmd_providers(args: argparse.Namespace) -> int:
             for name in list_verify_providers()
         ],
     )
+    _print_table(
+        "Web search (website discovery + owner lookup)",
+        ("provider", "configured", "auto-selected"),
+        [("openwebninja", "yes" if settings.openwebninja_key else "no",
+          "<--" if settings.web_search_configured else "")],
+    )
+    if not settings.web_search_configured:
+        echo("[dim]no OPENWEBNINJA_KEY - website discovery and owner search are off[/dim]")
     if auto_maps == "none configured":
         echo("\n[yellow]No Maps provider configured yet.[/yellow] Set a key in .env, or "
              "describe your API in a JSON file and point GENERIC_MAPS_CONFIG at it "
@@ -693,22 +803,18 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
         for path in paths:
             echo(f"  • [green]{path}[/green]")
 
-    top = [r for r in report.results if r.best_email][:10]
-    if top:
-        _print_table(
-            "Sample leads",
-            ("business", "best email", "source", "status", "conf"),
-            [
-                (
-                    r.place.name[:34],
-                    r.best_email.email,
-                    r.best_email.source,
-                    r.best_email.status,
-                    str(r.best_email.confidence),
-                )
-                for r in top
-            ],
-        )
+    rows = []
+    for r in report.results:
+        for c in r.lead_contacts():
+            rows.append((
+                r.place.name[:30],
+                c.contact_type + (f" · {c.contact_name}" if c.contact_name else ""),
+                c.email, c.source, c.status, str(c.confidence),
+            ))
+        if len(rows) >= 12:
+            break
+    if rows:
+        _print_table("Sample leads", ("business", "contact", "email", "source", "status", "conf"), rows)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -722,6 +828,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "extract": cmd_extract,
         "guess": cmd_guess,
         "probe-maps": cmd_probe_maps,
+        "search": cmd_search,
+        "owner": cmd_owner,
         "supabase-init": cmd_supabase_init,
         "supabase-check": cmd_supabase_check,
         "providers": cmd_providers,

@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS verifications (
     raw         TEXT,
     checked_at  REAL
 );
+CREATE TABLE IF NOT EXISTS web_searches (
+    query_key   TEXT PRIMARY KEY,
+    provider    TEXT,
+    query       TEXT,
+    payload     TEXT,
+    fetched_at  REAL
+);
 CREATE TABLE IF NOT EXISTS domain_facts (
     domain       TEXT PRIMARY KEY,
     has_mx       INTEGER,
@@ -198,6 +205,36 @@ class Store:
             )
             self.conn.commit()
 
+    # --- web search cache --------------------------------------------------
+    @staticmethod
+    def _search_key(provider: str, query: str) -> str:
+        return f"{provider}:{' '.join(query.lower().split())}"
+
+    def get_search(self, provider: str, query: str, ttl_hours: int) -> Optional[dict]:
+        with self._lock:
+            cutoff = time.time() - max(0, ttl_hours) * 3600
+            row = self.conn.execute(
+                "SELECT payload FROM web_searches WHERE query_key = ? AND fetched_at >= ?",
+                (self._search_key(provider, query), cutoff),
+            ).fetchone()
+            if row is None or not row["payload"]:
+                return None
+            try:
+                return json.loads(row["payload"])
+            except ValueError:
+                return None
+
+    def put_search(self, provider: str, query: str, payload: dict) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO web_searches(query_key, provider, query, payload, fetched_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(query_key) DO UPDATE SET payload=excluded.payload, "
+                "fetched_at=excluded.fetched_at",
+                (self._search_key(provider, query), provider, query,
+                 json.dumps(payload)[:200000], time.time()),
+            )
+            self.conn.commit()
+
     # --- domain facts ------------------------------------------------------
     def get_domain_facts(self, domain: str) -> Optional[tuple[Optional[bool], Optional[bool]]]:
         with self._lock:
@@ -325,6 +362,7 @@ class Store:
                 "valid_emails": count("SELECT COUNT(*) FROM emails WHERE status='valid'"),
                 "cached_pages": count("SELECT COUNT(*) FROM pages"),
                 "cached_verifications": count("SELECT COUNT(*) FROM verifications"),
+            "cached_searches": count("SELECT COUNT(*) FROM web_searches"),
             }
 
     def vacuum(self) -> None:

@@ -17,7 +17,7 @@ from gmscrape.core.pipeline import Pipeline
 from gmscrape.models import BusinessResult, EmailCandidate, Place, SOURCE_MAILTO
 from gmscrape.providers.maps.file_provider import FileMaps
 from gmscrape.store.db import Store
-from gmscrape.store.sinks import STATUS_DONE, STATUS_QUEUED, NullSink, lead_record
+from gmscrape.store.sinks import STATUS_DONE, STATUS_QUEUED, NullSink, lead_records
 from gmscrape.store.supabase import (
     SupabaseConfig,
     SupabaseError,
@@ -127,11 +127,12 @@ def test_writes_leads_and_emails(supabase):
         sink.flush()
 
         leads = _PostgREST.tables["gmscrape_leads"]
-        assert list(leads) == ["pid:p1"]
-        assert leads["pid:p1"]["name"] == "Joe's Plumbing"
-        assert leads["pid:p1"]["best_email"] == "info@joes.com"
-        assert leads["pid:p1"]["status"] == STATUS_DONE
-        assert leads["pid:p1"]["updated_at"]
+        assert list(leads) == ["pid:p1|general"]
+        row = leads["pid:p1|general"]
+        assert row["name"] == "Joe's Plumbing" and row["business_id"] == "pid:p1"
+        assert row["email"] == "info@joes.com" and row["contact_type"] == "general"
+        assert row["status"] == STATUS_DONE
+        assert row["updated_at"]
 
         assert list(_PostgREST.tables["gmscrape_emails"]) == ["pid:p1|info@joes.com"]
         assert _PostgREST.tables["gmscrape_runs"]["run1"]["queries"] == [
@@ -158,7 +159,7 @@ def test_rerunning_updates_the_same_row(supabase):
         sink.upsert([_result()], STATUS_DONE)
         sink.flush()
     assert len(_PostgREST.tables["gmscrape_leads"]) == 1
-    assert _PostgREST.status_history["pid:p1"] == [STATUS_QUEUED, STATUS_DONE]
+    assert _PostgREST.status_history["pid:p1|general"] == [STATUS_QUEUED, STATUS_DONE]
 
 
 def test_duplicate_ids_in_one_batch_are_collapsed(supabase):
@@ -298,7 +299,7 @@ def test_pipeline_streams_status_progression(tmp_path, settings, site_server, su
         report = pipeline.run(["*"])
 
     leads = _PostgREST.tables["gmscrape_leads"]
-    assert set(leads) == {"pid:s1", "pid:s2"}
+    assert set(leads) == {"pid:s1|general", "pid:s2|general"}
 
     # Rows land as `queued` before any slow work and finish as `done`. Stages
     # in between may coalesce into one write on a fast run, which is fine - the
@@ -307,18 +308,19 @@ def test_pipeline_streams_status_progression(tmp_path, settings, site_server, su
         assert history[0] == STATUS_QUEUED
         assert history[-1] == STATUS_DONE
 
-    joe = leads["pid:s1"]
-    assert joe["best_email"] == "office@joesplumbing.com"
+    joe = leads["pid:s1|general"]
+    assert joe["email"] == "office@joesplumbing.com"
     assert joe["website_status"] == "ok"
     assert joe["emails_found"] >= 1
 
-    roofing = leads["pid:s2"]
-    assert roofing["best_email"].startswith("info@")
+    roofing = leads["pid:s2|general"]
+    assert roofing["email"].startswith("info@")
     assert roofing["emails_guessed"] >= 1
 
     emails = _PostgREST.tables["gmscrape_emails"]
     assert any(e["email"] == "office@joesplumbing.com" for e in emails.values())
-    assert all(e["lead_id"] in leads for e in emails.values())
+    business_ids = {row["business_id"] for row in leads.values()}
+    assert all(e["lead_id"] in business_ids for e in emails.values())
 
     run_row = _PostgREST.tables["gmscrape_runs"][report.run_id]
     assert run_row["finished_at"] and run_row["stats"]["businesses"] == 2
@@ -356,7 +358,8 @@ def test_null_sink_is_the_default(tmp_path, settings):
 
 
 def test_lead_record_blanks_become_nulls():
-    record = lead_record(_result(), "run1", STATUS_QUEUED)
+    (record,) = lead_records(_result(), "run1", STATUS_QUEUED)
     assert record["postal_code"] is None      # empty string would break numeric/text nulls
     assert record["reviews"] == 87
     assert record["is_chain"] is False
+    assert record["id"] == "pid:p1|general" and record["business_id"] == "pid:p1"

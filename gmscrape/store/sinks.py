@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from ..models import BusinessResult
-from .export import business_row, email_rows
+from .export import email_rows, lead_rows
 
 # Status values, in the order a lead moves through them.
 STATUS_QUEUED = "queued"
@@ -47,50 +47,67 @@ def lead_id(result: BusinessResult) -> str:
     return result.place.dedupe_key()
 
 
-def lead_record(result: BusinessResult, run_id: str, status: str) -> dict[str, Any]:
-    """One row for the leads table, reusing the CSV column shapes."""
-    row = business_row(result)
-    best = result.best_email
+def lead_records(result: BusinessResult, run_id: str, status: str) -> list[dict[str, Any]]:
+    """Rows for the leads table: one per contact, keyed `<business>|<contact_type>`.
+
+    Before any contact exists the business has a single `|general` row, which
+    the general contact later takes over; the owner row appears when an owner
+    address does. Re-runs update in place.
+    """
+    parent = lead_id(result)
 
     def blank_to_none(value: Any) -> Any:
         return None if value == "" else value
 
-    return {
-        "id": lead_id(result),
-        "run_id": run_id,
-        "status": status,
-        "name": row["name"],
-        "query": row["query"],
-        "category": blank_to_none(row["category"]),
-        "best_email": blank_to_none(row["best_email"]),
-        "best_email_source": blank_to_none(row["best_email_source"]),
-        "best_email_status": blank_to_none(row["best_email_status"]),
-        "best_email_confidence": best.confidence if best else None,
-        "emails_found": row["emails_found"],
-        "emails_guessed": row["emails_guessed"],
-        "all_emails": blank_to_none(row["all_emails"]),
-        "phone": blank_to_none(row["phone"]),
-        "website": blank_to_none(row["website"]),
-        "domain": blank_to_none(row["domain"]),
-        "address": blank_to_none(row["address"]),
-        "city": blank_to_none(row["city"]),
-        "state": blank_to_none(row["state"]),
-        "postal_code": blank_to_none(row["postal_code"]),
-        "rating": blank_to_none(row["rating"]),
-        "reviews": blank_to_none(row["reviews"]),
-        "is_chain": result.is_chain,
-        "chain_reasons": blank_to_none(row["chain_reasons"]),
-        "website_status": blank_to_none(row["website_status"]),
-        "domain_has_mx": result.domain_has_mx,
-        "domain_is_catch_all": result.domain_is_catch_all,
-        "permutations_skipped_reason": blank_to_none(row["permutations_skipped_reason"]),
-        "pages_crawled": row["pages_crawled"],
-        "place_id": blank_to_none(row["place_id"]),
-        "latitude": blank_to_none(row["latitude"]),
-        "longitude": blank_to_none(row["longitude"]),
-        "google_url": blank_to_none(row["google_url"]),
-        "notes": blank_to_none(row["notes"]),
-    }
+    records: list[dict[str, Any]] = []
+    for row in lead_rows(result):
+        contact_type = row["contact_type"] or "general"
+        records.append({
+            "id": f"{parent}|{contact_type}",
+            "business_id": parent,
+            "run_id": run_id,
+            "status": status,
+            "contact_type": contact_type,
+            "contact_name": blank_to_none(row["contact_name"]),
+            "contact_title": blank_to_none(row["contact_title"]),
+            "email": blank_to_none(row["email"]),
+            "email_source": blank_to_none(row["email_source"]),
+            "email_status": blank_to_none(row["email_status"]),
+            "email_confidence": blank_to_none(row["email_confidence"]),
+            "name": row["name"],
+            "query": row["query"],
+            "category": blank_to_none(row["category"]),
+            "phone": blank_to_none(row["phone"]),
+            "website": blank_to_none(row["website"]),
+            "website_source": blank_to_none(row["website_source"]),
+            "domain": blank_to_none(row["domain"]),
+            "address": blank_to_none(row["address"]),
+            "city": blank_to_none(row["city"]),
+            "state": blank_to_none(row["state"]),
+            "postal_code": blank_to_none(row["postal_code"]),
+            "rating": blank_to_none(row["rating"]),
+            "reviews": blank_to_none(row["reviews"]),
+            "is_chain": result.is_chain,
+            "chain_reasons": blank_to_none(row["chain_reasons"]),
+            "owner_name": blank_to_none(row["owner_name"]),
+            "owner_title": blank_to_none(row["owner_title"]),
+            "owner_source": blank_to_none(row["owner_source"]),
+            "owner_confidence": blank_to_none(row["owner_confidence"]),
+            "emails_found": row["emails_found"],
+            "emails_guessed": row["emails_guessed"],
+            "all_emails": blank_to_none(row["all_emails"]),
+            "website_status": blank_to_none(row["website_status"]),
+            "domain_has_mx": result.domain_has_mx,
+            "domain_is_catch_all": result.domain_is_catch_all,
+            "permutations_skipped_reason": blank_to_none(row["permutations_skipped_reason"]),
+            "pages_crawled": row["pages_crawled"],
+            "place_id": blank_to_none(row["place_id"]),
+            "latitude": blank_to_none(row["latitude"]),
+            "longitude": blank_to_none(row["longitude"]),
+            "google_url": blank_to_none(row["google_url"]),
+            "notes": blank_to_none(row["notes"]),
+        })
+    return records
 
 
 def email_records(result: BusinessResult, run_id: str) -> list[dict[str, Any]]:
@@ -104,6 +121,9 @@ def email_records(result: BusinessResult, run_id: str) -> list[dict[str, Any]]:
             "run_id": run_id,
             "email": row["email"],
             "business_name": row["business_name"],
+            "contact_type": row["contact_type"],
+            "contact_name": row["contact_name"] or None,
+            "lead_eligible": row["lead_eligible"] == "yes",
             "confidence": row["confidence"],
             "status": row["status"],
             "sub_status": row["sub_status"] or None,

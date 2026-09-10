@@ -15,6 +15,8 @@ from .maps.scraperapi import ScraperApiMaps
 from .maps.scrapingdog import ScrapingDogMaps
 from .maps.serpapi import SerpApiMaps
 from .maps.serper import SerperMaps
+from .search.base import WebSearchProvider
+from .search.openwebninja import OpenWebNinjaSearch
 from .verify.generic import GenericVerifier
 from .verify.local import LocalVerifier
 from .verify.mailtester import MailTesterNinja
@@ -50,6 +52,28 @@ VERIFY_AUTO_ORDER = (
     "generic", "mailtester", "millionverifier", "zerobounce", "neverbounce",
     "reoon", "emaillistverify", "bouncer",
 )
+
+
+SEARCH_PROVIDERS: dict[str, Type[WebSearchProvider]] = {
+    OpenWebNinjaSearch.name: OpenWebNinjaSearch,
+}
+
+
+def get_web_search(settings: Settings, name: str | None = None) -> WebSearchProvider | None:
+    """The web search provider, or None when none is configured (feature off)."""
+    chosen = (name or settings.web_search_provider or "auto").lower()
+    if chosen == "none":
+        return None
+    if chosen == "auto":
+        chosen = "openwebninja" if settings.openwebninja_key else "none"
+        if chosen == "none":
+            return None
+    if chosen not in SEARCH_PROVIDERS:
+        raise ProviderError(
+            f"unknown web search provider {chosen!r}; available: "
+            f"{', '.join(sorted(SEARCH_PROVIDERS))}"
+        )
+    return SEARCH_PROVIDERS[chosen](settings)
 
 
 def list_maps_providers() -> list[str]:

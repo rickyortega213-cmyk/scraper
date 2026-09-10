@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ..data.domains import FREE_MAIL_DOMAINS, JUNK_EMAIL_DOMAINS, PLATFORM_DOMAINS
-from ..models import EmailCandidate, SOURCE_PERMUTATION
+from ..models import CONTACT_OWNER, EmailCandidate, Person, SOURCE_PERMUTATION
 from ..util import (
     domain_has_mx,
     name_tokens,
@@ -226,3 +226,69 @@ def build_permutations(
         if len(candidates) >= max_candidates:
             break
     return PermutationPlan(domain=registered, candidates=candidates)
+
+
+def build_owner_permutations(
+    domain: str,
+    person: Person,
+    *,
+    max_candidates: int = 8,
+    require_mx: bool = True,
+    is_chain: bool = False,
+    allow_chains: bool = False,
+    exclude: Sequence[str] = (),
+) -> PermutationPlan:
+    """Likely mailboxes for a named person at the business domain.
+
+    Ordered by how common each pattern is at small businesses:
+    first@, first.last@, flast@, firstl@, first_last@, firstlast@, last@, f.last@
+    """
+    from .people import owner_local_parts
+
+    registered = registered_domain(domain) or (domain or "").strip().lower()
+    if is_chain and not allow_chains:
+        return PermutationPlan(domain=registered, candidates=[], skipped_reason="national_chain")
+    guessable, reason = domain_is_guessable(registered)
+    if not guessable:
+        return PermutationPlan(domain=registered, candidates=[], skipped_reason=reason)
+    if require_mx and not domain_has_mx(registered):
+        return PermutationPlan(domain=registered, candidates=[], skipped_reason="domain_has_no_mx")
+    locals_ = owner_local_parts(person)
+    if not locals_:
+        return PermutationPlan(domain=registered, candidates=[], skipped_reason="no_usable_name")
+
+    excluded = {e.strip().lower() for e in exclude}
+    candidates: list[EmailCandidate] = []
+    for local in locals_:
+        email = f"{local}@{registered}"
+        if email in excluded:
+            continue
+        candidates.append(
+            EmailCandidate(
+                email=email,
+                source=SOURCE_PERMUTATION,
+                pattern=f"{_pattern_label(local, person)}@{{domain}}",
+                is_role=False,
+                on_business_domain=True,
+                contact_type=CONTACT_OWNER,
+                contact_name=person.name,
+                contact_title=person.title,
+                notes=["guessed_owner_pattern"],
+            )
+        )
+        if len(candidates) >= max_candidates:
+            break
+    return PermutationPlan(domain=registered, candidates=candidates)
+
+
+def _pattern_label(local: str, person: Person) -> str:
+    first, last = person.first, person.last
+    label = local
+    if last:
+        label = label.replace(last, "{last}") if last in local else label
+        label = label.replace(last[0], "{l}", 1) if "{last}" not in label and last[0] in local else label
+    if first:
+        label = label.replace(first, "{first}") if first in label else label
+        if "{first}" not in label and label.startswith(first[0]):
+            label = "{f}" + label[1:]
+    return label

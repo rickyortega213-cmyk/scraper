@@ -27,6 +27,10 @@ SOURCE_WEIGHT = {
     SOURCE_PERMUTATION: 40,
 }
 
+# --- who an address reaches ---------------------------------------------------
+CONTACT_GENERAL = "general"   # info@, office@, a shared inbox
+CONTACT_OWNER = "owner"       # the owner / founder / top decision-maker
+
 # --- verification statuses (normalized across vendors) ---------------------
 V_VALID = "valid"
 V_INVALID = "invalid"
@@ -132,6 +136,10 @@ class EmailCandidate:
     on_business_domain: bool = False   # local part hosted on the business domain
     verification: Optional[VerificationResult] = None
     confidence: int = 0
+    contact_type: str = CONTACT_GENERAL
+    contact_name: str = ""     # set when the address reaches a named person
+    contact_title: str = ""    # "Owner", "Founder", "DDS", ...
+    lead_eligible: bool = True # False = keep in the emails export, never as a lead row
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -150,6 +158,35 @@ class EmailCandidate:
     def status(self) -> str:
         return self.verification.status if self.verification else V_SKIPPED
 
+    @property
+    def is_owner(self) -> bool:
+        return self.contact_type == CONTACT_OWNER
+
+
+@dataclass
+class Person:
+    """A named decision-maker at a business, with how sure we are and why."""
+
+    name: str
+    title: str = ""            # normalized: owner, founder, ceo, president, ...
+    rank: int = 0              # higher = more senior (see emails.people.TITLE_RANK)
+    source: str = ""           # site_jsonld | site_text | search_ai_overview | search_snippet
+    source_url: str = ""
+    confidence: int = 0        # 0-100
+    evidence: str = ""         # the sentence the name was taken from
+
+    @property
+    def tokens(self) -> list[str]:
+        return [t for t in self.name.lower().replace("-", " ").split() if t]
+
+    @property
+    def first(self) -> str:
+        return self.tokens[0] if self.tokens else ""
+
+    @property
+    def last(self) -> str:
+        return self.tokens[-1] if len(self.tokens) > 1 else ""
+
 
 @dataclass
 class BusinessResult:
@@ -161,6 +198,10 @@ class BusinessResult:
     chain_score: int = 0
     chain_reasons: list[str] = field(default_factory=list)
     website_status: str = ""        # "", "ok", "no_website", "unreachable:<detail>"
+    website_source: str = ""        # "maps" | "search" | ""
+    website_confidence: int = 0     # for discovered sites: how sure we are it's theirs
+    owner: Optional[Person] = None
+    owner_search_done: bool = False
     pages_crawled: list[str] = field(default_factory=list)
     domain_has_mx: Optional[bool] = None
     domain_is_catch_all: Optional[bool] = None
@@ -169,9 +210,11 @@ class BusinessResult:
 
     @property
     def best_email(self) -> Optional[EmailCandidate]:
-        if not self.emails:
-            return None
-        return max(self.emails, key=lambda e: (e.confidence, SOURCE_WEIGHT.get(e.source, 0)))
+        """The single strongest lead address (owner wins ties on confidence)."""
+        owner, general = self.best_owner_email, self.best_general_email
+        if owner and general:
+            return owner if owner.confidence >= general.confidence - 5 else general
+        return owner or general
 
     @property
     def found_emails(self) -> list[EmailCandidate]:
@@ -180,3 +223,40 @@ class BusinessResult:
     @property
     def guessed_emails(self) -> list[EmailCandidate]:
         return [e for e in self.emails if e.from_permutation]
+
+    @property
+    def general_emails(self) -> list[EmailCandidate]:
+        return [e for e in self.emails if not e.is_owner]
+
+    @property
+    def owner_emails(self) -> list[EmailCandidate]:
+        return [e for e in self.emails if e.is_owner]
+
+    def _best_of(self, pool: list[EmailCandidate]) -> Optional[EmailCandidate]:
+        pool = [e for e in pool if e.lead_eligible]
+        if not pool:
+            return None
+        return max(pool, key=lambda e: (e.confidence, SOURCE_WEIGHT.get(e.source, 0)))
+
+    @property
+    def best_general_email(self) -> Optional[EmailCandidate]:
+        return self._best_of(self.general_emails)
+
+    @property
+    def best_owner_email(self) -> Optional[EmailCandidate]:
+        return self._best_of(self.owner_emails)
+
+    def lead_contacts(self) -> list[EmailCandidate]:
+        """The addresses that become output rows: best general + best owner.
+
+        Distinct addresses only - if the owner's mailbox is also the general
+        one, it is reported once, as the owner.
+        """
+        owner = self.best_owner_email
+        general = self.best_general_email
+        rows: list[EmailCandidate] = []
+        if owner is not None:
+            rows.append(owner)
+        if general is not None and (owner is None or general.email != owner.email):
+            rows.append(general)
+        return rows

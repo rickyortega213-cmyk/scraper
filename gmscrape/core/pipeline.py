@@ -18,11 +18,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
 from ..config import Settings
-from ..emails.patterns import build_permutations
+from ..emails.patterns import build_owner_permutations, build_permutations
+from ..emails.people import (
+    choose_owner,
+    email_matches_person,
+    is_medical,
+    owner_candidates_from_search,
+)
 from ..emails.score import keep_candidate, score_business
 from ..filters.chains import classify, should_keep
 from ..models import (
     BusinessResult,
+    CONTACT_OWNER,
     EmailCandidate,
     Place,
     QuerySpec,
@@ -31,8 +38,10 @@ from ..models import (
     V_CATCH_ALL,
     V_VALID,
 )
-from ..providers import get_maps_provider, get_verifier
+from ..providers import get_maps_provider, get_verifier, get_web_search
 from ..providers.base import EmailVerifier, MapsProvider, ProviderError
+from ..providers.search.base import SearchResponse, WebSearchProvider
+from ..providers.search.openwebninja import parse_response
 from ..providers.verify.local import prefilter
 from ..query import parse_queries
 from ..store.db import Store
@@ -45,8 +54,9 @@ from ..store.sinks import (
     LeadSink,
     NullSink,
 )
-from ..util import domain_has_mx, registered_domain
+from ..util import domain_has_mx, hostname, registered_domain
 from ..web.crawl import scrape_site
+from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
 
 log = logging.getLogger(__name__)
@@ -65,6 +75,9 @@ class RunReport:
     finished_at: float = 0.0
     maps_provider: str = ""
     verify_provider: str = ""
+    search_provider: str = ""
+    search_calls: int = 0
+    search_cache_hits: int = 0
     verification_calls: int = 0
     verification_cache_hits: int = 0
     errors: list[str] = field(default_factory=list)
@@ -79,10 +92,19 @@ class RunReport:
         scraped = [r for r in self.results if r.found_emails]
         guessed_only = [r for r in with_email if not r.found_emails]
         valid = [r for r in with_email if r.best_email and r.best_email.status == V_VALID]
+        owners = [r for r in self.results if r.owner]
         return {
             "queries": len(self.queries),
             "businesses": len(self.results),
             "with_website": sum(1 for r in self.results if r.place.website),
+            "websites_discovered": sum(
+                1 for r in self.results if r.website_source == "search" and r.place.website
+            ),
+            "owners_found": len(owners),
+            "owners_from_site": sum(1 for r in owners if r.owner.source.startswith("site")),
+            "owners_from_search": sum(1 for r in owners if r.owner.source.startswith("search")),
+            "owner_emails": sum(1 for r in self.results if r.best_owner_email),
+            "lead_rows": sum(max(1, len(r.lead_contacts())) for r in self.results),
             "with_any_email": len(with_email),
             "emails_scraped_from_site": len(scraped),
             "emails_guessed_only": len(guessed_only),
@@ -94,6 +116,8 @@ class RunReport:
             "total_emails": sum(len(r.emails) for r in self.results),
             "verification_api_calls": self.verification_calls,
             "verification_cache_hits": self.verification_cache_hits,
+            "web_search_calls": self.search_calls,
+            "web_search_cache_hits": self.search_cache_hits,
             "duration_seconds": round(self.duration, 1),
         }
 
@@ -108,6 +132,7 @@ class Pipeline:
         verifier: Optional[EmailVerifier] = None,
         progress: Optional[ProgressHook] = None,
         sinks: Optional[Sequence[LeadSink]] = None,
+        web_search: Optional[WebSearchProvider] = None,
     ) -> None:
         self.settings = settings
         settings.ensure_dirs()
@@ -115,7 +140,10 @@ class Pipeline:
         self._owns_store = store is None
         self.maps = maps or get_maps_provider(settings)
         self.verifier = verifier or get_verifier(settings)
+        self.web_search = web_search if web_search is not None else get_web_search(settings)
         self.progress = progress or (lambda event, data: None)
+        self._search_calls = 0
+        self._search_cache_hits = 0
         self.sinks: list[LeadSink] = list(sinks) if sinks else [NullSink()]
         self._verify_calls = 0
         self._cache_hits = 0
@@ -130,6 +158,7 @@ class Pipeline:
             queries=[s.search_string for s in specs],
             maps_provider=self.maps.name,
             verify_provider=self.verifier.name,
+            search_provider=self.web_search.name if self.web_search else "none",
         )
         self.store.start_run(report.run_id, report.queries, asdict(self.settings))
         self._sink_call("start_run", report.run_id, {
@@ -152,6 +181,7 @@ class Pipeline:
             self._verify_all(results)
             self._publish(results, STATUS_VERIFIED)
 
+        strict_guesses = self.settings.require_verified_guesses and self.verifier.requires_key
         for result in results:
             score_business(result)
             result.emails = [
@@ -163,11 +193,23 @@ class Pipeline:
                 )
                 and candidate.confidence >= self.settings.min_confidence
             ]
+            if strict_guesses:
+                # A guessed address becomes a lead only once a verifier said
+                # the mailbox exists. Everything else stays in the emails
+                # export, flagged, but never in the leads.
+                for candidate in result.guessed_emails:
+                    if candidate.status != V_VALID or (
+                        candidate.verification and candidate.verification.is_catch_all
+                    ):
+                        candidate.lead_eligible = False
+                        candidate.notes.append("not_lead_eligible:unverified_guess")
             self.store.save_business(result, report.run_id)
 
         report.results = results
         report.verification_calls = self._verify_calls
         report.verification_cache_hits = self._cache_hits
+        report.search_calls = self._search_calls
+        report.search_cache_hits = self._search_cache_hits
         report.sinks = [s for s in self.sinks if not isinstance(s, NullSink)]
         self._publish(results, STATUS_DONE)
         report.finished_at = time.time()
@@ -195,6 +237,8 @@ class Pipeline:
     def close(self) -> None:
         self.maps.close()
         self.verifier.close()
+        if self.web_search is not None:
+            self.web_search.close()
         self._sink_call("close")
         if self._owns_store:
             self.store.close()
@@ -260,17 +304,21 @@ class Pipeline:
         self.progress("classified", {"businesses": len(results)})
         return results
 
-    # --- stage 3: websites -------------------------------------------------
+    # --- stage 3: websites, owners ---------------------------------------
     async def _scrape_websites(self, results: Sequence[BusinessResult]) -> None:
         if not self.settings.crawl_websites:
             for result in results:
                 if result.place.website:
                     result.website_status = "skipped:crawl_disabled"
             return
-        targets = [r for r in results if r.place.website]
+        searching = self.web_search is not None
+        discover = searching and self.settings.discover_websites
+        owner_search = searching and self.settings.find_owners and self.settings.owner_search
+        targets = [r for r in results if r.place.website or discover]
         if not targets:
             return
 
+        search_sem = asyncio.Semaphore(max(1, self.settings.web_search_concurrency))
         async with Fetcher(self.settings, cache=self.store) as fetcher:
             semaphore = asyncio.Semaphore(max(1, self.settings.http_concurrency))
             done = 0
@@ -279,27 +327,21 @@ class Pipeline:
                 nonlocal done
                 async with semaphore:
                     try:
-                        scrape = await scrape_site(
-                            fetcher, result.place.website, self.settings, result.place.domain
+                        await self._process_site(
+                            result, fetcher, search_sem, discover=discover,
+                            owner_search=owner_search,
                         )
                     except Exception as exc:  # a single bad site must not kill the run
-                        log.warning("crawl failed for %s: %s", result.place.website, exc)
-                        result.website_status = f"unreachable:{type(exc).__name__}"
-                        return
-                    result.website_status = scrape.status
-                    result.pages_crawled = scrape.pages
-                    known = {c.email for c in result.emails}
-                    result.emails.extend(c for c in scrape.candidates if c.email not in known)
-                    if scrape.errors:
-                        result.notes.append(f"crawl_errors={len(scrape.errors)}")
+                        log.warning("processing failed for %s: %s", result.place.name, exc)
+                        result.website_status = result.website_status or f"error:{type(exc).__name__}"
                     done += 1
-                    # Stream this one straight out; the sink batches for us.
                     self._publish([result], STATUS_CRAWLED)
                     self.progress(
                         "site_done",
                         {
                             "website": result.place.website,
-                            "emails": len(scrape.candidates),
+                            "emails": len(result.found_emails),
+                            "owner": result.owner.name if result.owner else "",
                             "done": done,
                             "total": len(targets),
                         },
@@ -307,7 +349,159 @@ class Pipeline:
 
             await asyncio.gather(*(worker(r) for r in targets))
 
+    async def _process_site(
+        self,
+        result: BusinessResult,
+        fetcher: Fetcher,
+        search_sem: asyncio.Semaphore,
+        *,
+        discover: bool,
+        owner_search: bool,
+    ) -> None:
+        """Discover (if needed), crawl, confirm, and find the owner for one business."""
+        place = result.place
+
+        if not place.website:
+            if not discover:
+                result.website_status = "no_website"
+                return
+            response = await self._search(discovery_query(place), search_sem)
+            guess = (
+                pick_website(place, response.hits, min_score=self.settings.website_min_confidence)
+                if response.ok else None
+            )
+            if guess is None:
+                result.website_status = "no_website"
+                result.notes.append(
+                    f"website_search:{response.error}" if response.error else "website_search:no_clear_match"
+                )
+                return
+            place.website = guess.url
+            place.domain = guess.domain
+            result.website_source = "search"
+            result.website_confidence = guess.score
+            result.notes.append(f"website_discovered:{','.join(guess.reasons)}")
+        else:
+            result.website_source = result.website_source or "maps"
+
+        find_owner = self.settings.find_owners
+        scrape = await scrape_site(
+            fetcher, place.website, self.settings, place.domain,
+            business_name=place.name,
+            medical=is_medical(place.category, place.query),
+            find_owner=find_owner,
+            owner_min_confidence=self.settings.owner_min_confidence,
+        )
+
+        if result.website_source == "search":
+            # A discovered site earns its keep only by mentioning the business.
+            confirmed, reasons = (
+                confirm_website(place, scrape.homepage_text) if scrape.status == "ok"
+                else (False, [scrape.status])
+            )
+            if not confirmed:
+                result.website_status = f"discovered_unconfirmed:{','.join(reasons)}"
+                result.notes.append(f"rejected_site={hostname(place.website)}")
+                place.website = ""
+                place.domain = ""
+                result.website_source = ""
+                result.website_confidence = 0
+                return
+            result.notes.append(f"site_confirmed:{','.join(reasons)}")
+
+        result.website_status = scrape.status
+        result.pages_crawled = scrape.pages
+        known = {c.email for c in result.emails}
+        result.emails.extend(c for c in scrape.candidates if c.email not in known)
+        if scrape.errors:
+            result.notes.append(f"crawl_errors={len(scrape.errors)}")
+
+        if find_owner:
+            if scrape.owner is not None:
+                result.owner = scrape.owner
+            elif owner_search and place.domain:
+                await self._find_owner_by_search(result, search_sem)
+            if result.owner is not None:
+                self._tag_owner_emails(result)
+
+    async def _find_owner_by_search(
+        self, result: BusinessResult, search_sem: asyncio.Semaphore
+    ) -> None:
+        place = result.place
+        where = place.city or place.state or ""
+        query = f"who is the owner of {place.name}" + (f" in {where}" if where else "")
+        response = await self._search(query, search_sem)
+        result.owner_search_done = True
+        if not response.ok:
+            result.notes.append(f"owner_search:{response.error}")
+            return
+        candidates = owner_candidates_from_search(
+            response.all_text_blocks(), place.name, place.city
+        )
+        result.owner = choose_owner(candidates, min_confidence=self.settings.owner_min_confidence)
+        if result.owner is None:
+            result.notes.append(
+                "owner_search:no_confident_match" if candidates else "owner_search:no_mention"
+            )
+
+    @staticmethod
+    def _tag_owner_emails(result: BusinessResult) -> None:
+        """An address found on the site that spells the owner's name is theirs."""
+        owner = result.owner
+        assert owner is not None
+        for candidate in result.emails:
+            if candidate.from_permutation or not candidate.on_business_domain:
+                continue
+            if email_matches_person(candidate.local_part, owner):
+                candidate.contact_type = CONTACT_OWNER
+                candidate.contact_name = owner.name
+                candidate.contact_title = owner.title
+                candidate.notes.append("matches_owner_name")
+
+    # --- web search (cached, budgeted, never fatal) -----------------------
+    async def _search(self, query: str, search_sem: asyncio.Semaphore) -> SearchResponse:
+        assert self.web_search is not None
+        cached = self.store.get_search(self.web_search.name, query, self.settings.search_cache_ttl_hours)
+        if cached is not None:
+            self._search_cache_hits += 1
+            response = parse_response(query, cached)
+            response.from_cache = True
+            return response
+        async with search_sem:
+            return await asyncio.to_thread(self._search_sync, query)
+
+    def _search_sync(self, query: str) -> SearchResponse:
+        assert self.web_search is not None
+        disabled = getattr(self, "_search_disabled", "")
+        if disabled:
+            return SearchResponse(query=query, error=disabled)
+        try:
+            response = self.web_search.search(query, limit=10)
+        except ProviderError as exc:
+            # A rejected key fails every call the same way - stop asking.
+            self._search_disabled = str(exc)
+            log.error("web search disabled for this run: %s", exc)
+            return SearchResponse(query=query, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - search is best effort
+            log.warning("web search failed for %r: %s", query, exc)
+            return SearchResponse(query=query, error=f"{type(exc).__name__}: {exc}")
+        self._search_calls += 1
+        if response.ok and response.raw:
+            self.store.put_search(self.web_search.name, query, response.raw)
+        return response
+
     # --- stage 4: permutations --------------------------------------------
+    def _domain_has_mx(self, result: BusinessResult, domain: str) -> bool:
+        cached = self.store.get_domain_facts(domain)
+        has_mx = cached[0] if cached else None
+        if has_mx is None:
+            has_mx = domain_has_mx(domain)
+            self.store.put_domain_facts(domain, has_mx=has_mx)
+        result.domain_has_mx = has_mx
+        if cached and cached[1] is not None:
+            result.domain_is_catch_all = cached[1]
+        return has_mx
+
     def _plan_permutations(self, results: Sequence[BusinessResult]) -> None:
         if not self.settings.permutations:
             for result in results:
@@ -316,44 +510,62 @@ class Pipeline:
             return
 
         for result in results:
+            domain = result.place.domain or registered_domain(result.place.website)
+            known = [c.email for c in result.emails]
+
+            # General inbox: only when nothing usable was found on the site.
             usable = [
                 c for c in result.found_emails
                 if not c.is_low_value and (c.on_business_domain or c.is_personal_domain)
             ]
-            if usable:
+            if not usable:
+                if not domain:
+                    result.permutations_skipped_reason = "no_domain"
+                else:
+                    self._domain_has_mx(result, domain)
+                    plan = build_permutations(
+                        domain,
+                        business_name=result.place.name,
+                        category=result.place.category,
+                        business_type=result.place.query,
+                        tier=self.settings.permutation_tier,
+                        max_candidates=self.settings.permutation_max,
+                        require_mx=self.settings.permutation_require_mx,
+                        is_chain=result.is_chain,
+                        allow_chains=self.settings.permutations_for_chains,
+                        exclude=known,
+                    )
+                    if plan.allowed:
+                        result.emails.extend(plan.candidates)
+                        known.extend(c.email for c in plan.candidates)
+                        result.notes.append(f"guessed={len(plan.candidates)}")
+                    else:
+                        result.permutations_skipped_reason = plan.skipped_reason
+
+            # Owner mailbox: whenever we know who they are and haven't found it.
+            owner = result.owner
+            if not (self.settings.find_owners and owner and domain):
                 continue
-
-            domain = result.place.domain or registered_domain(result.place.website)
-            if not domain:
-                result.permutations_skipped_reason = "no_domain"
+            if owner.confidence < self.settings.owner_min_confidence:
+                result.notes.append("owner_guess_skipped:low_confidence")
                 continue
-
-            cached = self.store.get_domain_facts(domain)
-            has_mx = cached[0] if cached else None
-            if has_mx is None:
-                has_mx = domain_has_mx(domain)
-                self.store.put_domain_facts(domain, has_mx=has_mx)
-            result.domain_has_mx = has_mx
-            if cached and cached[1] is not None:
-                result.domain_is_catch_all = cached[1]
-
-            plan = build_permutations(
+            if any(c.is_owner and not c.from_permutation for c in result.emails):
+                continue
+            self._domain_has_mx(result, domain)
+            plan = build_owner_permutations(
                 domain,
-                business_name=result.place.name,
-                category=result.place.category,
-                business_type=result.place.query,
-                tier=self.settings.permutation_tier,
-                max_candidates=self.settings.permutation_max,
+                owner,
+                max_candidates=self.settings.owner_permutation_max,
                 require_mx=self.settings.permutation_require_mx,
                 is_chain=result.is_chain,
                 allow_chains=self.settings.permutations_for_chains,
-                exclude=[c.email for c in result.emails],
+                exclude=known,
             )
-            if not plan.allowed:
-                result.permutations_skipped_reason = plan.skipped_reason
-                continue
-            result.emails.extend(plan.candidates)
-            result.notes.append(f"guessed={len(plan.candidates)}")
+            if plan.allowed:
+                result.emails.extend(plan.candidates)
+                result.notes.append(f"owner_guessed={len(plan.candidates)}")
+            else:
+                result.notes.append(f"owner_guess_skipped:{plan.skipped_reason}")
 
     # --- stage 5: verification --------------------------------------------
     def _verify_all(self, results: Sequence[BusinessResult]) -> None:
@@ -391,9 +603,24 @@ class Pipeline:
             list(pool.map(self._verify_guesses_for, pending))
 
     def _verify_guesses_for(self, result: BusinessResult) -> None:
+        """Walk each contact type's guesses in order; stop at the first hit."""
         guesses = result.guessed_emails
+        chains = [
+            [c for c in guesses if not c.is_owner],
+            [c for c in guesses if c.is_owner],
+        ]
+        for chain in chains:
+            if not chain:
+                continue
+            if result.domain_is_catch_all:
+                # Already known to accept anything - no guess can be proven.
+                self._drop_untested(result, chain, 0)
+                continue
+            self._verify_chain(result, chain)
+
+    def _verify_chain(self, result: BusinessResult, chain: list[EmailCandidate]) -> None:
         stopped_at: Optional[int] = None
-        for index, candidate in enumerate(guesses):
+        for index, candidate in enumerate(chain):
             if self._budget_exhausted():
                 candidate.notes.append("verification_budget_exhausted")
                 stopped_at = index
@@ -413,12 +640,14 @@ class Pipeline:
                 if self.settings.stop_on_first_valid:
                     stopped_at = index + 1
                     break
+        if stopped_at is not None:
+            self._drop_untested(result, chain, stopped_at)
 
-        if stopped_at is None:
-            return
-        # Guesses we never checked are not results - drop them rather than
-        # shipping a dozen unverified addresses per business.
-        untested = {c.email for c in guesses[stopped_at:]}
+    @staticmethod
+    def _drop_untested(result: BusinessResult, chain: list[EmailCandidate], keep: int) -> None:
+        """Guesses we never checked are not results - drop them rather than
+        shipping a dozen unverified addresses per business."""
+        untested = {c.email for c in chain[keep:]}
         if untested:
             result.emails = [c for c in result.emails if c.email not in untested]
             result.notes.append(f"guesses_not_checked={len(untested)}")

@@ -15,20 +15,35 @@ from typing import Any, Iterable, Sequence
 
 from ..models import BusinessResult
 
+# One row per contact (general inbox and/or owner). Everything about the
+# business repeats on each of its rows; only the contact columns differ.
+LEAD_COLUMNS = (
+    "name", "query", "category", "contact_type", "contact_name", "contact_title",
+    "email", "email_source", "email_status", "email_confidence",
+    "phone", "website", "website_source", "domain", "address", "city", "state",
+    "postal_code", "rating", "reviews", "is_chain", "chain_reasons",
+    "owner_name", "owner_title", "owner_source", "owner_confidence",
+    "emails_found", "emails_guessed", "all_emails", "website_status",
+    "domain_has_mx", "permutations_skipped_reason", "pages_crawled",
+    "place_id", "latitude", "longitude", "google_url", "notes",
+)
+
+# Business-level summary (used by the JSON export and the Supabase sink).
 BUSINESS_COLUMNS = (
     "name", "query", "category", "best_email", "best_email_source",
     "best_email_status", "best_email_confidence", "emails_found", "emails_guessed",
-    "all_emails", "phone", "website", "domain", "address", "city", "state",
-    "postal_code", "rating", "reviews", "is_chain", "chain_reasons",
+    "all_emails", "phone", "website", "website_source", "domain", "address", "city",
+    "state", "postal_code", "rating", "reviews", "is_chain", "chain_reasons",
+    "owner_name", "owner_title", "owner_source", "owner_confidence",
     "website_status", "domain_has_mx", "permutations_skipped_reason",
     "pages_crawled", "place_id", "latitude", "longitude", "google_url", "notes",
 )
 
 EMAIL_COLUMNS = (
-    "email", "business_name", "confidence", "status", "sub_status", "provider",
-    "source", "source_url", "pattern", "is_role", "is_personal_domain",
-    "on_business_domain", "domain", "phone", "website", "city", "state",
-    "is_chain", "query", "context", "notes",
+    "email", "business_name", "contact_type", "contact_name", "lead_eligible",
+    "confidence", "status", "sub_status", "provider", "source", "source_url",
+    "pattern", "is_role", "is_personal_domain", "on_business_domain", "domain",
+    "phone", "website", "city", "state", "is_chain", "query", "context", "notes",
 )
 
 
@@ -48,6 +63,7 @@ def business_row(result: BusinessResult) -> dict[str, Any]:
         "all_emails": "; ".join(c.email for c in result.emails),
         "phone": place.phone,
         "website": place.website,
+        "website_source": result.website_source,
         "domain": place.domain,
         "address": place.address,
         "city": place.city,
@@ -57,6 +73,10 @@ def business_row(result: BusinessResult) -> dict[str, Any]:
         "reviews": place.reviews if place.reviews is not None else "",
         "is_chain": "yes" if result.is_chain else "no",
         "chain_reasons": "; ".join(result.chain_reasons),
+        "owner_name": result.owner.name if result.owner else "",
+        "owner_title": result.owner.title if result.owner else "",
+        "owner_source": result.owner.source if result.owner else "",
+        "owner_confidence": result.owner.confidence if result.owner else "",
         "website_status": result.website_status,
         "domain_has_mx": "" if result.domain_has_mx is None else ("yes" if result.domain_has_mx else "no"),
         "permutations_skipped_reason": result.permutations_skipped_reason,
@@ -69,6 +89,30 @@ def business_row(result: BusinessResult) -> dict[str, Any]:
     }
 
 
+def lead_rows(result: BusinessResult) -> list[dict[str, Any]]:
+    """One row per selected contact; a business with no email still gets a row."""
+    base = business_row(result)
+    for key in ("best_email", "best_email_source", "best_email_status", "best_email_confidence"):
+        base.pop(key, None)
+    contacts = result.lead_contacts()
+    if not contacts:
+        return [{**base, "contact_type": "", "contact_name": "", "contact_title": "",
+                 "email": "", "email_source": "", "email_status": "", "email_confidence": ""}]
+    rows: list[dict[str, Any]] = []
+    for candidate in contacts:
+        rows.append({
+            **base,
+            "contact_type": candidate.contact_type,
+            "contact_name": candidate.contact_name,
+            "contact_title": candidate.contact_title,
+            "email": candidate.email,
+            "email_source": candidate.source,
+            "email_status": candidate.status,
+            "email_confidence": candidate.confidence,
+        })
+    return rows
+
+
 def email_rows(result: BusinessResult) -> list[dict[str, Any]]:
     place = result.place
     rows: list[dict[str, Any]] = []
@@ -77,6 +121,9 @@ def email_rows(result: BusinessResult) -> list[dict[str, Any]]:
         rows.append({
             "email": candidate.email,
             "business_name": place.name,
+            "contact_type": candidate.contact_type,
+            "contact_name": candidate.contact_name,
+            "lead_eligible": "yes" if candidate.lead_eligible else "no",
             "confidence": candidate.confidence,
             "status": candidate.status,
             "sub_status": verification.sub_status if verification else "",
@@ -123,7 +170,17 @@ def _result_to_dict(result: BusinessResult) -> dict[str, Any]:
         "domain_is_catch_all": result.domain_is_catch_all,
         "permutations_skipped_reason": result.permutations_skipped_reason,
         "notes": result.notes,
+        "website_source": result.website_source,
+        "owner": (
+            {k: v for k, v in asdict(result.owner).items()} if result.owner else None
+        ),
         "best_email": result.best_email.email if result.best_email else None,
+        "contacts": [
+            {"contact_type": c.contact_type, "contact_name": c.contact_name,
+             "contact_title": c.contact_title, "email": c.email,
+             "source": c.source, "status": c.status, "confidence": c.confidence}
+            for c in result.lead_contacts()
+        ],
         "emails": [
             {
                 **{k: v for k, v in asdict(candidate).items() if k != "verification"},
@@ -155,12 +212,12 @@ def export_results(
     if "all" in formats:
         formats = ["csv", "json", "jsonl", "xlsx"]
 
-    businesses = [business_row(r) for r in results]
+    leads = [row for r in results for row in lead_rows(r)]
     emails = [row for r in results for row in email_rows(r)]
 
     if "csv" in formats:
         path = directory / f"{basename}.csv"
-        _write_csv(path, BUSINESS_COLUMNS, businesses)
+        _write_csv(path, LEAD_COLUMNS, leads)
         written.append(path)
         email_path = directory / f"{basename}_emails.csv"
         _write_csv(email_path, EMAIL_COLUMNS, emails)
@@ -182,7 +239,7 @@ def export_results(
         written.append(path)
 
     if "xlsx" in formats:
-        path = _write_xlsx(directory / f"{basename}.xlsx", businesses, emails)
+        path = _write_xlsx(directory / f"{basename}.xlsx", leads, emails)
         if path is not None:
             written.append(path)
 
@@ -190,7 +247,7 @@ def export_results(
 
 
 def _write_xlsx(
-    path: Path, businesses: list[dict[str, Any]], emails: list[dict[str, Any]]
+    path: Path, leads: list[dict[str, Any]], emails: list[dict[str, Any]]
 ) -> Path | None:
     try:
         from openpyxl import Workbook
@@ -201,7 +258,7 @@ def _write_xlsx(
 
     workbook = Workbook()
     for index, (title, columns, rows) in enumerate(
-        (("Businesses", BUSINESS_COLUMNS, businesses), ("Emails", EMAIL_COLUMNS, emails))
+        (("Leads", LEAD_COLUMNS, leads), ("Emails", EMAIL_COLUMNS, emails))
     ):
         sheet = workbook.active if index == 0 else workbook.create_sheet()
         sheet.title = title

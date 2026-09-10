@@ -17,6 +17,7 @@ from ..util import (
     as_int,
     clean_phone,
     first_dig,
+    has_valid_suffix,
     normalize_url,
     registered_domain,
     squeeze,
@@ -172,6 +173,12 @@ def place_from_mapping(
         website_raw = website_raw.get("url") or website_raw.get("href") or ""
     website = normalize_url(str(website_raw or ""))
     domain = registered_domain(website)
+    if not domain:
+        # A source that already knows the mail domain (a CSV you enriched by
+        # hand, an intranet test fixture) may say so explicitly.
+        explicit = str(first_dig(raw, ("domain", "email_domain")) or "").strip().lower()
+        if explicit and has_valid_suffix(explicit):
+            domain = registered_domain(explicit) or explicit
 
     hours = pick("hours")
     if isinstance(hours, (list, tuple)):

@@ -84,6 +84,17 @@ class Settings:
     emaillistverify_key: str = ""
     bouncer_key: str = ""
 
+    # Web search (website discovery + owner lookup)
+    web_search_provider: str = "auto"   # auto|openwebninja|none
+    openwebninja_key: str = ""
+    discover_websites: bool = True      # search for a site when Maps has none
+    find_owners: bool = True            # look for the owner on the website
+    owner_search: bool = True           # ...and via web search when the site is silent
+    web_search_concurrency: int = 6
+    search_cache_ttl_hours: int = 720
+    website_min_confidence: int = 60    # accept a discovered site at/above this
+    owner_min_confidence: int = 60      # guess owner addresses at/above this
+
     # Generic (config-driven) adapters - see providers/maps/generic.py
     generic_maps_config: str = ""     # path to JSON mapping file
     generic_verify_config: str = ""
@@ -116,6 +127,8 @@ class Settings:
     permutation_require_mx: bool = True
     permutations_for_chains: bool = False
     stop_on_first_valid: bool = True
+    owner_permutation_max: int = 8
+    require_verified_guesses: bool = True   # a guess must verify `valid` to become a lead row
 
     # --- verification ------------------------------------------------------
     verify_emails: bool = True
@@ -187,6 +200,10 @@ class Settings:
     @property
     def supabase_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_key)
+
+    @property
+    def web_search_configured(self) -> bool:
+        return bool(self.openwebninja_key) and self.web_search_provider != "none"
 
     def configured_maps_keys(self) -> dict[str, str]:
         return {

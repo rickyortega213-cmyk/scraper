@@ -52,6 +52,26 @@ PAGES: dict[str, str] = {
         <a href="/site3/menu">Menu</a></body></html>
     """,
     "/site3/menu": "<html><body><p>Tacos, burritos, tortas.</p></body></html>",
+    # A business Maps lists with no website; discovered via search.
+    "/site4/": """
+        <html><head><title>Bluebonnet Roofing | Austin TX Roofers</title></head><body>
+        <h1>Bluebonnet Roofing</h1>
+        <p>Austin's roofing specialists. Call (512) 555-0177 for a free estimate.</p>
+        <p>Email: <a href="mailto:hello@bluebonnetroofing.com">hello@bluebonnetroofing.com</a></p>
+        <a href="/site4/about">About Us</a></body></html>
+    """,
+    "/site4/about": """
+        <html><body><h1>About Bluebonnet Roofing</h1>
+        <p>Bluebonnet Roofing was founded in 2009 by John Kowalski, a third-generation roofer.</p>
+        <p>John Kowalski, Owner</p></body></html>
+    """,
+    # A business whose site never names the owner - found via web search.
+    "/site5/": """
+        <html><body><h1>Hill Country Landscaping</h1>
+        <p>Contact us: info@hillcountrylandscaping.com or (512) 555-0190</p>
+        <a href="/site5/services">Services</a></body></html>
+    """,
+    "/site5/services": "<html><body><p>Lawn care, hardscapes, irrigation.</p></body></html>",
     "/robots.txt": "User-agent: *\nAllow: /\n",
 }
 
@@ -97,6 +117,7 @@ def site_server() -> str:
 # plus info@ (so the "stop at the first valid guess" path is exercised).
 VALID_LOCALS = {
     "office", "dispatch", "joe.plumber1972", "frontdesk", "newpatients", "info",
+    "hello", "john.kowalski", "maria.lopez",
 }
 
 

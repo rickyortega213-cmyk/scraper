@@ -152,8 +152,8 @@ def test_persists_and_exports(report, tmp_path):
     csv_path = next(p for p in paths if p.name.endswith("leads.csv"))
     rows = list(csv.DictReader(csv_path.open(encoding="utf-8-sig")))
     assert len(rows) == 5
-    assert any(row["best_email"] for row in rows)
-    assert {"is_chain", "website_status", "best_email_confidence"} <= set(rows[0])
+    assert any(row["email"] for row in rows)
+    assert {"is_chain", "website_status", "email_confidence", "contact_type"} <= set(rows[0])
 
     payload = json.loads(next(p for p in paths if p.suffix == ".json").read_text())
     assert len(payload) == 5 and "emails" in payload[0]

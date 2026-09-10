@@ -156,16 +156,38 @@ def _iter_regex(text: str, source: str) -> Iterable[Found]:
             yield Found(email, source, trim_context(text, match.start()))
 
 
-def _iter_obfuscated(text: str) -> Iterable[Found]:
+# Ordinary prose that the obfuscation pattern would otherwise read as an
+# address: "join us at meetup.com", "find us at facebook.com".
+_PROSE_LOCALS = {
+    "us", "me", "them", "him", "her", "it", "you", "we", "here", "there", "now",
+    "available", "found", "visit", "see", "look", "shop", "order", "book", "call",
+    "located", "back", "more", "online", "out", "up", "in", "on", "and", "or",
+    "the", "a", "at", "to", "of", "for", "is", "are", "was", "be", "our", "your",
+    "info", "details", "menu", "reviews", "page", "site", "website", "profile",
+}
+
+
+def _iter_obfuscated(text: str, business_domain: str = "") -> Iterable[Found]:
     for match in OBFUSCATED_RE.finditer(text or ""):
         local = squeeze(match.group(1)).replace(" ", "")
         domain_raw = match.group(2)
+        at_part = match.group(0)[len(match.group(1)):][: -len(domain_raw)]
         # Rebuild "example (dot) com" -> "example.com"
         domain = re.sub(_DOT, ".", domain_raw, flags=re.IGNORECASE)
         domain = re.sub(r"\s+", "", html.unescape(domain)).strip(".")
         email = _normalize(f"{local}@{domain}")
-        if _plausible(email):
-            yield Found(email, SOURCE_OBFUSCATED, trim_context(text, match.start()))
+        if not _plausible(email):
+            continue
+        plain_at = bool(re.fullmatch(r"\s*at\s*", at_part, re.IGNORECASE))
+        plain_dot = not re.search(r"\(|\[|\{|\bdot\b|&#", domain_raw, re.IGNORECASE)
+        if plain_at and plain_dot:
+            # "word at host.tld" is only an address when the word is a mailbox
+            # name and the host is the business's own domain.
+            if local.lower() in _PROSE_LOCALS:
+                continue
+            if not business_domain or registered_domain(domain) != registered_domain(business_domain):
+                continue
+        yield Found(email, SOURCE_OBFUSCATED, trim_context(text, match.start()))
 
 
 def _iter_mailto(soup: BeautifulSoup) -> Iterable[Found]:
@@ -235,7 +257,7 @@ def _visible_text(soup: BeautifulSoup) -> str:
     return clone.get_text(" ", strip=True)
 
 
-def extract_emails(raw_html: str, page_url: str = "") -> list[Found]:
+def extract_emails(raw_html: str, page_url: str = "", business_domain: str = "") -> list[Found]:
     """All plausible email hits on one page, best-provenance-first per address."""
     if not raw_html:
         return []
@@ -248,8 +270,8 @@ def extract_emails(raw_html: str, page_url: str = "") -> list[Found]:
     found.extend(_iter_jsonld(soup))
     found.extend(_iter_regex(text, SOURCE_HTML_TEXT))
     found.extend(_iter_regex(html.unescape(raw_html), SOURCE_HTML_TEXT))
-    found.extend(_iter_obfuscated(text))
-    found.extend(_iter_obfuscated(html.unescape(raw_html)))
+    found.extend(_iter_obfuscated(text, business_domain))
+    found.extend(_iter_obfuscated(html.unescape(raw_html), business_domain))
 
     # Keep the strongest source per address, preferring one with context.
     from ..models import SOURCE_WEIGHT
