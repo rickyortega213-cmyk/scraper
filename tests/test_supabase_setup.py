@@ -280,3 +280,32 @@ def test_buddy_asks_for_project_url_and_key_only():
 
     supabase = [k for k in BUDDY_KEYS if "supabase" in k.env.lower()]
     assert [k.env for k in supabase] == ["SUPABASE_URL", "SUPABASE_KEY"]
+
+
+def test_an_unusable_saved_key_is_replaced_via_the_token(management, monkeypatch, tmp_path):
+    """A key copied while the dashboard still masked it (bullets) is useless;
+    with an access token on file the real key is fetched and saved instead."""
+    from gmscrape import cli
+    from gmscrape import keys as K
+
+    monkeypatch.setenv("GMSCRAPE_CONFIG", str(tmp_path / "cfg.env"))
+    said: list[str] = []
+    monkeypatch.setattr(cli, "echo", lambda text="", *a, **k: said.append(str(text)))
+    settings = Settings.from_env(
+        supabase_url="https://abcdefghijkl.supabase.co",
+        supabase_key="eyJhbGci" + "•" * 20,
+        supabase_access_token="sbp_good",
+    )
+    config = cli.supabase_config(settings)
+    assert config.key == "svc-key" and config.url == "https://abcdefghijkl.supabase.co"
+    assert settings.supabase_key == "svc-key"                       # this run uses the real key
+    assert K.read_saved_keys()["SUPABASE_KEY"] == "svc-key"          # and so will the next one
+    assert any("copy/paste went wrong" in t for t in said)
+
+    # Without a token there is nothing to fall back to: a clear error instead.
+    from gmscrape.store.supabase import SupabaseError
+
+    bad = Settings.from_env(supabase_url="https://abcdefghijkl.supabase.co", supabase_key="eyJ" + "•" * 5)
+    with pytest.raises(SupabaseError) as err:
+        cli.supabase_config(bad)
+    assert "scraper keys set SUPABASE_KEY" in str(err.value)

@@ -910,14 +910,23 @@ def supabase_config(settings: Settings):
     """The Supabase connection - from the access token alone when that is all
     we have (the project URL and service key are looked up, then remembered)."""
     from .keys import save_keys
-    from .store.supabase import SupabaseConfig, resolve_from_token
+    from .store.supabase import SupabaseConfig, SupabaseError, resolve_from_token
 
     if settings.supabase_url and settings.supabase_key:
-        return SupabaseConfig(
+        config = SupabaseConfig(
             url=settings.supabase_url, key=settings.supabase_key,
             schema=settings.supabase_schema, prefix=settings.supabase_prefix,
             access_token=settings.supabase_access_token,
         )
+        problems = config.problems()
+        if not problems:
+            return config
+        if not settings.supabase_access_token:
+            raise SupabaseError(problems[0])
+        # The saved key is unusable (a masked copy from the dashboard, say) but
+        # the account token can fetch the real one - do that and repair the file.
+        echo(f"[yellow]Supabase: {problems[0]}[/yellow]")
+        echo("[yellow]fetching the project key with the access token instead[/yellow]")
     config = resolve_from_token(settings.supabase_access_token, settings.supabase_project_ref)
     config.schema = settings.supabase_schema
     config.prefix = settings.supabase_prefix
