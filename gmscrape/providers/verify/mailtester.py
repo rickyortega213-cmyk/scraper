@@ -46,7 +46,7 @@ from ...models import (
     V_VALID,
 )
 from ...util import as_float
-from ..base import EmailVerifier, ProviderAuthError, ProviderError
+from ..base import RETRY_STATUS, ApiClient, EmailVerifier, ProviderAuthError, ProviderError
 from .vendors import normalize_status
 
 log = logging.getLogger(__name__)
@@ -110,27 +110,50 @@ def _jwt_expiry(token: str) -> Optional[float]:
 
 
 class RateLimiter:
-    """At most `limit` calls per `window` seconds, shared by every thread."""
+    """`limit` calls per `window` seconds, spread evenly rather than in bursts.
+
+    MailTester's limiter is a steady drip (Ultimate: one call every ~175 ms),
+    so 57 calls in the first second of a 10 s window still trip it. Calls are
+    scheduled `window / limit` apart across every thread. A 429 stretches the
+    gap (penalize); a long run of clean answers relaxes it back (reward)."""
+
+    MAX_STRETCH = 8.0
+    RECOVER_AFTER = 100          # clean answers before the gap shrinks a step
 
     def __init__(self, limit: int, window: float = RATE_WINDOW) -> None:
         self.limit = max(0, int(limit))
         self.window = window
-        self._stamps: collections.deque[float] = collections.deque()
+        self.base_interval = (window / self.limit) if self.limit else 0.0
+        self.interval = self.base_interval
+        self._next_slot = 0.0
+        self._hold_until = 0.0
+        self._clean = 0
         self._lock = threading.Lock()
 
     def wait(self) -> None:
         if self.limit <= 0:
             return
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                while self._stamps and now - self._stamps[0] >= self.window:
-                    self._stamps.popleft()
-                if len(self._stamps) < self.limit:
-                    self._stamps.append(now)
-                    return
-                pause = self.window - (now - self._stamps[0])
-            time.sleep(max(0.05, pause))
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot, self._hold_until)
+            self._next_slot = slot + self.interval
+        pause = slot - time.monotonic()
+        if pause > 0:
+            time.sleep(pause)
+
+    def penalize(self, hold: float) -> None:
+        """Called on a 429: everyone pauses `hold` seconds and the gap grows."""
+        with self._lock:
+            self._hold_until = max(self._hold_until, time.monotonic() + hold)
+            self.interval = min(self.base_interval * self.MAX_STRETCH, self.interval * 1.5)
+            self._clean = 0
+
+    def reward(self) -> None:
+        with self._lock:
+            self._clean += 1
+            if self._clean >= self.RECOVER_AFTER and self.interval > self.base_interval:
+                self.interval = max(self.base_interval, self.interval / 1.25)
+                self._clean = 0
 
 
 class MailTesterNinja(EmailVerifier):
@@ -145,6 +168,9 @@ class MailTesterNinja(EmailVerifier):
         self._mode: str = (getattr(settings, "mailtester_auth", "") or "auto").lower()
         self._key_param: str = ""           # the key variant the direct endpoint accepted
         self._limiter = RateLimiter(int(getattr(settings, "mailtester_rate", 0) or 0))
+        # 429 is handled here (a global pause + a longer gap), not by blind per-call retries.
+        self.client.close()
+        self.client = ApiClient(timeout=45.0, retries=2, retry_statuses=RETRY_STATUS - {429})
 
     @property
     def auth_mode(self) -> str:
@@ -289,9 +315,12 @@ class MailTesterNinja(EmailVerifier):
             payload, outcome = self._request(email)
             if outcome == "limited" and attempt < LIMITED_RETRIES:
                 pause = LIMITED_BACKOFF[min(attempt, len(LIMITED_BACKOFF) - 1)]
-                log.info("mailtester rate-limited on %s; pausing %.0fs", email, pause)
+                self._limiter.penalize(pause)          # every thread slows down, not just this one
+                log.info("mailtester rate-limited; pausing %.0fs and spacing calls further apart", pause)
                 time.sleep(pause)
                 continue
+            if outcome == "ok":
+                self._limiter.reward()
             break
         if outcome == "limited":
             return self._unknown("mailtester_rate_limited")

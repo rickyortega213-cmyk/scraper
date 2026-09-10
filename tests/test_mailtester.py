@@ -224,17 +224,29 @@ def test_rate_limited_answers_are_retried_not_recorded(monkeypatch):
 
     api = Throttling({}, direct_key="sub_test_key")
     result = make_verifier(api).verify("a@x.com")
-    # the HTTP client retries the 429 itself (its own backoff), then "Limited"
-    # is paused on by the adapter; neither answer became a verdict
-    assert result.status == V_VALID and len(naps) == 2 and naps[-1] == 2.0
+    # both the 429 and the "Limited" answer are paused on by the adapter (2 s, then 5 s),
+    # which also widens the gap for every thread; neither became a verdict
+    assert result.status == V_VALID and naps == [2.0, 5.0]
 
 
-def test_rate_limiter_meters_calls_per_window():
+def test_rate_limiter_spreads_calls_evenly_and_backs_off():
     from gmscrape.providers.verify.mailtester import RateLimiter
 
-    limiter = RateLimiter(3, window=0.4)
+    limiter = RateLimiter(4, window=0.4)               # one call every 100 ms, never a burst
     started = time.monotonic()
+    stamps = []
     for _ in range(4):
         limiter.wait()
-    assert time.monotonic() - started >= 0.3          # the fourth call waited for the window
+        stamps.append(time.monotonic() - started)
+    assert stamps[-1] >= 0.28                           # 4 calls take ~3 gaps, not 0 s
+    assert all(b - a >= 0.08 for a, b in zip(stamps, stamps[1:]))
     assert RateLimiter(0).limit == 0                    # 0 = unmetered
+
+    limiter.penalize(0.2)                               # a 429: pause everyone, widen the gap
+    assert limiter.interval == pytest.approx(0.15)
+    t = time.monotonic()
+    limiter.wait()
+    assert time.monotonic() - t >= 0.15
+    for _ in range(limiter.RECOVER_AFTER):
+        limiter.reward()
+    assert limiter.interval == pytest.approx(0.12)      # relaxing back toward the plan rate

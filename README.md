@@ -198,9 +198,11 @@ accepts: the documented direct call (`?email=…&key=…` on every request) is
 tried first, then the older token exchange (`token.mailtester.ninja`, the token
 cached until its JWT `exp` and re-fetched when it lapses). A key pasted with or
 without the curly braces their site shows works either way. Calls are metered
-to `MAILTESTER_RATE` per 10 seconds because the vendor bans accounts that
-exceed their plan's limit; a `Limited` answer or HTTP 429 is waited out and
-retried, never recorded as a verdict. Their `code` values map as `ok` → valid,
+to `MAILTESTER_RATE` per 10 seconds, spread evenly (their limiter is a steady
+drip, so a burst of 57 in one second trips it even though the total fits),
+because the vendor bans accounts that exceed their plan's limit; a `Limited`
+answer or HTTP 429 pauses every thread and widens the gap between calls, then
+the call is retried, never recorded as a verdict. Their `code` values map as `ok` → valid,
 `ko` → invalid, `mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all. A
 key the service refuses both ways (HTTP 401 pointing at their subscribe page)
 is caught **before** a run spends anything, and stops a run

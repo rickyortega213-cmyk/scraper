@@ -47,9 +47,11 @@ class ApiClient:
         retries: int = 3,
         headers: Optional[dict[str, str]] = None,
         base_backoff: float = 1.5,
+        retry_statuses: Optional[set[int]] = None,
     ) -> None:
         self.retries = max(0, retries)
         self.base_backoff = base_backoff
+        self.retry_statuses = RETRY_STATUS if retry_statuses is None else set(retry_statuses)
         self._client = httpx.Client(
             timeout=timeout,
             follow_redirects=True,
@@ -61,7 +63,7 @@ class ApiClient:
         for attempt in range(self.retries + 1):
             try:
                 response = self._client.request(method, url, **kwargs)
-                if response.status_code in RETRY_STATUS and attempt < self.retries:
+                if response.status_code in self.retry_statuses and attempt < self.retries:
                     delay = self._retry_delay(response, attempt)
                     log.warning(
                         "%s %s -> HTTP %s, retrying in %.1fs",
