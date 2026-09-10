@@ -205,3 +205,24 @@ def dedupe_preserving_order(items: Iterable[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+_HOUSE_NUMBER_RE = re.compile(r"^\d+[A-Za-z]?\b")
+
+
+def city_from_address(address: str) -> str:
+    """'220 Oak Ave, Austin, TX 78702' -> 'Austin'  (best effort, '' if unsure).
+
+    The city is the segment right after the street (the first segment that
+    starts with a house number); anything else - "Austin, TX" alone, a bare
+    region - is not confident enough to gate search results on.
+    """
+    parts = [squeeze(p) for p in (address or "").split(",") if squeeze(p)]
+    for index, part in enumerate(parts[:-1]):
+        if _HOUSE_NUMBER_RE.match(part):
+            candidate = parts[index + 1]
+            candidate = re.sub(r"\s+\d{4,}(?:-\d{4})?$", "", candidate)
+            if candidate and not any(ch.isdigit() for ch in candidate) and len(candidate) > 2:
+                return candidate
+            return ""
+    return ""

@@ -117,7 +117,7 @@ def site_server() -> str:
 # plus info@ (so the "stop at the first valid guess" path is exercised).
 VALID_LOCALS = {
     "office", "dispatch", "joe.plumber1972", "frontdesk", "newpatients", "info",
-    "hello", "john.kowalski", "maria.lopez",
+    "hello", "john.kowalski", "maria.lopez", "dana.whitfield", "rosa.delgado",
 }
 
 

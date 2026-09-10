@@ -38,6 +38,28 @@ _STATE_RE = re.compile(
 )
 _COMMENT_RE = re.compile(r"^\s*#")
 
+# "<word> in" that names a kind of business rather than a place.
+_COMPOUND_IN_WORDS = {
+    "walk", "drive", "dine", "check", "drop", "move", "trade", "built", "plug",
+    "log", "sign", "stand", "live", "pop", "all", "cash", "sit", "lie", "sleep",
+    "buy", "sell", "turn", "opt", "tune", "phone", "call", "eat", "stay", "sit",
+}
+# Tails people add that are not part of the place.
+_LOCATION_TAIL_RE = re.compile(
+    r"\s*(?:near\s+me|nearby|near\s+by|around\s+me|close\s+to\s+me|"
+    r"within\s+\d+\s*(?:mi|miles|km|kilometers|minutes|min))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_location(text: str) -> str:
+    location = squeeze(text)
+    while True:
+        stripped = _LOCATION_TAIL_RE.sub("", location).strip(" ,-")
+        if stripped == location:
+            return location
+        location = stripped
+
 
 def parse_query(raw: str) -> QuerySpec:
     """Split one raw query string into business type + location."""
@@ -45,12 +67,16 @@ def parse_query(raw: str) -> QuerySpec:
     if not text:
         raise ValueError("empty query")
 
-    match = _SPLIT_RE.search(text)
-    if match:
+    # Split on the first separator - unless it belongs to the business type
+    # itself: "walk in clinic in austin tx" is a walk-in clinic in Austin.
+    for match in _SPLIT_RE.finditer(text):
         business = squeeze(text[: match.start()])
-        location = squeeze(text[match.end():])
-        if business and location:
-            return QuerySpec(raw=text, business_type=business, location=location)
+        location = _clean_location(text[match.end():])
+        if not business or not location:
+            continue
+        if business.split()[-1].lower() in _COMPOUND_IN_WORDS and match.group(0).strip().lower() == "in":
+            continue
+        return QuerySpec(raw=text, business_type=business, location=location)
 
     # No explicit separator: try "<what>, <City>, <ST>" / "<what> <City>, <ST>"
     # or a trailing ZIP code.

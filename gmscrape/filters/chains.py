@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from ..data.chains import CHAIN_BRANDS, CHAIN_DOMAINS, FRANCHISE_HINTS
+from ..data.chains import CHAIN_BRANDS, CHAIN_DOMAINS, CHAIN_KINDS, FRANCHISE_HINTS
 from ..models import Place
 from ..util import name_tokens, normalize_name, registered_domain
 
@@ -39,6 +39,96 @@ class ChainVerdict:
     is_chain: bool
     score: int
     reasons: list[str]
+    brand: str = ""            # normalized brand that matched, if any
+
+
+@dataclass
+class ChainProfile:
+    """Who to look for at a chain location, and how to ask the web for them."""
+
+    kind: str                       # franchise | corporate_store | corporate_restaurant
+    contact_type: str               # owner | manager
+    target_titles: tuple[str, ...]  # best first - boosts these when choosing a person
+    queries: tuple[str, ...]        # templates with {brand} {name} {city} {state} {where}
+    label: str                      # human description for notes / summaries
+
+
+_PROFILES: dict[str, ChainProfile] = {
+    "franchise": ChainProfile(
+        kind="franchise",
+        contact_type="owner",
+        target_titles=("franchise owner", "franchisee", "owner/operator", "owner operator",
+                       "owner", "operator", "co-owner", "general manager"),
+        queries=(
+            "who owns the {brand} franchise in {where}",
+            "{brand} {where} franchisee owner",
+        ),
+        label="franchise owner",
+    ),
+    "corporate_store": ChainProfile(
+        kind="corporate_store",
+        contact_type="manager",
+        target_titles=("store manager", "general manager", "branch manager", "store director",
+                       "market manager", "district manager", "regional manager",
+                       "location manager", "manager"),
+        queries=(
+            "who is the store manager of {brand} in {where}",
+            "{brand} {where} store manager OR district manager OR regional manager",
+        ),
+        label="store / district manager",
+    ),
+    "corporate_restaurant": ChainProfile(
+        kind="corporate_restaurant",
+        contact_type="manager",
+        target_titles=("general manager", "managing partner", "restaurant manager",
+                       "kitchen manager", "district manager", "regional manager", "manager"),
+        queries=(
+            "who is the general manager of {brand} in {where}",
+            "{brand} {where} general manager OR managing partner",
+        ),
+        label="general manager",
+    ),
+}
+
+_FRANCHISE_CATEGORY_RE = re.compile(
+    r"fast food|hamburger|pizza|sandwich|chicken|donut|coffee|ice cream|frozen yogurt|"
+    r"hair salon|barber|fitness|gym|hotel|motel|inn\b|tax|insurance|real estate|"
+    r"cleaning|plumb|hvac|heating|electric|handyman|pest|lawn|landscap|painting|"
+    r"printing|shipping|mail|storage|car wash|oil change|auto repair|tire|tutoring|"
+    r"learning|child care|day ?care|preschool|senior|home care|massage|wax|tanning|"
+    r"convenience store|gas station",
+    re.IGNORECASE,
+)
+_RESTAURANT_CATEGORY_RE = re.compile(
+    r"restaurant|steak|grill|bar\b|diner|cafe|bistro|eatery|brewery|kitchen|buffet",
+    re.IGNORECASE,
+)
+
+
+def chain_profile(place: Place, verdict: ChainVerdict) -> ChainProfile | None:
+    """Which local person to look for at this chain location, or None if local."""
+    if not verdict.is_chain:
+        return None
+    kind = CHAIN_KINDS.get(verdict.brand or "", "")
+    if not kind:
+        haystack = f"{place.category} {place.name}"
+        if _FRANCHISE_CATEGORY_RE.search(haystack):
+            kind = "franchise"
+        elif _RESTAURANT_CATEGORY_RE.search(haystack):
+            kind = "corporate_restaurant"
+        else:
+            kind = "corporate_store"
+    return _PROFILES[kind]
+
+
+def profile_for_kind(kind: str) -> ChainProfile | None:
+    return _PROFILES.get(kind)
+
+
+def brand_display_name(place: Place) -> str:
+    """The brand as people write it: the listing name minus store numbers."""
+    name = _TRAILING_NUMBER_RE.sub("", _STORE_NUMBER_RE.sub("", place.name)).strip(" -–—,")
+    return name or place.name
 
 
 def _brand_match(name: str) -> tuple[int, str]:
@@ -67,6 +157,7 @@ def classify(place: Place, *, review_threshold: int = 1500) -> ChainVerdict:
     reasons: list[str] = []
 
     brand_score, brand_reason = _brand_match(place.name)
+    brand = brand_reason.split(":", 1)[1] if brand_score else ""
     if brand_score:
         score += brand_score
         reasons.append(brand_reason)
@@ -91,7 +182,9 @@ def classify(place: Place, *, review_threshold: int = 1500) -> ChainVerdict:
         score += SCORE_HIGH_REVIEWS
         reasons.append(f"reviews>={review_threshold}")
 
-    return ChainVerdict(is_chain=score >= CHAIN_THRESHOLD, score=score, reasons=reasons)
+    if not brand and domain in CHAIN_DOMAINS:
+        brand = normalize_name(domain.rsplit(".", 1)[0].replace("-", " "))
+    return ChainVerdict(is_chain=score >= CHAIN_THRESHOLD, score=score, reasons=reasons, brand=brand)
 
 
 def should_keep(verdict: ChainVerdict, mode: str) -> bool:

@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
+from ..data.chains import CHAIN_DOMAINS
 from ..data.domains import FREE_MAIL_DOMAINS, JUNK_EMAIL_DOMAINS, PLATFORM_DOMAINS
 from ..models import CONTACT_OWNER, EmailCandidate, Person, SOURCE_PERMUTATION
 from ..util import (
@@ -237,6 +238,7 @@ def build_owner_permutations(
     is_chain: bool = False,
     allow_chains: bool = False,
     exclude: Sequence[str] = (),
+    contact_type: str = CONTACT_OWNER,
 ) -> PermutationPlan:
     """Likely mailboxes for a named person at the business domain.
 
@@ -248,8 +250,12 @@ def build_owner_permutations(
     registered = registered_domain(domain) or (domain or "").strip().lower()
     if is_chain and not allow_chains:
         return PermutationPlan(domain=registered, candidates=[], skipped_reason="national_chain")
+    # A chain's corporate domain is where its store managers get mail, even
+    # when the same domain is a marketplace we would never guess for a local
+    # seller (amazon.com, walmart.com).
+    corporate = is_chain and allow_chains and registered in CHAIN_DOMAINS
     guessable, reason = domain_is_guessable(registered)
-    if not guessable:
+    if not guessable and not (corporate and reason == "platform_or_social_domain"):
         return PermutationPlan(domain=registered, candidates=[], skipped_reason=reason)
     if require_mx and not domain_has_mx(registered):
         return PermutationPlan(domain=registered, candidates=[], skipped_reason="domain_has_no_mx")
@@ -270,7 +276,7 @@ def build_owner_permutations(
                 pattern=f"{_pattern_label(local, person)}@{{domain}}",
                 is_role=False,
                 on_business_domain=True,
-                contact_type=CONTACT_OWNER,
+                contact_type=contact_type,
                 contact_name=person.name,
                 contact_title=person.title,
                 notes=["guessed_owner_pattern"],

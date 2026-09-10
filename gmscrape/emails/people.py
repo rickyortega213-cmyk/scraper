@@ -22,7 +22,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from bs4 import BeautifulSoup
 
@@ -37,11 +37,18 @@ TITLE_RANK: dict[str, int] = {
     "partner": 70, "senior partner": 72, "director": 60, "executive director": 62,
     "general manager": 55, "practice owner": 100, "practice manager": 45,
     "office manager": 40, "manager": 40, "head chef": 50, "chef owner": 100,
-    "chef-owner": 100, "owner operator": 100, "owner/operator": 100,
+    "chef-owner": 100, "owner operator": 100,
     "broker owner": 100, "broker/owner": 100, "lead attorney": 65,
     "founding attorney": 95, "founding partner": 95, "medical director": 66,
     "dr": 64, "doctor": 64, "dds": 64, "dmd": 64, "md": 64, "dvm": 64, "od": 64,
     "dc": 64, "cpa": 60, "esq": 60,
+    # chain / franchise roles
+    "franchise owner": 100, "franchisee": 100, "operator": 90, "owner/operator": 100,
+    "multi-unit franchisee": 100, "area developer": 85,
+    "store manager": 58, "store director": 58, "branch manager": 56,
+    "market manager": 54, "district manager": 52, "regional manager": 50,
+    "location manager": 50, "restaurant manager": 48, "kitchen manager": 42,
+    "assistant manager": 30, "assistant store manager": 30, "shift manager": 20,
 }
 
 # Titles that mark a practice principal in these industries.
@@ -49,7 +56,7 @@ _CREDENTIAL_TITLES = {"dds", "dmd", "md", "dvm", "od", "dc", "cpa", "esq", "dr",
 
 # Credentials stripped off the end of a name: "Jane Doe, DDS", "John Roe MD, FACS"
 _CREDENTIAL_RE = re.compile(
-    r"(?:\s*,?\s*(?:DDS|DMD|MD|DO|DVM|OD|DC|PhD|Ph\.D\.?|CPA|Esq\.?|Esquire|JD|J\.D\.?|"
+    r"(?:(?:\s*,\s*|\s+)(?:DDS|DMD|MD|DO|DVM|OD|DC|PhD|Ph\.D\.?|CPA|Esq\.?|Esquire|JD|J\.D\.?|"
     r"RN|NP|PA-C|LMT|LCSW|MBA|FACS|FAGD|MAGD|FAAD|RDH|CFP|EA|PE|AIA|CFA|LLC|Inc\.?)\.?)+$",
     re.IGNORECASE,
 )
@@ -69,7 +76,10 @@ _TITLES = (
     r"founding (?:partner|attorney|member)|ceo|chief executive officer|president|"
     r"principal|managing (?:partner|member|director)|partner|(?:executive |medical )?director|"
     r"general manager|practice owner|chef[\s/-]*owner|broker[\s/-]*owner|head chef|"
-    r"office manager|practice manager|manager)"
+    r"multi-unit franchisee|franchise owner|franchisee|operator|area developer|"
+    r"store (?:manager|director)|branch manager|market manager|district manager|"
+    r"regional manager|location manager|restaurant manager|kitchen manager|"
+    r"assistant (?:store )?manager|shift manager|office manager|practice manager|manager)"
 )
 
 # "Owner: Jane Doe" / "Owner - Jane Doe" / "Owner Jane Doe" / "our owner, Jane Doe"
@@ -85,6 +95,15 @@ _NAME_THEN_TITLE = re.compile(
 _BY_NAME = re.compile(
     rf"\b(?i:founded|established|started|owned(?:\s+and\s+operated)?|run|led|opened|created)"
     rf"\s+(?:(?i:in)\s+\d{{4}}\s+)?(?i:by)\s+{_DR}{_NAME}"
+)
+# "The store manager of the Walmart Supercenter in Austin, TX is Dana Whitfield"
+_TITLE_OF_IS_NAME = re.compile(
+    rf"\b{_TITLES}\s+(?i:of|at|for)\s+[^.;|]{{0,90}}?\s(?i:is|was|:)\s+{_DR}{_NAME}"
+)
+# "Jane Doe owns two Subway locations" / "Jane Doe, who owns the ..."
+_NAME_OWNS = re.compile(
+    rf"{_NAME},?\s+(?:(?i:who)\s+)?(?i:owns and operates|owns|operates|franchises)\s+"
+    rf"(?:(?i:the|a|an|two|three|four|five|six|several|multiple|\d+)\s+)?"
 )
 # "Dr. Jane Doe" on a medical/dental/vet/chiro site - the practice principal.
 _DOCTOR_NAME = re.compile(rf"\bDr\.?\s+{_NAME}")
@@ -123,6 +142,10 @@ _STOP_TOKENS = {
     "response", "responses", "reply", "replies", "responded", "says", "said",
     "program", "portal", "login", "profile", "page", "site", "website", "info",
     "operator", "operated", "operations", "since", "est", "established",
+    "currently", "hiring", "open", "closed", "proud", "very", "always", "still",
+    "also", "yet", "not", "available", "responsible", "located", "here", "there",
+    "unknown", "unavailable", "listed", "named", "usually", "typically", "often",
+    "generally", "likely", "reportedly", "officially", "temporarily", "permanently",
 }
 
 # A title we matched inside a name capture ("Owner Operator") - never a person.
@@ -139,6 +162,7 @@ class OwnerCandidate:
     evidence: str = ""
     weight: int = 1
     mentions: int = 1
+    loose: bool = False        # from a sentence shape that can also name a non-person
 
     @property
     def key(self) -> str:
@@ -218,6 +242,18 @@ def _iter_text_matches(text: str, source: str, source_url: str = "") -> Iterable
     for match in _BY_NAME.finditer(text):
         verb = match.group(0).split()[0].lower()
         title = "founder" if verb in ("founded", "established", "started", "opened", "created") else "owner"
+        yield OwnerCandidate(match.group(1), title, TITLE_RANK[title], source, source_url,
+                             _context(text, match.start(), match.end()))
+    for match in _TITLE_OF_IS_NAME.finditer(text):
+        # "...the store manager of X is Dana Whitfield" - but also "...is
+        # Currently Hiring". This shape only counts when something else on the
+        # web names the same person (see _confidence).
+        title, rank = _normalize_title(match.group(0)[: match.start(1) - match.start(0)])
+        yield OwnerCandidate(match.group(1), title, rank, source, source_url,
+                             _context(text, match.start(), match.end()), loose=True)
+    for match in _NAME_OWNS.finditer(text):
+        verb = match.group(0)[match.end(1) - match.start():].lower()
+        title = "franchise owner" if "franchis" in verb else "owner"
         yield OwnerCandidate(match.group(1), title, TITLE_RANK[title], source, source_url,
                              _context(text, match.start(), match.end()))
     for match in _CREDENTIALED_NAME.finditer(text):
@@ -313,10 +349,22 @@ def _accept(cand: OwnerCandidate, business_name: str) -> bool:
 
 # --- extraction from search ------------------------------------------------
 def owner_candidates_from_search(
-    blocks: Iterable[tuple[str, str]], business_name: str, city: str = ""
+    blocks: Iterable[tuple[str, str]],
+    business_name: str,
+    city: str = "",
+    *,
+    require_location: bool = False,
 ) -> list[OwnerCandidate]:
-    """Owner mentions from search text, only where the business is named."""
+    """Owner mentions from search text, only where the business is named.
+
+    With `require_location`, the text must also mention the city: "Walmart"
+    appears in every snippet on the web, so for a chain the location is what
+    ties a manager to *this* store.
+    """
     biz_norm = normalize_name(business_name)
+    city_norm = normalize_name(city)
+    brand_tokens = set(name_tokens(business_name)) - _STOP_TOKENS
+    city_tokens = set(city_norm.split()) if city_norm else set()
     biz_tokens = [t for t in name_tokens(business_name) if len(t) > 2 and t not in _STOP_TOKENS]
     weights = {"search_ai_overview": 3, "search_answer": 3, "search_knowledge": 3,
                "search_snippet": 2, "search_related": 1}
@@ -333,6 +381,8 @@ def owner_candidates_from_search(
             names_the_business = hits >= max(1, (len(biz_tokens) + 1) // 2)
         if not names_the_business:
             continue
+        if require_location and city_norm and city_norm not in lowered:
+            continue
         # Knowledge-panel attributes are already keyed: "attributes.founder: Jane".
         if source == "search_knowledge":
             for match in re.finditer(
@@ -345,18 +395,38 @@ def owner_candidates_from_search(
                         out.append(cand)
         for cand in _iter_text_matches(text, source):
             cand.weight = weights.get(source, 1)
-            if _accept(cand, business_name):
-                out.append(cand)
+            if not _accept(cand, business_name):
+                continue
+            tokens = set(name_tokens(cand.name))
+            # "Austin McDonald's franchisee ..." reads as a name; it is the
+            # city plus the brand. In search text, a person's name never
+            # borrows either.
+            if tokens & city_tokens or (require_location and tokens & brand_tokens):
+                continue
+            out.append(cand)
     return out
 
 
 # --- choosing one person ---------------------------------------------------
 def choose_owner(
-    candidates: Iterable[OwnerCandidate], *, min_confidence: int = 60
+    candidates: Iterable[OwnerCandidate],
+    *,
+    min_confidence: int = 60,
+    preferred_titles: Sequence[str] = (),
 ) -> Optional[Person]:
-    """Collapse mentions into one Person, or None when the evidence is unsafe."""
+    """Collapse mentions into one Person, or None when the evidence is unsafe.
+
+    `preferred_titles` (best first) re-ranks roles for the situation: at a
+    corporate store the store manager outranks a regional VP quoted in a press
+    release; at a franchise the franchisee outranks the general manager.
+    """
     groups: dict[str, list[OwnerCandidate]] = defaultdict(list)
     for cand in candidates:
+        if preferred_titles:
+            reranked = _reranked(cand, preferred_titles)
+            if reranked is None:
+                continue          # a corporate CEO is never the store's contact
+            cand = reranked
         groups[cand.key].append(cand)
     if not groups:
         return None
@@ -379,7 +449,12 @@ def choose_owner(
                 _first_name(top.name) != _first_name(second.name):
             return None
 
-    confidence = _confidence(top, top_support, len(groups))
+    # Rivals are other people claiming the *same* role; a district manager
+    # named alongside the store manager is context, not competition.
+    rivals = sum(1 for score, _, _, cand in scored if cand.rank == top.rank)
+    top_mentions = groups[scored[0][2]]
+    all_loose = all(c.loose for c in top_mentions)
+    confidence = _confidence(top, len(top_mentions), rivals, all_loose)
     if confidence < min_confidence:
         return None
     return Person(
@@ -388,26 +463,43 @@ def choose_owner(
     )
 
 
+def _reranked(cand: OwnerCandidate, preferred: Sequence[str]) -> Optional[OwnerCandidate]:
+    """Copy of `cand` ranked by its position in the preferred titles, or None
+    when its role is not one we are looking for at this kind of business."""
+    title = cand.title
+    for index, wanted in enumerate(preferred):
+        if title == wanted or (wanted == "manager" and title.endswith("manager")):
+            # Every preferred title is a good answer; the spacing only orders them.
+            rank = 100 - index * 3
+            return OwnerCandidate(cand.name, title, rank, cand.source, cand.source_url,
+                                  cand.evidence, cand.weight, cand.mentions, cand.loose)
+    return None
+
+
 def _first_name(name: str) -> str:
     tokens = name_tokens(name)
     return tokens[0] if tokens else ""
 
 
-def _confidence(best: OwnerCandidate, support: int, rivals: int) -> int:
+def _confidence(best: OwnerCandidate, mentions: int, rivals: int, all_loose: bool = False) -> int:
+    """0-100. `mentions` is how many separate statements named this person -
+    a single weighty source is still a single statement."""
     base = {
         "site_jsonld": 85, "site_text": 75,
         "search_knowledge": 80, "search_ai_overview": 72, "search_answer": 72,
         "search_snippet": 58, "search_related": 45,
     }.get(best.source, 50)
-    base += min(15, (support - 1) * 5)
-    if best.rank >= 90:
-        base += 5
+    base += min(15, (mentions - 1) * 5)
+    if best.rank >= 85:
+        base += 5           # the role we were actually looking for
     elif best.rank < 60:
         base -= 10
     if len(name_tokens(best.name)) < 2:
         base -= 20          # first name only - weak for permutations
     if rivals > 1:
         base -= 5 * (rivals - 1)
+    if all_loose:
+        base -= 25          # one loosely-shaped sentence is not evidence
     return max(0, min(100, base))
 
 
@@ -468,3 +560,24 @@ def email_matches_person(local_part: str, person: Person) -> bool:
     if not local:
         return False
     return local in {re.sub(r"[^a-z]", "", p) for p in owner_local_parts(person)}
+
+
+_EMAIL_IN_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])([A-Za-z0-9][A-Za-z0-9._%+\-]{0,63})@"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24})(?![A-Za-z0-9\-])"
+)
+
+
+def emails_for_person_in_text(text: str, person: Person) -> list[tuple[str, str]]:
+    """Addresses in `text` that spell this person's name - (email, context).
+
+    Used on search snippets and press releases: an address is attributed to the
+    person only when its mailbox name matches them, never by proximity alone.
+    """
+    out: list[tuple[str, str]] = []
+    for match in _EMAIL_IN_TEXT_RE.finditer(text or ""):
+        local, domain = match.group(1), match.group(2)
+        if email_matches_person(local, person):
+            email = f"{local}@{domain}".lower()
+            out.append((email, _context(text, match.start(), match.end())))
+    return out

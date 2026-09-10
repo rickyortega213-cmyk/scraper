@@ -150,8 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     chains = run.add_argument_group("chains / big businesses")
     chains.add_argument("--chain-mode", choices=["flag", "skip", "only"], dest="chain_mode",
                         help="flag (default), skip national chains, or only chains")
+    chains.add_argument("--no-chain-people", dest="chain_people", action="store_false",
+                        default=None, help="don't look for the franchisee / store manager at chains")
+    chains.add_argument("--no-chain-guesses", dest="chain_person_guesses", action="store_false",
+                        default=None, help="never guess a chain person's mailbox on the corporate domain")
     chains.add_argument("--guess-chains", dest="permutations_for_chains", action="store_true",
-                        default=None, help="allow guessing on chain domains too")
+                        default=None,
+                        help="also allow generic info@/contact@ guesses on chain domains (off by default)")
 
     live = run.add_argument_group("live lead table")
     live.add_argument("--supabase", dest="supabase", action="store_true", default=None,
@@ -263,6 +268,7 @@ SETTINGS_KEYS = {
     "chain_mode", "permutations_for_chains", "db_path", "log_level",
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
+    "chain_people", "chain_person_guesses", "chain_crawl_pages",
 }
 
 

@@ -411,7 +411,7 @@ select run_id, status,
        count(distinct business_id) as businesses,
        count(email) as emails,
        count(*) filter (where email_status = 'valid') as verified_valid,
-       count(*) filter (where contact_type = 'owner' and email is not null) as owner_emails
+       count(*) filter (where contact_type in ('owner', 'manager') and email is not null) as person_emails
 from {p}leads
 group by run_id, status
 order by run_id, status;

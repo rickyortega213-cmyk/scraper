@@ -64,6 +64,8 @@ async def scrape_site(
     medical: bool = False,
     find_owner: bool = True,
     owner_min_confidence: int = 60,
+    max_pages: Optional[int] = None,
+    preferred_titles: tuple[str, ...] = (),
 ) -> SiteScrape:
     """Crawl `website` for email candidates and the owner."""
     url = normalize_url(website)
@@ -92,7 +94,8 @@ async def scrape_site(
             owner_candidates_from_html(home.html, result.final_url, business_name, medical=medical)
         )
 
-    budget = max(0, settings.max_pages_per_site - 1)
+    page_limit = settings.max_pages_per_site if max_pages is None else max_pages
+    budget = max(0, page_limit - 1)
     if budget and not _done(seen_emails, domain, result.owner_candidates, find_owner):
         targets = find_internal_links(home.html, result.final_url, limit=budget * 4)
         if not targets:
@@ -126,7 +129,10 @@ async def scrape_site(
 
     result.candidates = list(seen_emails.values())
     if find_owner and result.owner_candidates:
-        result.owner = choose_owner(result.owner_candidates, min_confidence=owner_min_confidence)
+        result.owner = choose_owner(
+            result.owner_candidates, min_confidence=owner_min_confidence,
+            preferred_titles=preferred_titles,
+        )
     return result
 
 

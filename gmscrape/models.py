@@ -14,6 +14,7 @@ SOURCE_OBFUSCATED = "obfuscated"
 SOURCE_CLOUDFLARE = "cloudflare_decoded"
 SOURCE_JSONLD = "jsonld"
 SOURCE_MAPS = "maps_api"
+SOURCE_SEARCH = "search_snippet"   # an address in a search result that spells the person's name
 SOURCE_PERMUTATION = "permutation"
 
 # Higher = more trustworthy provenance.
@@ -24,12 +25,15 @@ SOURCE_WEIGHT = {
     SOURCE_HTML_TEXT: 90,
     SOURCE_OBFUSCATED: 85,
     SOURCE_MAPS: 80,
+    SOURCE_SEARCH: 70,
     SOURCE_PERMUTATION: 40,
 }
 
 # --- who an address reaches ---------------------------------------------------
 CONTACT_GENERAL = "general"   # info@, office@, a shared inbox
-CONTACT_OWNER = "owner"       # the owner / founder / top decision-maker
+CONTACT_OWNER = "owner"       # the owner / founder / franchisee - the decision-maker
+CONTACT_MANAGER = "manager"   # store / general / district manager at a corporate chain
+PERSON_CONTACT_TYPES = (CONTACT_OWNER, CONTACT_MANAGER)
 
 # --- verification statuses (normalized across vendors) ---------------------
 V_VALID = "valid"
@@ -87,16 +91,20 @@ class Place:
     raw: dict[str, Any] = field(default_factory=dict)
 
     def dedupe_key(self) -> str:
-        """Stable identity for a business across overlapping queries."""
+        """Stable identity for a business across overlapping queries.
+
+        The domain is deliberately not part of it: every Walmart shares
+        walmart.com, and a dentist with two offices shares one site.
+        """
         if self.place_id:
             return f"pid:{self.place_id}".lower()
-        if self.domain:
-            return f"dom:{self.domain}".lower()
         if self.phone:
             digits = "".join(c for c in self.phone if c.isdigit())[-10:]
             if len(digits) >= 7:
                 return f"tel:{digits}"
-        return f"na:{self.name.strip().lower()}|{self.address.strip().lower()}"
+        if self.address:
+            return f"na:{self.name.strip().lower()}|{self.address.strip().lower()}"
+        return f"nd:{self.name.strip().lower()}|{self.domain.lower()}"
 
 
 @dataclass
@@ -160,7 +168,8 @@ class EmailCandidate:
 
     @property
     def is_owner(self) -> bool:
-        return self.contact_type == CONTACT_OWNER
+        """A named person (owner or manager) rather than a shared inbox."""
+        return self.contact_type in PERSON_CONTACT_TYPES
 
 
 @dataclass
@@ -197,6 +206,8 @@ class BusinessResult:
     is_chain: bool = False
     chain_score: int = 0
     chain_reasons: list[str] = field(default_factory=list)
+    chain_kind: str = ""            # franchise | corporate_store | corporate_restaurant
+    target_role: str = ""           # who we look for at a chain: "franchise owner", ...
     website_status: str = ""        # "", "ok", "no_website", "unreachable:<detail>"
     website_source: str = ""        # "maps" | "search" | ""
     website_confidence: int = 0     # for discovered sites: how sure we are it's theirs

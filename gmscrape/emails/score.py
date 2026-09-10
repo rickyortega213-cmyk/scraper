@@ -35,6 +35,7 @@ BASE_BY_SOURCE = {
     "html_text": 64,
     "obfuscated": 60,
     "maps_api": 62,
+    "search_snippet": 52,
     "permutation": 22,
 }
 

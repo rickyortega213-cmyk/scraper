@@ -142,6 +142,9 @@ class Settings:
     # --- chains ------------------------------------------------------------
     chain_mode: str = "flag"          # flag|skip|only
     chain_review_threshold: int = 1500
+    chain_people: bool = True         # look for the local manager / franchisee at chains
+    chain_person_guesses: bool = True # guess that person's mailbox on the corporate domain
+    chain_crawl_pages: int = 2        # corporate sites rarely name local staff - stay shallow
 
     # --- Supabase live table -----------------------------------------------
     supabase_url: str = ""

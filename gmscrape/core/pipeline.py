@@ -22,11 +22,19 @@ from ..emails.patterns import build_owner_permutations, build_permutations
 from ..emails.people import (
     choose_owner,
     email_matches_person,
+    emails_for_person_in_text,
     is_medical,
     owner_candidates_from_search,
 )
 from ..emails.score import keep_candidate, score_business
-from ..filters.chains import classify, should_keep
+from ..filters.chains import (
+    ChainProfile,
+    brand_display_name,
+    chain_profile,
+    classify,
+    profile_for_kind,
+    should_keep,
+)
 from ..models import (
     BusinessResult,
     CONTACT_OWNER,
@@ -34,6 +42,7 @@ from ..models import (
     Place,
     QuerySpec,
     SOURCE_MAPS,
+    SOURCE_SEARCH,
     VerificationResult,
     V_CATCH_ALL,
     V_VALID,
@@ -54,7 +63,8 @@ from ..store.sinks import (
     LeadSink,
     NullSink,
 )
-from ..util import domain_has_mx, hostname, registered_domain
+from ..data.domains import FREE_MAIL_DOMAINS
+from ..util import city_from_address, domain_has_mx, hostname, registered_domain
 from ..web.crawl import scrape_site
 from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
@@ -284,6 +294,11 @@ class Pipeline:
                 chain_score=verdict.score,
                 chain_reasons=verdict.reasons,
             )
+            profile = chain_profile(place, verdict)
+            if profile is not None:
+                result.chain_kind = profile.kind
+                result.target_role = profile.label
+                result.notes.append(f"chain_brand={brand_display_name(place)}")
             if not place.website:
                 result.website_status = "no_website"
             # Some Maps providers surface an email directly; keep it.
@@ -314,7 +329,11 @@ class Pipeline:
         searching = self.web_search is not None
         discover = searching and self.settings.discover_websites
         owner_search = searching and self.settings.find_owners and self.settings.owner_search
-        targets = [r for r in results if r.place.website or discover]
+        chain_people = owner_search and self.settings.chain_people
+        targets = [
+            r for r in results
+            if r.place.website or discover or (r.is_chain and chain_people)
+        ]
         if not targets:
             return
 
@@ -360,8 +379,16 @@ class Pipeline:
     ) -> None:
         """Discover (if needed), crawl, confirm, and find the owner for one business."""
         place = result.place
+        profile = self._profile(result)
 
         if not place.website:
+            if profile is not None:
+                # A chain's site is corporate; nothing to discover locally.
+                # The right local person can still be found by search.
+                result.website_status = "no_website"
+                if owner_search and self.settings.chain_people:
+                    await self._find_chain_person(result, profile, search_sem)
+                return
             if not discover:
                 result.website_status = "no_website"
                 return
@@ -384,13 +411,15 @@ class Pipeline:
         else:
             result.website_source = result.website_source or "maps"
 
-        find_owner = self.settings.find_owners
+        find_owner = self.settings.find_owners and (profile is None or self.settings.chain_people)
         scrape = await scrape_site(
             fetcher, place.website, self.settings, place.domain,
             business_name=place.name,
             medical=is_medical(place.category, place.query),
             find_owner=find_owner,
             owner_min_confidence=self.settings.owner_min_confidence,
+            max_pages=self.settings.chain_crawl_pages if profile is not None else None,
+            preferred_titles=profile.target_titles if profile is not None else (),
         )
 
         if result.website_source == "search":
@@ -419,6 +448,8 @@ class Pipeline:
         if find_owner:
             if scrape.owner is not None:
                 result.owner = scrape.owner
+            elif owner_search and profile is not None:
+                await self._find_chain_person(result, profile, search_sem)
             elif owner_search and place.domain:
                 await self._find_owner_by_search(result, search_sem)
             if result.owner is not None:
@@ -428,35 +459,119 @@ class Pipeline:
         self, result: BusinessResult, search_sem: asyncio.Semaphore
     ) -> None:
         place = result.place
-        where = place.city or place.state or ""
+        city = place.city or city_from_address(place.address)
+        where = city or place.state or ""
         query = f"who is the owner of {place.name}" + (f" in {where}" if where else "")
         response = await self._search(query, search_sem)
         result.owner_search_done = True
         if not response.ok:
             result.notes.append(f"owner_search:{response.error}")
             return
-        candidates = owner_candidates_from_search(
-            response.all_text_blocks(), place.name, place.city
-        )
+        blocks = response.all_text_blocks()
+        candidates = owner_candidates_from_search(blocks, place.name, city)
         result.owner = choose_owner(candidates, min_confidence=self.settings.owner_min_confidence)
         if result.owner is None:
             result.notes.append(
                 "owner_search:no_confident_match" if candidates else "owner_search:no_mention"
             )
+        else:
+            self._harvest_person_emails(result, blocks, CONTACT_OWNER)
 
-    @staticmethod
-    def _tag_owner_emails(result: BusinessResult) -> None:
-        """An address found on the site that spells the owner's name is theirs."""
+    async def _find_chain_person(
+        self, result: BusinessResult, profile: ChainProfile, search_sem: asyncio.Semaphore
+    ) -> None:
+        """The local franchisee / store manager of a chain location, by search.
+
+        Up to two queries (a question for the AI Overview, then a role search);
+        only text that names both the brand and the city counts.
+        """
+        place = result.place
+        city = place.city or city_from_address(place.address)
+        if not city:
+            # Without a city there is no way to tie a manager to *this* store.
+            result.notes.append("chain_person:no_city")
+            return
+        where = ", ".join(p for p in (city, place.state) if p)
+        brand = brand_display_name(place)
+        best_candidates: list = []
+        for template in profile.queries:
+            query = template.format(brand=brand, name=place.name, city=city,
+                                    state=place.state, where=where)
+            response = await self._search(query, search_sem)
+            result.owner_search_done = True
+            if not response.ok:
+                result.notes.append(f"chain_person:{response.error}")
+                break
+            blocks = response.all_text_blocks()
+            candidates = owner_candidates_from_search(
+                blocks, brand, city, require_location=True
+            )
+            best_candidates.extend(candidates)
+            person = choose_owner(
+                best_candidates, min_confidence=self.settings.owner_min_confidence,
+                preferred_titles=profile.target_titles,
+            )
+            if person is not None:
+                result.owner = person
+                self._harvest_person_emails(result, blocks, profile.contact_type)
+                return
+        result.notes.append(
+            "chain_person:no_confident_match" if best_candidates else "chain_person:no_mention"
+        )
+
+    def _harvest_person_emails(
+        self, result: BusinessResult, blocks: Sequence[tuple[str, str]], contact_type: str
+    ) -> None:
+        """An address in the search text that spells the person's name is theirs."""
+        person = result.owner
+        if person is None:
+            return
+        known = {c.email for c in result.emails}
+        for source, text in blocks:
+            for email, context in emails_for_person_in_text(text, person):
+                if email in known:
+                    continue
+                known.add(email)
+                domain = email.rsplit("@", 1)[-1]
+                result.emails.append(EmailCandidate(
+                    email=email,
+                    source=SOURCE_SEARCH,
+                    context=context,
+                    contact_type=contact_type,
+                    contact_name=person.name,
+                    contact_title=person.title,
+                    on_business_domain=bool(result.place.domain)
+                    and registered_domain(domain) == result.place.domain,
+                    is_personal_domain=domain in FREE_MAIL_DOMAINS,
+                    notes=[f"from_{source}"],
+                ))
+
+    def _tag_owner_emails(self, result: BusinessResult) -> None:
+        """An address found on the site that spells the person's name is theirs -
+        on the business domain or a personal one (john.kowalski@gmail.com)."""
         owner = result.owner
         assert owner is not None
+        contact_type = self._person_contact_type(result)
         for candidate in result.emails:
-            if candidate.from_permutation or not candidate.on_business_domain:
+            if candidate.from_permutation or candidate.is_owner:
+                continue
+            if not (candidate.on_business_domain or candidate.is_personal_domain):
                 continue
             if email_matches_person(candidate.local_part, owner):
-                candidate.contact_type = CONTACT_OWNER
+                candidate.contact_type = contact_type
                 candidate.contact_name = owner.name
                 candidate.contact_title = owner.title
-                candidate.notes.append("matches_owner_name")
+                candidate.notes.append("matches_person_name")
+
+    @staticmethod
+    def _profile(result: BusinessResult) -> Optional[ChainProfile]:
+        if not result.is_chain or not result.chain_kind:
+            return None
+        return profile_for_kind(result.chain_kind)
+
+    def _person_contact_type(self, result: BusinessResult) -> str:
+        profile = self._profile(result)
+        return profile.contact_type if profile is not None else CONTACT_OWNER
 
     # --- web search (cached, budgeted, never fatal) -----------------------
     async def _search(self, query: str, search_sem: asyncio.Semaphore) -> SearchResponse:
@@ -558,8 +673,9 @@ class Pipeline:
                 max_candidates=self.settings.owner_permutation_max,
                 require_mx=self.settings.permutation_require_mx,
                 is_chain=result.is_chain,
-                allow_chains=self.settings.permutations_for_chains,
+                allow_chains=self.settings.chain_person_guesses,
                 exclude=known,
+                contact_type=self._person_contact_type(result),
             )
             if plan.allowed:
                 result.emails.extend(plan.candidates)

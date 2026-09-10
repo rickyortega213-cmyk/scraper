@@ -242,10 +242,12 @@ The leads export has **one row per contact**. A business with both a general
 inbox and an owner address gets two rows that are identical in every column —
 name, phone, address, city, query — except the contact ones:
 
-| name | contact_type | contact_name | email | email_status |
-|---|---|---|---|---|
-| Hill Country Landscaping | owner | Maria Lopez | maria.lopez@hillcountrylandscaping.com | valid |
-| Hill Country Landscaping | general | | info@hillcountrylandscaping.com | valid |
+| name | contact_type | contact_name | contact_title | email | email_status |
+|---|---|---|---|---|---|
+| Hill Country Landscaping | owner | Maria Lopez | owner | maria.lopez@hillcountrylandscaping.com | valid |
+| Hill Country Landscaping | general | | | info@hillcountrylandscaping.com | valid |
+| Walmart Supercenter #1234 | manager | Dana Whitfield | store manager | dana.whitfield@walmart.com | valid |
+| McDonald's | owner | Rosa Delgado | franchise owner | rosa.delgado@mcdfranchise.com | valid |
 
 A business with no email still gets one row, so nothing is silently dropped.
 The Supabase table follows the same shape (`<business>|general`, `<business>|owner`).
@@ -293,25 +295,47 @@ than `valid` (unknown, risky, catch-all, never checked) stay in
 rows. `--allow-unverified-guesses` relaxes this; without any verification key
 it is relaxed automatically, since nothing could ever verify.
 
-## Local businesses vs. national chains
+## National chains: the right local person
 
-The point of the run is local operators, so every business is scored against
-~740 known brands and ~510 corporate domains, plus signals like store numbers
-in the name (`Walmart Supercenter #1234`), franchise wording and review volume.
+Every business is scored against ~740 known brands and ~510 corporate domains,
+plus signals like store numbers in the name (`Walmart Supercenter #1234`),
+franchise wording and review volume — a popular local taqueria with 2,900
+reviews stays local.
 
-```
-Walmart Supercenter #1234   chain  ['brand_prefix:walmart supercenter',
-                                    'corporate_domain:walmart.com',
-                                    'store_number_in_name']
-Great Clips                 chain  ['brand_exact:great clips', 'corporate_domain:greatclips.com']
-Riverside Taqueria          local  — popular (2,900 reviews) but not a brand
-Austin Family Dental        local
-```
+Chains are **not** skipped. They go through enrichment looking for the person
+who actually runs *that location*, chosen by how the chain is run:
 
-Chains are never guessed at, and `--chain-mode` decides what happens to them:
-`flag` (default, keep with `is_chain=yes`), `skip` (drop) or `only` (keep just
-the chains). Emails actually *found* on a chain's site are still reported —
-they're real, just rarely the local decision-maker.
+| Kind | Examples | Who we look for | Row |
+|---|---|---|---|
+| **franchise** | McDonald's, Subway, Great Clips, Anytime Fitness, ServPro, Hampton Inn | the franchise owner in that city | `owner` |
+| **corporate store** | Walmart, Target, Home Depot, CVS, Chase, Starbucks, Chipotle | store manager → district / regional manager | `manager` |
+| **corporate restaurant** | Olive Garden, Chili's, Texas Roadhouse, Cheesecake Factory | general manager → managing partner | `manager` |
+
+~620 brands are mapped; unknown chains fall back to the category (fast food,
+salon, hotel, home services → franchise; restaurant → general manager;
+otherwise store manager).
+
+The lookup is by web search — `who is the store manager of Walmart Supercenter
+in Austin, TX`, `who owns the McDonald's franchise in Austin, TX` — reading the
+AI Overview, knowledge panel and snippets (LinkedIn titles like *Dana Whitfield
+- Store Manager - Walmart · Austin, Texas* are exactly the shape it reads).
+Guards specific to chains, because "Walmart" is in every snippet on the web:
+
+- a sentence only counts if it names **the brand and the city** — a Dallas
+  store manager is never attached to the Austin store
+- a name that borrows the brand or the city ("Austin McDonald's") is rejected
+- a **corporate executive is never the store contact** — CEO/president mentions
+  are dropped rather than demoted
+- a single "the store manager of X is Y" sentence is not evidence on its own;
+  something else on the web has to name the same person
+- no city on the listing → no search (nothing to gate on, no credit spent)
+
+The person's mailbox is then guessed on the **corporate domain**
+(`dana.whitfield@walmart.com`) and must verify like any other guess; an address
+in a search result that spells their name (a franchisee's email in a press
+piece) is picked up directly. Generic `info@walmart.com` guesses are still
+never made. `--chain-mode skip` drops chains entirely, `--no-chain-people`
+keeps them but skips the person lookup.
 
 ## Live lead table in Supabase
 
@@ -411,6 +435,7 @@ Useful flags on `run`:
 --no-permutations      only report addresses actually found
 --verify-budget N      hard cap on paid verification calls
 --chain-mode skip      drop national chains entirely
+--no-chain-people      keep chains but skip the franchisee / manager lookup
 --max-pages N          pages per site (default 6)
 --concurrency N        parallel site fetches (default 12)
 --min-confidence N     drop weak addresses
@@ -445,7 +470,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 109 tests, no network or API keys needed
+make test     # 125 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
