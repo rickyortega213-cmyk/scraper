@@ -157,7 +157,9 @@ class Settings:
     supabase_key: str = ""
     supabase_schema: str = "public"
     supabase_prefix: str = "gmscrape_"
-    supabase_access_token: str = ""      # Management API token: lets us create the tables
+    supabase_access_token: str = ""      # the one credential needed: sbp_... access token
+    supabase_project_ref: str = ""       # which project, when the token can see several
+    supabase_run_tables: bool = True     # a fresh table per run, named after the search + date
     supabase: bool = True                # on whenever URL + key are configured
 
     # --- output / storage --------------------------------------------------
@@ -210,7 +212,8 @@ class Settings:
 
     @property
     def supabase_configured(self) -> bool:
-        return bool(self.supabase_url and self.supabase_key)
+        """Either the access token alone, or an explicit URL + service key."""
+        return bool(self.supabase_access_token) or bool(self.supabase_url and self.supabase_key)
 
     @property
     def web_search_configured(self) -> bool:

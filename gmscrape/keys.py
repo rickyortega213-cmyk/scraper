@@ -59,12 +59,15 @@ KEY_FIELDS: tuple[KeyField, ...] = (
     KeyField("BOUNCER_KEY", "Bouncer key", "app.usebouncer.com/api", "verify"),
     KeyField("OPENWEBNINJA_KEY", "OpenWeb Ninja key",
              "ak_... from openwebninja.com - website discovery + owner lookup", "search"),
-    KeyField("SUPABASE_URL", "Supabase project URL", "https://<project>.supabase.co", "supabase",
-             secret=False),
-    KeyField("SUPABASE_KEY", "Supabase service_role key", "Project Settings → API", "supabase"),
-    KeyField("SUPABASE_ACCESS_TOKEN", "Supabase access token (optional)",
-             "sbp_... from supabase.com/dashboard/account/tokens - lets gmscrape create the tables",
+    KeyField("SUPABASE_ACCESS_TOKEN", "Supabase access token",
+             "sbp_... from supabase.com/dashboard/account/tokens - the only Supabase credential needed",
              "supabase"),
+    KeyField("SUPABASE_PROJECT_REF", "Supabase project ref (only if you have several projects)",
+             "the id in your project URL", "supabase", secret=False),
+    KeyField("SUPABASE_URL", "Supabase project URL (advanced; looked up from the token)",
+             "https://<project>.supabase.co", "supabase", secret=False),
+    KeyField("SUPABASE_KEY", "Supabase service_role key (advanced; looked up from the token)",
+             "Project Settings → API", "supabase"),
 )
 
 GROUP_TITLES = {

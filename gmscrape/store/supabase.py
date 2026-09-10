@@ -43,6 +43,7 @@ def _now() -> str:
 class SinkStats:
     leads_written: int = 0
     emails_written: int = 0
+    run_rows_written: int = 0
     requests: int = 0
     failures: int = 0
     last_error: str = ""
@@ -113,8 +114,10 @@ class SupabaseSink:
 
     name = "supabase"
 
-    def __init__(self, config: SupabaseConfig, *, client: Optional[httpx.Client] = None) -> None:
+    def __init__(self, config: SupabaseConfig, *, client: Optional[httpx.Client] = None,
+                 run_table: str = "") -> None:
         self.config = config
+        self.run_table = run_table          # per-run table (created by the caller), or ""
         self.stats = SinkStats()
         self._client = client or httpx.Client(timeout=config.timeout)
         self._owns_client = client is None
@@ -147,6 +150,10 @@ class SupabaseSink:
             for r in results for rec in lead_records(r, self._run_id, status)
         ]
         self._enqueue("leads", leads)
+        if self.run_table:
+            self._enqueue(self.run_table, [
+                {**_run_row(rec), "status": status} for rec in leads
+            ], raw_table=True)
         # Only publish addresses once they exist; `queued` rows have none yet.
         emails = [rec for r in results for rec in email_records(r, self._run_id)]
         if emails:
@@ -177,9 +184,9 @@ class SupabaseSink:
         self.close()
 
     # --- writer thread -----------------------------------------------------
-    def _enqueue(self, table: str, rows: list[dict[str, Any]]) -> None:
+    def _enqueue(self, table: str, rows: list[dict[str, Any]], raw_table: bool = False) -> None:
         stamped = [{**row, "updated_at": _now()} for row in rows]
-        self._queue.put((table, stamped))
+        self._queue.put((("=" + table) if raw_table else table, stamped))
 
     def _writer_loop(self) -> None:
         """Drain the queue, coalescing rows per table before each write.
@@ -223,7 +230,9 @@ class SupabaseSink:
 
     def _write(self, table: str, rows: list[dict[str, Any]]) -> None:
         rows = _dedupe_by_id(rows)
-        url = f"{self.config.rest_url}/{self.config.table(table)}"
+        # "=name" means an exact table name (the per-run table); otherwise prefixed.
+        full = table[1:] if table.startswith("=") else self.config.table(table)
+        url = f"{self.config.rest_url}/{full}"
         for start in range(0, len(rows), BATCH_SIZE):
             chunk = rows[start: start + BATCH_SIZE]
             conflict = "run_id" if table == "runs" else "id"
@@ -247,6 +256,8 @@ class SupabaseSink:
                 self.stats.leads_written += len(chunk)
             elif table == "emails":
                 self.stats.emails_written += len(chunk)
+            elif table.startswith("="):
+                self.stats.run_rows_written += len(chunk)
 
     def _record_failure(self, detail: str, rows: int) -> None:
         self.stats.failures += 1
@@ -266,6 +277,124 @@ def run_label(queries: list[str]) -> str:
 
 
 MANAGEMENT_API = "https://api.supabase.com/v1/projects/{ref}/database/query"
+MANAGEMENT_PROJECTS = "https://api.supabase.com/v1/projects"
+MANAGEMENT_KEYS = "https://api.supabase.com/v1/projects/{ref}/api-keys"
+
+
+def _management_get(token: str, url: str, params: Optional[dict[str, Any]] = None) -> Any:
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
+    if response.status_code in (401, 403):
+        raise SupabaseError(
+            "Supabase rejected the access token. Make one at "
+            "https://supabase.com/dashboard/account/tokens (it starts with sbp_)."
+        )
+    if response.status_code >= 400:
+        raise SupabaseError(f"{url} -> HTTP {response.status_code}: {response.text[:200]}")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise SupabaseError(f"{url} returned non-JSON") from exc
+
+
+def list_projects(token: str) -> list[dict[str, str]]:
+    """[{ref, name, region}] for the account behind the token."""
+    payload = _management_get(token, MANAGEMENT_PROJECTS)
+    projects = payload if isinstance(payload, list) else payload.get("projects") or payload.get("data") or []
+    out: list[dict[str, str]] = []
+    for item in projects:
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("id") or item.get("ref") or "")
+        if ref:
+            out.append({"ref": ref, "name": str(item.get("name") or ref),
+                        "region": str(item.get("region") or "")})
+    return out
+
+
+def service_role_key(token: str, ref: str) -> str:
+    payload = _management_get(token, MANAGEMENT_KEYS.format(ref=ref), params={"reveal": "true"})
+    keys = payload if isinstance(payload, list) else payload.get("keys") or payload.get("data") or []
+    for item in keys:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("id") or "").lower()
+        value = str(item.get("api_key") or item.get("apiKey") or item.get("key") or "")
+        if value and ("service_role" in name or name == "service"):
+            return value
+    raise SupabaseError(
+        f"no service_role key found for project {ref}; the token may lack permission"
+    )
+
+
+def resolve_from_token(token: str, preferred_ref: str = "") -> SupabaseConfig:
+    """Everything the sink needs, from the access token alone.
+
+    Returns a config whose `url` and `key` were looked up; the caller may
+    save them so later runs skip these two calls.
+    """
+    projects = list_projects(token)
+    if not projects:
+        raise SupabaseError("the token's account has no Supabase projects - create one first")
+    chosen = next((p for p in projects if p["ref"] == preferred_ref), None) if preferred_ref else None
+    if chosen is None:
+        if len(projects) > 1 and not preferred_ref:
+            names = ", ".join(f"{p['name']} ({p['ref']})" for p in projects)
+            raise SupabaseError(
+                f"the token can see {len(projects)} projects: {names}. "
+                "Set SUPABASE_PROJECT_REF to the one to use."
+            )
+        chosen = projects[0]
+    key = service_role_key(token, chosen["ref"])
+    return SupabaseConfig(
+        url=f"https://{chosen['ref']}.supabase.co", key=key, access_token=token,
+    )
+
+
+def run_table_name(label: str, prefix: str = "") -> str:
+    """'dentist in austin tx · 2026-09-10' -> 'run_2026_09_10_dentist_in_austin_tx'."""
+    import re
+
+    text, _, date_part = label.rpartition(" · ")
+    text = text or label
+    date_slug = date_part.replace("-", "_") if date_part else ""
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    slug = re.sub(r"_\+\d+_more$", "", slug)
+    name = f"run_{date_slug}_{slug}" if date_slug else f"run_{slug}"
+    name = re.sub(r"_+", "_", name).strip("_")[:60]
+    return f"{prefix}{name}"
+
+
+def run_table_sql(table: str) -> str:
+    """A per-run table with the clean columns - what a person reads."""
+    return f"""
+create table if not exists {table} (
+    id                  text primary key,
+    status              text,
+    company_name        text,
+    city                text,
+    state               text,
+    address             text,
+    phone_number        text,
+    verified_email      text,
+    contact_first_name  text,
+    contact_last_name   text,
+    contact_title       text,
+    business_type       text,
+    contact_type        text,
+    email               text,
+    email_status        text,
+    email_confidence    int,
+    website             text,
+    google_maps_link    text,
+    rating              numeric,
+    reviews             int,
+    is_chain            text,
+    search_query        text,
+    updated_at          timestamptz default now()
+);
+alter table {table} enable row level security;
+"""
 
 
 def missing_tables(config: SupabaseConfig) -> list[str]:
@@ -311,22 +440,32 @@ def apply_schema(config: SupabaseConfig, sql: str) -> None:
         )
 
 
-def ensure_schema(config: SupabaseConfig) -> tuple[bool, str]:
+def ensure_schema(config: SupabaseConfig, run_table: str = "") -> tuple[bool, str]:
     """Make sure the tables exist. Returns (ready, what_happened).
 
     Creates them through the Management API when an access token is saved;
-    otherwise explains exactly where to paste the SQL.
+    otherwise explains exactly where to paste the SQL. With `run_table`, a
+    fresh per-run table is created as well (token required).
     """
     missing = missing_tables(config)
-    if not missing:
+    if not missing and not run_table:
         return True, "tables present"
-    sql = schema_sql(config.prefix)
     if config.access_token:
+        sql = schema_sql(config.prefix) if missing else ""
+        if run_table:
+            sql += run_table_sql(run_table)
         apply_schema(config, sql)
         still = missing_tables(config)
         if still:
             raise SupabaseError(f"schema applied but tables still missing: {', '.join(still)}")
-        return True, f"created {', '.join(missing)}"
+        done = []
+        if missing:
+            done.append(f"created {', '.join(missing)}")
+        if run_table:
+            done.append(f"created {run_table}")
+        return True, "; ".join(done) or "tables present"
+    if not missing:
+        return True, "tables present (no access token, so no per-run table)"
     return False, (
         f"tables missing: {', '.join(missing)}. Either save a Supabase access token "
         "(`gmscrape setup --only supabase`; make one at "
@@ -334,6 +473,28 @@ def ensure_schema(config: SupabaseConfig) -> tuple[bool, str]:
         "you, or paste `gmscrape supabase-init` into "
         f"{config.sql_editor_url or 'the SQL editor'} and run it."
     )
+
+
+_RUN_ROW_KEYS = (
+    "company_name", "phone_number", "verified_email", "contact_first_name",
+    "contact_last_name", "contact_title", "business_type", "contact_type", "email",
+    "email_status", "email_confidence", "website", "rating", "reviews",
+)
+
+
+def _run_row(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a leads record onto the per-run table's clean columns."""
+    row = {key: record.get(key) for key in _RUN_ROW_KEYS}
+    row.update({
+        "id": record["id"],
+        "city": record.get("city_clean"),
+        "state": record.get("state_clean"),
+        "address": record.get("address_clean"),
+        "google_maps_link": record.get("google_url"),
+        "is_chain": "Yes" if record.get("is_chain") else "No",
+        "search_query": record.get("query"),
+    })
+    return row
 
 
 def _dedupe_by_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

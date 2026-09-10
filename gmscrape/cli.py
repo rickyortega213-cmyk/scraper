@@ -293,6 +293,7 @@ SETTINGS_KEYS = {
     "discover_websites", "find_owners", "owner_search", "owner_min_confidence",
     "website_min_confidence", "require_verified_guesses", "supabase", "supabase_prefix",
     "chain_people", "chain_person_guesses", "chain_crawl_pages", "confirm_keys_on_start",
+    "supabase_run_tables",
 }
 
 
@@ -423,7 +424,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     settings = checked
 
     try:
-        pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
+        pipeline = Pipeline(settings, progress=_make_progress(),
+                            sinks=build_sinks(settings, [s.search_string for s in specs]))
     except ProviderError as exc:
         echo(f"[red]{exc}[/red]")
         return 2
@@ -453,7 +455,8 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     if settings.confirm_keys_on_start:
         _print_key_status(settings)
     try:
-        pipeline = Pipeline(settings, progress=_make_progress(), sinks=build_sinks(settings))
+        pipeline = Pipeline(settings, progress=_make_progress(),
+                            sinks=build_sinks(settings, ["enrich " + Path(args.places_file).stem]))
     except ProviderError as exc:
         echo(f"[red]{exc}[/red]")
         return 2
@@ -651,27 +654,45 @@ def cmd_probe_maps(args: argparse.Namespace) -> int:
 
 
 def supabase_config(settings: Settings):
-    from .store.supabase import SupabaseConfig
+    """The Supabase connection - from the access token alone when that is all
+    we have (the project URL and service key are looked up, then remembered)."""
+    from .keys import save_keys
+    from .store.supabase import SupabaseConfig, resolve_from_token
 
-    return SupabaseConfig(
-        url=settings.supabase_url,
-        key=settings.supabase_key,
-        schema=settings.supabase_schema,
-        prefix=settings.supabase_prefix,
-        access_token=settings.supabase_access_token,
-    )
+    if settings.supabase_url and settings.supabase_key:
+        return SupabaseConfig(
+            url=settings.supabase_url, key=settings.supabase_key,
+            schema=settings.supabase_schema, prefix=settings.supabase_prefix,
+            access_token=settings.supabase_access_token,
+        )
+    config = resolve_from_token(settings.supabase_access_token, settings.supabase_project_ref)
+    config.schema = settings.supabase_schema
+    config.prefix = settings.supabase_prefix
+    settings.supabase_url, settings.supabase_key = config.url, config.key
+    try:
+        save_keys({"SUPABASE_URL": config.url, "SUPABASE_KEY": config.key,
+                   "SUPABASE_PROJECT_REF": config.project_ref})
+    except OSError:
+        pass
+    return config
 
 
-def build_sinks(settings: Settings) -> list:
-    """The live sinks a run should publish to. Supabase is on whenever its
-    keys are saved; the tables are created on first use when possible."""
+def build_sinks(settings: Settings, queries: Sequence[str] = ()) -> list:
+    """The live sinks a run should publish to. Supabase is on whenever an
+    access token (or URL + key) is saved; the shared tables are created on
+    first use and a fresh per-run table for this run."""
     if not settings.supabase or not settings.supabase_configured:
         return []
-    from .store.supabase import SupabaseError, SupabaseSink, ensure_schema
+    from .store.supabase import (
+        SupabaseError, SupabaseSink, ensure_schema, run_label, run_table_name,
+    )
 
-    config = supabase_config(settings)
     try:
-        ready, detail = ensure_schema(config)
+        config = supabase_config(settings)
+        run_table = ""
+        if settings.supabase_run_tables and config.access_token:
+            run_table = run_table_name(run_label(list(queries)))
+        ready, detail = ensure_schema(config, run_table=run_table)
     except SupabaseError as exc:
         echo(f"[yellow]Supabase: {exc}[/yellow]")
         echo("[yellow]continuing without the live table[/yellow]")
@@ -682,8 +703,9 @@ def build_sinks(settings: Settings) -> list:
         return []
     if detail != "tables present":
         echo(f"Supabase: [green]{detail}[/green]")
-    echo(f"live table: [green]{config.table_editor_url or settings.supabase_url}[/green]")
-    return [SupabaseSink(config)]
+    echo(f"live table: [green]{run_table or config.table('latest')}[/green]  "
+         f"{config.table_editor_url or settings.supabase_url}")
+    return [SupabaseSink(config, run_table=run_table)]
 
 
 def cmd_supabase_init(args: argparse.Namespace) -> int:
@@ -710,14 +732,14 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
 
     settings = settings_from_args(args)
     if not settings.supabase_configured:
-        echo("[red]SUPABASE_URL and SUPABASE_KEY are not both set.[/red]")
-        echo("Add them to .env, then re-run. The service_role key is the one to use "
-             "for writes from your own machine.")
+        echo("[red]No Supabase access token saved.[/red] Run `gmscrape setup --only supabase` "
+             "and paste the sbp_... token from https://supabase.com/dashboard/account/tokens")
         return 2
     from .store.supabase import ensure_schema
 
-    config = supabase_config(settings)
     try:
+        config = supabase_config(settings)
+        echo(f"project: [green]{config.project_ref or config.url}[/green]")
         ready, detail = ensure_schema(config)
         if ready:
             tables = check_connection(config)
@@ -1041,10 +1063,13 @@ def _print_supabase_link(settings: Settings, report: RunReport) -> None:
         return
     echo("")
     echo("[bold]Live table:[/bold]")
+    run_table = getattr(sink, "run_table", "")
+    if run_table:
+        echo(f"  [cyan]{run_table}[/cyan] - this run's table")
     if config.table_editor_url:
-        echo(f"  {config.table_editor_url}  → open [cyan]{config.table('latest')}[/cyan] "
-             f"(this run) or [cyan]{config.table('table')}[/cyan] (every run)")
-    echo(f"  this run: [dim]select * from {config.table('table')} where run_id = '{report.run_id}'[/dim]")
+        echo(f"  {config.table_editor_url}")
+    echo(f"  every run: [cyan]{config.table('table')}[/cyan]   "
+         f"[dim]where run_id = '{report.run_id}'[/dim]")
 
 
 def _print_report(report: RunReport, paths: Sequence[Path]) -> None:

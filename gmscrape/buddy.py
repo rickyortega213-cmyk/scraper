@@ -52,11 +52,8 @@ BUDDY_KEYS: tuple[BuddyKey, ...] = (
     BuddyKey("MailTester Ninja (email verification)", "MAILTESTER_KEY", "confirms emails are real"),
     BuddyKey("OpenWeb Ninja (web search)", "OPENWEBNINJA_KEY",
              "finds missing websites and owners", optional=True),
-    BuddyKey("Supabase URL (live table)", "SUPABASE_URL", "where the live table lives",
-             optional=True, secret=False),
-    BuddyKey("Supabase key (live table)", "SUPABASE_KEY", "service_role key", optional=True),
-    BuddyKey("Supabase access token (creates tables)", "SUPABASE_ACCESS_TOKEN",
-             "sbp_... token, optional", optional=True),
+    BuddyKey("Supabase access token (live table, sbp_...)", "SUPABASE_ACCESS_TOKEN",
+             "a new table in Supabase for every run", optional=True),
 )
 
 

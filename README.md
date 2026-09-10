@@ -385,32 +385,37 @@ keeps them but skips the person lookup.
 
 ## Live lead table in Supabase
 
-Every run streams into a Clay-style table you can watch fill in, and the
-finished rows stay there as a running database of your market.
+One credential, and every run gets its own table.
 
 ```bash
-gmscrape setup --only supabase       # paste Project URL + service_role key (+ optional access token)
-gmscrape run "dentist in austin tx"  # that's it - Supabase is on whenever keys are saved
+scraper buddy        # paste your Supabase access token at the Supabase question
 ```
 
-The tables are created for you on first use when a Supabase **access token**
-(`sbp_…`, from supabase.com/dashboard/account/tokens) is saved; without one,
-the run tells you exactly where to paste `gmscrape supabase-init`. Each run
-ends with the link:
+The token (`sbp_…`, from supabase.com/dashboard/account/tokens) is all it
+needs: the project, its URL and its service key are looked up from the token
+and remembered. If the token can see several projects, it asks which
+(`SUPABASE_PROJECT_REF`).
+
+Each run creates a fresh table named after the search and the date —
+`run_2026_09_10_dentist_in_austin_tx` — with exactly the clean columns
+(`company_name`, `city`, `state`, `address`, `phone_number`, `verified_email`,
+`contact_first_name`, `contact_last_name`, `contact_title`, `business_type`,
+…) plus a `status` that advances live: `queued → crawled → guessed → verified
+→ done`. Open it in the Table Editor and watch it fill in. The run ends with:
 
 ```
 Live table:
-  https://supabase.com/dashboard/project/<ref>/editor  → open gmscrape_latest (this run)
-                                                          or gmscrape_table (every run)
+  run_2026_09_10_dentist_in_austin_tx - this run's table
+  https://supabase.com/dashboard/project/<ref>/editor
+  every run: gmscrape_table
 ```
 
-`gmscrape_latest` is the current run; `gmscrape_table` is every run, filterable
-by `run_label` ("dentist in austin tx · 2026-09-10"). Rows appear as `queued`
-the moment the run starts and advance in place: `queued → crawled → guessed →
-verified → done`. Re-running a query updates rows instead of duplicating them.
-Writes happen on a background thread and can never fail a scrape — errors are
-counted and reported. Use the **service_role** key; RLS stays on so the anon
-key can't read your leads. `--no-supabase` skips it for one run.
+The shared `gmscrape_table` keeps every run together (re-running a query
+updates rows there instead of duplicating them), so you have both: a table per
+run and a running database of your market. Writes happen on a background
+thread and can never fail a scrape — errors are counted and reported.
+`--no-supabase` skips it for one run; `SUPABASE_RUN_TABLES=false` keeps only
+the shared tables.
 
 ## Output
 
@@ -498,7 +503,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 181 tests, no network or API keys needed
+make test     # 188 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
