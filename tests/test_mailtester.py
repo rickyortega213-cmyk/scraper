@@ -35,6 +35,7 @@ class Api:
         responses: dict[str, dict],
         token: str | None = None,
         default: dict | None = None,
+        direct_key: str = "",            # a key the direct endpoint accepts ("" = token flow only)
     ) -> None:
         self.responses = responses
         self.default = default or {"code": "err"}
@@ -42,21 +43,28 @@ class Api:
         self.token_calls = 0
         self.verify_calls: list[str] = []
         self.reject_tokens: set[str] = set()
+        self.direct_key = direct_key
+        self.key_params: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.host == "token.mailtester.ninja":
             self.token_calls += 1
             return httpx.Response(200, json={"token": self.token})
         email = request.url.params.get("email", "")
-        supplied = request.url.params.get("token", "")
-        if supplied in self.reject_tokens:
-            return httpx.Response(401, json={"message": "token expired"})
+        if "key" in request.url.params:
+            self.key_params.append(request.url.params["key"])
+            if not self.direct_key or request.url.params["key"] != self.direct_key:
+                return httpx.Response(401, text="https://mailtester.ninja/subscribe")
+        else:
+            supplied = request.url.params.get("token", "")
+            if supplied in self.reject_tokens:
+                return httpx.Response(401, json={"message": "token expired"})
         self.verify_calls.append(email)
         return httpx.Response(200, json=self.responses.get(email, self.default))
 
 
-def make_verifier(api: Api) -> MailTesterNinja:
-    settings = Settings.from_env(mailtester_key="sub_test_key")
+def make_verifier(api: Api, key: str = "sub_test_key") -> MailTesterNinja:
+    settings = Settings.from_env(mailtester_key=key, mailtester_rate=0)
     verifier = MailTesterNinja(settings)
     verifier.client._client = httpx.Client(transport=httpx.MockTransport(api.handler))
     return verifier
@@ -146,8 +154,8 @@ def test_catch_all_probe_reads_the_domain():
 
 
 def test_a_refused_key_fails_fast_and_says_what_to_do():
-    """HTTP 401 from the token endpoint (body: a subscribe link) means the
-    subscription is dead. One clear error, no further network calls."""
+    """401 from both doors (body: a subscribe link) means the key is no good.
+    One clear error, no further network calls."""
     from gmscrape.providers.base import ProviderAuthError
 
     class Refusing(Api):
@@ -162,9 +170,71 @@ def test_a_refused_key_fails_fast_and_says_what_to_do():
     with pytest.raises(ProviderAuthError) as err:
         verifier.preflight()
     text = str(err.value)
-    assert "subscription is not active" in text and "https://mailtester.ninja/subscribe" in text
+    assert "https://mailtester.ninja/subscribe" in text and "curly braces" in text
     assert "scraper keys set MAILTESTER_KEY" in text
     for email in ("a@x.com", "b@x.com", "c@x.com"):
         with pytest.raises(ProviderAuthError):
             verifier.verify(email)
     assert api.token_calls == 1 and api.verify_calls == []     # never hammered again
+    assert api.key_params == ["sub_test_key", "{sub_test_key}"]  # both spellings were tried
+
+
+def test_direct_key_auth_is_used_when_the_service_accepts_it():
+    """The documented call: key= on every request, no token endpoint at all."""
+    api = Api({"a@x.com": {"code": "ok", "message": "Accepted"}}, direct_key="sub_test_key")
+    verifier = make_verifier(api)
+    verifier.preflight()
+    assert verifier.auth_mode == "direct"
+    assert verifier.verify("a@x.com").status == V_VALID
+    assert api.token_calls == 0
+    assert api.verify_calls == ["probe@example.com", "a@x.com"]   # one probe, then real work
+
+
+def test_key_pasted_with_braces_still_works():
+    api = Api({"a@x.com": {"code": "ok", "message": "Accepted"}}, direct_key="sub_test_key")
+    verifier = make_verifier(api, key="{sub_test_key}")
+    assert verifier.verify("a@x.com").status == V_VALID
+    assert verifier.auth_mode == "direct" and api.token_calls == 0
+
+
+def test_token_flow_is_the_fallback_when_direct_is_refused():
+    api = Api({"a@x.com": {"code": "ok", "message": "Accepted"}})     # no direct key accepted
+    verifier = make_verifier(api)
+    assert verifier.verify("a@x.com").status == V_VALID
+    assert verifier.auth_mode == "token" and api.token_calls == 1
+
+
+def test_rate_limited_answers_are_retried_not_recorded(monkeypatch):
+    """'Limited' or HTTP 429 means slow down - never a verdict on the address."""
+    from gmscrape.providers.verify import mailtester as M
+
+    naps: list[float] = []
+    monkeypatch.setattr(M.time, "sleep", lambda s: naps.append(s))
+    answers = iter([
+        httpx.Response(429, text="slow down"),
+        httpx.Response(200, json={"code": "mb", "message": "Limited"}),
+        httpx.Response(200, json={"code": "ok", "message": "Accepted"}),
+    ])
+
+    class Throttling(Api):
+        def handler(self, request):
+            if "key" in request.url.params and request.url.params.get("email") == "probe@example.com":
+                return super().handler(request)
+            return next(answers)
+
+    api = Throttling({}, direct_key="sub_test_key")
+    result = make_verifier(api).verify("a@x.com")
+    # the HTTP client retries the 429 itself (its own backoff), then "Limited"
+    # is paused on by the adapter; neither answer became a verdict
+    assert result.status == V_VALID and len(naps) == 2 and naps[-1] == 2.0
+
+
+def test_rate_limiter_meters_calls_per_window():
+    from gmscrape.providers.verify.mailtester import RateLimiter
+
+    limiter = RateLimiter(3, window=0.4)
+    started = time.monotonic()
+    for _ in range(4):
+        limiter.wait()
+    assert time.monotonic() - started >= 0.3          # the fourth call waited for the window
+    assert RateLimiter(0).limit == 0                    # 0 = unmetered

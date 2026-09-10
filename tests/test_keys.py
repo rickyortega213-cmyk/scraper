@@ -202,7 +202,7 @@ def test_pasted_values_are_cleaned_and_checked():
     assert K.clean_value("MCP_MAPS_URL", '"https://mcp.scraper.tech/key/"') == "https://mcp.scraper.tech/key"
     assert K.clean_value("MAILTESTER_KEY", "  sub_x  ") == "sub_x"
     assert K.check_value("MAILTESTER_KEY", "sub_x") is None
-    assert "sub_" in K.check_value("MAILTESTER_KEY", "abc")
+    assert K.check_value("MAILTESTER_KEY", "abc") is None      # their keys come in more than one shape
     assert "ak_" in K.check_value("OPENWEBNINJA_KEY", "sub_x")
     assert "sbp_" in K.check_value("SUPABASE_KEY", "sbp_token")
     assert K.check_value("SUPABASE_KEY", "sb_secret_abc") is None

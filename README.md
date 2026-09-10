@@ -79,7 +79,7 @@ Press Enter to start, or type k to change keys:
 To load every key in one go (a new machine, a fresh install), skip the prompts:
 
 ```bash
-scraper keys set MCP_MAPS_URL=https://mcp.scraper.tech/YOURKEY MAILTESTER_KEY=sub_... OPENWEBNINJA_KEY=ak_... SUPABASE_URL=https://YOURPROJECT.supabase.co SUPABASE_KEY=...
+scraper keys set MCP_MAPS_URL=https://mcp.scraper.tech/YOURKEY MAILTESTER_KEY=... OPENWEBNINJA_KEY=ak_... SUPABASE_URL=https://YOURPROJECT.supabase.co SUPABASE_KEY=...
 ```
 
 From then on `scraper buddy` starts with them all on file and asks `keep it?
@@ -189,16 +189,21 @@ Vendor vocabularies (`deliverable`, `ok`, `accept_all`, `catch-all`, …) are
 normalized to `valid / invalid / risky / catch_all / disposable / unknown`.
 
 ```bash
-MAILTESTER_KEY=sub_...          # your MailTester Ninja subscription id
+MAILTESTER_KEY=...              # the key from mailtester.ninja's key page, exactly as shown
+MAILTESTER_RATE=5               # requests per 10 s your plan allows: 5 Starter, 11 Pro, 57 Ultimate
 ```
 
-MailTester Ninja's two-step flow is handled for you: the key is exchanged for a
-short-lived bearer token, the token is cached for its whole lifetime (read from
-its JWT `exp`), and it is re-fetched automatically when it lapses or the API
-rejects it mid-run. Their `code` values map as `ok` → valid, `ko` → invalid,
-`mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all. A key the service
-refuses (HTTP 401 pointing at their subscribe page: the subscription lapsed or
-the key is wrong) is caught **before** a run spends anything, and stops a run
+MailTester Ninja has two ways in and the program finds the one your key
+accepts: the documented direct call (`?email=…&key=…` on every request) is
+tried first, then the older token exchange (`token.mailtester.ninja`, the token
+cached until its JWT `exp` and re-fetched when it lapses). A key pasted with or
+without the curly braces their site shows works either way. Calls are metered
+to `MAILTESTER_RATE` per 10 seconds because the vendor bans accounts that
+exceed their plan's limit; a `Limited` answer or HTTP 429 is waited out and
+retried, never recorded as a verdict. Their `code` values map as `ok` → valid,
+`ko` → invalid, `mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all. A
+key the service refuses both ways (HTTP 401 pointing at their subscribe page)
+is caught **before** a run spends anything, and stops a run
 in progress resumably instead of logging one failure per address; an `ok` whose
 message reveals a catch-all domain is downgraded rather than sold as
 deliverable. An unrecognized code becomes `unknown`, never `valid` — the raw
@@ -605,7 +610,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 220 tests, no network or API keys needed
+make test     # 226 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

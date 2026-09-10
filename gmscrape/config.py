@@ -83,6 +83,8 @@ class Settings:
     mcp_maps_args: str = ""           # JSON template overriding the argument mapping
 
     mailtester_key: str = ""
+    mailtester_auth: str = "auto"     # auto | direct (key= on every call) | token (exchange first)
+    mailtester_rate: int = 5          # requests per 10 s: 5 Starter, 11 Pro, 57 Ultimate; 0 = no limit
     millionverifier_key: str = ""
     zerobounce_key: str = ""
     neverbounce_key: str = ""

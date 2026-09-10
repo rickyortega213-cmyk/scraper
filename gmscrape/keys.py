@@ -50,7 +50,8 @@ KEY_FIELDS: tuple[KeyField, ...] = (
              "path to the JSON written by `gmscrape probe-maps --write` (e.g. scraper.tech)",
              "maps", secret=False),
     KeyField("MAPS_API_KEY", "Custom maps API key", "the key for the config file above", "maps"),
-    KeyField("MAILTESTER_KEY", "MailTester Ninja key", "your sub_... subscription id", "verify"),
+    KeyField("MAILTESTER_KEY", "MailTester Ninja key",
+             "from mailtester.ninja's key page, exactly as shown", "verify"),
     KeyField("MILLIONVERIFIER_KEY", "MillionVerifier key", "app.millionverifier.com/api", "verify"),
     KeyField("ZEROBOUNCE_KEY", "ZeroBounce key", "zerobounce.net/members/apikey", "verify"),
     KeyField("NEVERBOUNCE_KEY", "NeverBounce key", "app.neverbounce.com/settings/api", "verify"),
@@ -241,8 +242,6 @@ def check_value(env: str, value: str) -> Optional[str]:
                 "a copy/paste went wrong; copy it again from the provider's dashboard")
     if env == "MCP_MAPS_URL" and "mcp.scraper.tech/" not in v:
         return "expected a link like https://mcp.scraper.tech/<your key>"
-    if env == "MAILTESTER_KEY" and not v.startswith("sub_"):
-        return "MailTester Ninja keys start with sub_"
     if env == "OPENWEBNINJA_KEY" and not v.startswith("ak_"):
         return "OpenWeb Ninja keys start with ak_"
     if env == "SUPABASE_URL" and not v.endswith(".supabase.co"):
