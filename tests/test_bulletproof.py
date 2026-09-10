@@ -15,7 +15,7 @@ from gmscrape.config import Settings
 from gmscrape.models import VerificationResult, V_UNKNOWN, V_VALID
 from gmscrape.store.db import Store
 from gmscrape.store.supabase import (
-    SupabaseConfig, SupabaseError, SupabaseSink, _statements, ensure_schema, exec_function_sql,
+    SupabaseConfig, SupabaseSink, _statements, ensure_schema, exec_function_sql,
     runner_installed,
 )
 
@@ -51,7 +51,7 @@ class _Project(http.server.BaseHTTPRequestHandler):
                                        "create index if not exists", "create or replace view")):
                 return self._send(400, {"message": "gmscrape_exec only manages gmscrape_* objects"})
             if lowered.startswith("create table if not exists "):
-                self.tables.add(lowered.split()[4].strip("("))
+                self.tables.add(lowered.split()[5].strip("("))
             return self._send(204, [])
         return self._send(201, [])
 

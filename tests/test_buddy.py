@@ -114,7 +114,7 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
     monkeypatch.setattr("gmscrape.cli.cmd_run", fake_run)
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
     script = Script(
-        "", "", "", "",                          # keep / skip every key
+        "", "", "", "", "",                      # keep / skip every key
         "dentist in austin tx", "plumber in miami fl", "",   # searches
         "25",                                    # businesses per search
         "",                                      # Start? -> yes

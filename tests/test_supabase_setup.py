@@ -275,8 +275,8 @@ def test_token_alone_counts_as_configured():
     assert not Settings.from_env().supabase_configured
 
 
-def test_buddy_asks_only_for_the_token():
+def test_buddy_asks_for_project_url_and_key_only():
     from gmscrape.buddy import BUDDY_KEYS
 
     supabase = [k for k in BUDDY_KEYS if "supabase" in k.env.lower()]
-    assert [k.env for k in supabase] == ["SUPABASE_ACCESS_TOKEN"]
+    assert [k.env for k in supabase] == ["SUPABASE_URL", "SUPABASE_KEY"]
