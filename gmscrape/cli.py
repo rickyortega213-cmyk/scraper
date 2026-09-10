@@ -163,8 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="also allow generic info@/contact@ guesses on chain domains (off by default)")
 
     live = run.add_argument_group("live lead table")
+    live.add_argument("--no-supabase", dest="supabase", action="store_false", default=None,
+                      help="don't mirror this run into Supabase (on by default when keys are saved)")
     live.add_argument("--supabase", dest="supabase", action="store_true", default=None,
-                      help="mirror leads into Supabase as the run progresses")
+                      help=argparse.SUPPRESS)
     live.add_argument("--supabase-prefix", dest="supabase_prefix",
                       help="table name prefix (default gmscrape_)")
 
@@ -425,8 +427,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         paths = export_results(
             report.results, settings.out_dir,
             basename=args.basename, formats=settings.export_formats,
+            run_date=_today(),
         )
     _print_report(report, paths)
+    _print_final_table(report)
+    _print_supabase_link(settings, report)
     return 0
 
 
@@ -448,8 +453,11 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         paths = export_results(
             report.results, settings.out_dir,
             basename=args.basename, formats=settings.export_formats,
+            run_date=_today(),
         )
     _print_report(report, paths)
+    _print_final_table(report)
+    _print_supabase_link(settings, report)
     return 0
 
 
@@ -625,24 +633,39 @@ def cmd_probe_maps(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_sinks(settings: Settings) -> list:
-    """The live sinks a run should publish to, based on configuration."""
-    if not settings.supabase:
-        return []
-    from .store.supabase import SupabaseConfig, SupabaseSink
+def supabase_config(settings: Settings):
+    from .store.supabase import SupabaseConfig
 
-    if not settings.supabase_configured:
-        echo("[yellow]--supabase given but SUPABASE_URL / SUPABASE_KEY are not set;"
-             " continuing without it.[/yellow]")
-        return []
-    config = SupabaseConfig(
+    return SupabaseConfig(
         url=settings.supabase_url,
         key=settings.supabase_key,
         schema=settings.supabase_schema,
         prefix=settings.supabase_prefix,
+        access_token=settings.supabase_access_token,
     )
-    echo(f"live table: [green]{settings.supabase_url}[/green] "
-         f"({config.table('leads')})")
+
+
+def build_sinks(settings: Settings) -> list:
+    """The live sinks a run should publish to. Supabase is on whenever its
+    keys are saved; the tables are created on first use when possible."""
+    if not settings.supabase or not settings.supabase_configured:
+        return []
+    from .store.supabase import SupabaseError, SupabaseSink, ensure_schema
+
+    config = supabase_config(settings)
+    try:
+        ready, detail = ensure_schema(config)
+    except SupabaseError as exc:
+        echo(f"[yellow]Supabase: {exc}[/yellow]")
+        echo("[yellow]continuing without the live table[/yellow]")
+        return []
+    if not ready:
+        echo(f"[yellow]Supabase: {detail}[/yellow]")
+        echo("[yellow]continuing without the live table[/yellow]")
+        return []
+    if detail != "tables present":
+        echo(f"Supabase: [green]{detail}[/green]")
+    echo(f"live table: [green]{config.table_editor_url or settings.supabase_url}[/green]")
     return [SupabaseSink(config)]
 
 
@@ -666,7 +689,7 @@ def cmd_supabase_init(args: argparse.Namespace) -> int:
 
 
 def cmd_supabase_check(args: argparse.Namespace) -> int:
-    from .store.supabase import SupabaseConfig, SupabaseError, check_connection
+    from .store.supabase import SupabaseError, check_connection
 
     settings = settings_from_args(args)
     if not settings.supabase_configured:
@@ -674,18 +697,24 @@ def cmd_supabase_check(args: argparse.Namespace) -> int:
         echo("Add them to .env, then re-run. The service_role key is the one to use "
              "for writes from your own machine.")
         return 2
-    config = SupabaseConfig(
-        url=settings.supabase_url, key=settings.supabase_key,
-        schema=settings.supabase_schema, prefix=settings.supabase_prefix,
-    )
+    from .store.supabase import ensure_schema
+
+    config = supabase_config(settings)
     try:
-        tables = check_connection(config)
+        ready, detail = ensure_schema(config)
+        if ready:
+            tables = check_connection(config)
+        else:
+            echo(f"[yellow]{detail}[/yellow]")
+            return 1
     except SupabaseError as exc:
         echo(f"[red]{exc}[/red]")
         return 1
     _print_table("Supabase", ("table", "status"), list(tables.items()))
-    echo(f"[green]✓[/green] ready — run with [cyan]--supabase[/cyan] to stream leads into "
-         f"[bold]{config.table('table')}[/bold]")
+    if detail != "tables present":
+        echo(f"[green]{detail}[/green]")
+    echo(f"[green]✓[/green] ready — every run now streams into "
+         f"[bold]{config.table('table')}[/bold]  ({config.table_editor_url or settings.supabase_url})")
     return 0
 
 
@@ -888,6 +917,56 @@ def _print_table(title: str, columns: Sequence[str], rows: Sequence[Sequence[str
     _console.print(table)
 
 
+def _today() -> str:
+    from datetime import date
+
+    return date.today().isoformat()
+
+
+MAX_TERMINAL_ROWS = 200
+
+
+def _print_final_table(report: RunReport) -> None:
+    """The finished leads, as they appear in the CSV."""
+    from .store.export import clean_rows
+
+    rows = [row for r in report.results for row in clean_rows(r, _today())]
+    if not rows:
+        return
+    shown = rows[:MAX_TERMINAL_ROWS]
+    _print_table(
+        f"Leads ({len(rows)} row{'s' if len(rows) != 1 else ''})",
+        ("Company", "City", "State", "Phone", "Verified Email", "First", "Last",
+         "Title", "Business Type"),
+        [
+            (
+                r["company_name"], r["city"], r["state"], r["phone_number"],
+                r["verified_email"] or (f"[dim]{r['email']}[/dim]" if r["email"] else ""),
+                r["contact_first_name"], r["contact_last_name"], r["contact_title"],
+                r["business_type"],
+            )
+            for r in shown
+        ],
+    )
+    if len(rows) > len(shown):
+        echo(f"[dim]… {len(rows) - len(shown)} more rows in the CSV[/dim]")
+
+
+def _print_supabase_link(settings: Settings, report: RunReport) -> None:
+    if not report.sinks:
+        return
+    config = supabase_config(settings)
+    sink = report.sinks[0]
+    if getattr(sink, "stats", None) and sink.stats.failures and not sink.stats.leads_written:
+        return
+    echo("")
+    echo("[bold]Live table:[/bold]")
+    if config.table_editor_url:
+        echo(f"  {config.table_editor_url}  → open [cyan]{config.table('latest')}[/cyan] "
+             f"(this run) or [cyan]{config.table('table')}[/cyan] (every run)")
+    echo(f"  this run: [dim]select * from {config.table('table')} where run_id = '{report.run_id}'[/dim]")
+
+
 def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
     stats = report.stats()
     _print_table(
@@ -912,18 +991,7 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
         for path in paths:
             echo(f"  • [green]{path}[/green]")
 
-    rows = []
-    for r in report.results:
-        for c in r.lead_contacts():
-            rows.append((
-                r.place.name[:30],
-                c.contact_type + (f" · {c.contact_name}" if c.contact_name else ""),
-                c.email, c.source, c.status, str(c.confidence),
-            ))
-        if len(rows) >= 12:
-            break
-    if rows:
-        _print_table("Sample leads", ("business", "contact", "email", "source", "status", "conf"), rows)
+    return
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

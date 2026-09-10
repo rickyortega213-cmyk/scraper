@@ -351,75 +351,57 @@ keeps them but skips the person lookup.
 
 ## Live lead table in Supabase
 
-Watch leads fill in while the run is still going, Clay-style, instead of
-waiting for a CSV at the end.
+Every run streams into a Clay-style table you can watch fill in, and the
+finished rows stay there as a running database of your market.
 
 ```bash
-gmscrape supabase-init --write supabase_schema.sql   # paste into the SQL editor
-# add SUPABASE_URL + SUPABASE_KEY (service_role) to .env
-gmscrape supabase-check                              # verifies key + tables
-gmscrape run "dentist in austin tx" -n 5 --supabase
+gmscrape setup --only supabase       # paste Project URL + service_role key (+ optional access token)
+gmscrape run "dentist in austin tx"  # that's it - Supabase is on whenever keys are saved
 ```
 
-Every business is written and flushed **before** any slow work starts, so the
-table is fully populated the moment the run begins. Each row's `status` then
-advances in place as the pipeline works on it:
+The tables are created for you on first use when a Supabase **access token**
+(`sbp_…`, from supabase.com/dashboard/account/tokens) is saved; without one,
+the run tells you exactly where to paste `gmscrape supabase-init`. Each run
+ends with the link:
 
 ```
-queued  ─▶  crawled  ─▶  guessed  ─▶  verified  ─▶  done
+Live table:
+  https://supabase.com/dashboard/project/<ref>/editor  → open gmscrape_latest (this run)
+                                                          or gmscrape_table (every run)
 ```
 
-```
-[table] {d1: crawled, d2: crawled, d3: crawled, d4: queued}
-[table] {d1: done,    d2: done,    d3: crawled, d4: crawled}
-```
-
-Three tables and two views are created:
-
-| Object | What's in it |
-|---|---|
-| `gmscrape_leads` | one row per business — best email, confidence, status, chain flags, crawl diagnostics |
-| `gmscrape_emails` | one row per address — source, verification status, provider, confidence |
-| `gmscrape_runs` | one row per run — queries, providers, final stats |
-| `gmscrape_table` | the lead view, columns ordered the way you actually read them, best-first |
-| `gmscrape_progress` | live counts per run and status |
-
-Rows are keyed by the same identity the deduplicator uses (place ID, then
-domain, then phone), so **re-running a query updates rows instead of
-duplicating them** — the table becomes a running database of your market, not
-an append-only log.
-
-Writes go through PostgREST, so there's no extra dependency, and they happen on
-a background thread — the crawler is never blocked waiting on a database. A
-Supabase outage can't cost you a scrape either: failures are counted and
-reported at the end, never raised.
-
-```
-supabase: 20 leads, 18 emails in 11 request(s)
-```
-
-Use the **service_role** key. It's server-side only and bypasses RLS; the
-schema leaves RLS enabled so the anon key can't read your leads. Add your own
-policies if you want to expose the table to a front end.
+`gmscrape_latest` is the current run; `gmscrape_table` is every run, filterable
+by `run_label` ("dentist in austin tx · 2026-09-10"). Rows appear as `queued`
+the moment the run starts and advance in place: `queued → crawled → guessed →
+verified → done`. Re-running a query updates rows instead of duplicating them.
+Writes happen on a background thread and can never fail a scrape — errors are
+counted and reported. Use the **service_role** key; RLS stays on so the anon
+key can't read your leads. `--no-supabase` skips it for one run.
 
 ## Output
 
-`out/leads.csv` — one row per business (best email + counts + chain flags +
-crawl diagnostics), `out/leads_emails.csv` — one row per address, ready to
-import into a sending tool. Plus `leads.json`, `leads.jsonl`, `leads.xlsx`
-(two filtered, frozen-header sheets), and everything in SQLite.
+The run ends with the finished table in the terminal and `out/leads.csv` —
+the same rows, title-cased, one per contact:
+
+| company_name | city | state | address | phone_number | verified_email | contact_first_name | contact_last_name | contact_title | business_type |
+|---|---|---|---|---|---|---|---|---|---|
+| Hill Country Landscaping | Austin | TX | 9 Elm St, Austin, TX 78701 | (512)-555-0190 | maria.lopez@hillcountrylandscaping.com | Maria | Lopez | Owner | Landscaper |
+| Hill Country Landscaping | Austin | TX | 9 Elm St, Austin, TX 78701 | (512)-555-0190 | info@hillcountrylandscaping.com | | | | Landscaper |
+| Walmart Supercenter | Austin | TX | … | (512)-555-0001 | dana.whitfield@walmart.com | Dana | Whitfield | Store Manager | Department Store |
+
+Plus `contact_type`, `email` (best candidate even when unverified),
+`email_status`, `email_confidence`, `website`, `google_maps_link`, `rating`,
+`reviews`, `is_chain`, `search_query`, `run_date`. `verified_email` is filled
+only when a verifier confirmed the mailbox exists.
+
+Also written: `leads_detailed.csv` (every diagnostic column — crawl status,
+sources, chain reasons, why no guess was made), `leads_emails.csv` (every
+address considered and why it was kept or dropped), and `leads.json` /
+`.jsonl` / `.xlsx` on request (`--format all`).
 
 Every address carries a **confidence 0-100** blending provenance, verification
 and context, so a `mailto:` beats a guess and an unverified guess can never
-outrank a scraped address:
-
-```
-office@joesplumbing.com      mailto              valid   93
-joe.plumber1972@gmail.com    html_text           valid   74   personal mailbox
-dispatch@joesplumbing.com    obfuscated          risky   58
-info@bluebonnetroofing.com   permutation         valid   50   guessed
-sales@bluebonnetroofing.com  permutation         invalid  —   dropped
-```
+outrank a scraped address.
 
 ## Commands
 
@@ -457,7 +439,7 @@ Useful flags on `run`:
 --no-owners            skip owner lookup and owner-address guessing
 --no-owner-search      find owners on the site only, never via web search
 --allow-unverified-guesses   let unverified guesses become lead rows
---supabase             mirror leads into Supabase live as the run progresses
+--no-supabase          skip the live table for this run
 ```
 
 ## Re-runs are cheap
@@ -482,7 +464,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 136 tests, no network or API keys needed
+make test     # 164 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

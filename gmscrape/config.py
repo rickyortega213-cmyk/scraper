@@ -154,7 +154,8 @@ class Settings:
     supabase_key: str = ""
     supabase_schema: str = "public"
     supabase_prefix: str = "gmscrape_"
-    supabase: bool = False
+    supabase_access_token: str = ""      # Management API token: lets us create the tables
+    supabase: bool = True                # on whenever URL + key are configured
 
     # --- output / storage --------------------------------------------------
     db_path: str = "out/gmscrape.sqlite"

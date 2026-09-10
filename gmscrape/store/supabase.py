@@ -68,10 +68,29 @@ class SupabaseConfig:
     schema: str = "public"
     prefix: str = "gmscrape_"
     timeout: float = 20.0
+    access_token: str = ""      # Management API token (sbp_...) - lets us create tables
 
     @property
     def rest_url(self) -> str:
         return self.url.rstrip("/") + "/rest/v1"
+
+    @property
+    def project_ref(self) -> str:
+        """'https://abcdefgh.supabase.co' -> 'abcdefgh'"""
+        host = self.url.replace("https://", "").replace("http://", "").split("/")[0]
+        return host.split(".")[0] if host.endswith(".supabase.co") else ""
+
+    @property
+    def dashboard_url(self) -> str:
+        return f"https://supabase.com/dashboard/project/{self.project_ref}" if self.project_ref else ""
+
+    @property
+    def table_editor_url(self) -> str:
+        return f"{self.dashboard_url}/editor" if self.dashboard_url else ""
+
+    @property
+    def sql_editor_url(self) -> str:
+        return f"{self.dashboard_url}/sql/new" if self.dashboard_url else ""
 
     def table(self, name: str) -> str:
         return f"{self.prefix}{name}"
@@ -109,8 +128,10 @@ class SupabaseSink:
     # --- public API --------------------------------------------------------
     def start_run(self, run_id: str, meta: dict[str, Any]) -> None:
         self._run_id = run_id
+        self._run_label = run_label(meta.get("queries", []))
         self._enqueue("runs", [{
             "run_id": run_id,
+            "run_label": self._run_label,
             "started_at": _now(),
             "queries": meta.get("queries", []),
             "maps_provider": meta.get("maps_provider", ""),
@@ -121,7 +142,10 @@ class SupabaseSink:
     def upsert(self, results: Sequence[BusinessResult], status: str) -> None:
         if not results:
             return
-        leads = [rec for r in results for rec in lead_records(r, self._run_id, status)]
+        leads = [
+            {**rec, "run_label": getattr(self, "_run_label", "")}
+            for r in results for rec in lead_records(r, self._run_id, status)
+        ]
         self._enqueue("leads", leads)
         # Only publish addresses once they exist; `queued` rows have none yet.
         emails = [rec for r in results for rec in email_records(r, self._run_id)]
@@ -231,6 +255,87 @@ class SupabaseSink:
         log.warning("supabase write failed (%d rows): %s", rows, detail)
 
 
+def run_label(queries: list[str]) -> str:
+    """'dentist in austin tx · 2026-09-10' (+ N more) - how a run shows in the table."""
+    from datetime import date
+
+    queries = [q for q in queries if q and q != "*"]
+    head = queries[0] if queries else "enrich"
+    extra = f" +{len(queries) - 1} more" if len(queries) > 1 else ""
+    return f"{head}{extra} · {date.today().isoformat()}"
+
+
+MANAGEMENT_API = "https://api.supabase.com/v1/projects/{ref}/database/query"
+
+
+def missing_tables(config: SupabaseConfig) -> list[str]:
+    """Which of our tables do not exist yet (empty list = ready)."""
+    missing: list[str] = []
+    with httpx.Client(timeout=config.timeout) as client:
+        for table in ("runs", "leads", "emails"):
+            url = f"{config.rest_url}/{config.table(table)}"
+            try:
+                response = client.get(url, params={"select": "*", "limit": 1},
+                                      headers=config.headers())
+            except Exception as exc:
+                raise SupabaseError(f"could not reach {url}: {exc}") from exc
+            if response.status_code in (401, 403):
+                raise SupabaseError(
+                    f"Supabase rejected the key (HTTP {response.status_code}). Use the "
+                    "service_role key from Project Settings → API."
+                )
+            if response.status_code == 404 or (
+                response.status_code == 400 and "does not exist" in response.text
+            ):
+                missing.append(config.table(table))
+    return missing
+
+
+def apply_schema(config: SupabaseConfig, sql: str) -> None:
+    """Create the tables through the Management API (needs an access token)."""
+    if not config.access_token:
+        raise SupabaseError("no SUPABASE_ACCESS_TOKEN - cannot create tables automatically")
+    if not config.project_ref:
+        raise SupabaseError(f"cannot work out the project ref from {config.url}")
+    url = MANAGEMENT_API.format(ref=config.project_ref)
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            url, json={"query": sql},
+            headers={"Authorization": f"Bearer {config.access_token}",
+                     "Content-Type": "application/json"},
+        )
+    if response.status_code >= 400:
+        raise SupabaseError(
+            f"Management API refused to run the schema (HTTP {response.status_code}): "
+            f"{response.text[:300]}"
+        )
+
+
+def ensure_schema(config: SupabaseConfig) -> tuple[bool, str]:
+    """Make sure the tables exist. Returns (ready, what_happened).
+
+    Creates them through the Management API when an access token is saved;
+    otherwise explains exactly where to paste the SQL.
+    """
+    missing = missing_tables(config)
+    if not missing:
+        return True, "tables present"
+    sql = schema_sql(config.prefix)
+    if config.access_token:
+        apply_schema(config, sql)
+        still = missing_tables(config)
+        if still:
+            raise SupabaseError(f"schema applied but tables still missing: {', '.join(still)}")
+        return True, f"created {', '.join(missing)}"
+    return False, (
+        f"tables missing: {', '.join(missing)}. Either save a Supabase access token "
+        "(`gmscrape setup --only supabase`; make one at "
+        "https://supabase.com/dashboard/account/tokens) so they can be created for "
+        "you, or paste `gmscrape supabase-init` into "
+        f"{config.sql_editor_url or 'the SQL editor'} and run it."
+    )
+
+
 def _dedupe_by_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """PostgREST rejects a batch containing the same key twice - keep the last."""
     seen: dict[str, dict[str, Any]] = {}
@@ -291,6 +396,7 @@ def schema_sql(prefix: str = "gmscrape_") -> str:
 
 create table if not exists {p}runs (
     run_id          text primary key,
+    run_label       text,
     started_at      timestamptz,
     finished_at     timestamptz,
     queries         jsonb,
@@ -305,7 +411,18 @@ create table if not exists {p}leads (
     id                          text primary key,
     business_id                 text,
     run_id                      text,
+    run_label                   text,
     status                      text,
+    -- clean, human-facing columns (title case, (956)-324-6856 phones)
+    company_name                text,
+    city_clean                  text,
+    state_clean                 text,
+    address_clean               text,
+    phone_number                text,
+    verified_email              text,
+    contact_first_name          text,
+    contact_last_name           text,
+    business_type               text,
     contact_type                text,
     contact_name                text,
     contact_title               text,
@@ -382,28 +499,36 @@ create index if not exists {p}leads_contact_idx  on {p}leads(contact_type);
 create index if not exists {p}emails_lead_idx    on {p}emails(lead_id);
 create index if not exists {p}emails_status_idx  on {p}emails(status);
 
--- The lead view, ordered the way you actually read it.
+-- The table you read: clean columns first, one row per contact.
 create or replace view {p}table as
 select
-    status,
-    name              as business,
-    contact_type,
-    contact_name,
+    company_name,
+    city_clean          as city,
+    state_clean         as state,
+    address_clean       as address,
+    phone_number,
+    verified_email,
+    contact_first_name,
+    contact_last_name,
     contact_title,
+    business_type,
+    contact_type,
     email,
     email_status,
-    email_confidence  as confidence,
-    email_source      as found_via,
-    phone, website, website_source, city, state, category,
-    reviews, rating,
+    email_confidence,
+    website,
+    google_url          as google_maps_link,
+    rating, reviews,
     is_chain,
-    owner_name, owner_title, owner_source,
-    emails_found, emails_guessed,
-    website_status,
-    permutations_skipped_reason as no_guess_reason,
-    query, run_id, domain, all_emails, updated_at
+    status,
+    run_label, run_id, query, updated_at
 from {p}leads
-order by name, contact_type desc, email_confidence desc nulls last;
+order by run_label desc, company_name, contact_type desc;
+
+-- Only the most recent run - the "current table".
+create or replace view {p}latest as
+select * from {p}table
+where run_id = (select run_id from {p}runs order by started_at desc limit 1);
 
 -- Live progress: how far the current run has got.
 create or replace view {p}progress as
@@ -417,6 +542,17 @@ group by run_id, status
 order by run_id, status;
 
 -- Upgrading from an earlier schema? These are safe to run on existing tables.
+alter table {p}runs   add column if not exists run_label text;
+alter table {p}leads  add column if not exists run_label text;
+alter table {p}leads  add column if not exists company_name text;
+alter table {p}leads  add column if not exists city_clean text;
+alter table {p}leads  add column if not exists state_clean text;
+alter table {p}leads  add column if not exists address_clean text;
+alter table {p}leads  add column if not exists phone_number text;
+alter table {p}leads  add column if not exists verified_email text;
+alter table {p}leads  add column if not exists contact_first_name text;
+alter table {p}leads  add column if not exists contact_last_name text;
+alter table {p}leads  add column if not exists business_type text;
 alter table {p}leads  add column if not exists business_id text;
 alter table {p}leads  add column if not exists contact_type text;
 alter table {p}leads  add column if not exists contact_name text;

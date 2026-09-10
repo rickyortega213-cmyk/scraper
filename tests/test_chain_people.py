@@ -311,7 +311,7 @@ def test_two_managers_with_equal_support_means_none(run):
 def test_chain_rows_are_labelled_by_contact_type(run, tmp_path):
     report, _, settings = run
     paths = export_results(report.results, settings.out_dir, formats=["csv"])
-    rows = list(csv.DictReader(next(p for p in paths if p.name == "leads.csv").open(encoding="utf-8-sig")))
+    rows = list(csv.DictReader(next(p for p in paths if p.name == "leads_detailed.csv").open(encoding="utf-8-sig")))
     by_name = {(r["name"], r["contact_type"]): r for r in rows}
     walmart = by_name[("Walmart Supercenter #1234", "manager")]
     assert walmart["is_chain"] == "yes" and walmart["contact_name"] == "Dana Whitfield"

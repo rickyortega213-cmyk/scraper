@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from ..models import BusinessResult
-from .export import email_rows, lead_rows
+from .export import clean_rows, email_rows, lead_rows
 
 # Status values, in the order a lead moves through them.
 STATUS_QUEUED = "queued"
@@ -60,13 +60,23 @@ def lead_records(result: BusinessResult, run_id: str, status: str) -> list[dict[
         return None if value == "" else value
 
     records: list[dict[str, Any]] = []
-    for row in lead_rows(result):
+    for row, clean in zip(lead_rows(result), clean_rows(result)):
         contact_type = row["contact_type"] or "general"
         records.append({
             "id": f"{parent}|{contact_type}",
             "business_id": parent,
             "run_id": run_id,
             "status": status,
+            # --- the clean, human-facing columns (title case, formatted phone)
+            "company_name": clean["company_name"],
+            "city_clean": blank_to_none(clean["city"]),
+            "state_clean": blank_to_none(clean["state"]),
+            "address_clean": blank_to_none(clean["address"]),
+            "phone_number": blank_to_none(clean["phone_number"]),
+            "verified_email": blank_to_none(clean["verified_email"]),
+            "contact_first_name": blank_to_none(clean["contact_first_name"]),
+            "contact_last_name": blank_to_none(clean["contact_last_name"]),
+            "business_type": blank_to_none(clean["business_type"]),
             "contact_type": contact_type,
             "contact_name": blank_to_none(row["contact_name"]),
             "contact_title": blank_to_none(row["contact_title"]),

@@ -190,7 +190,7 @@ def test_owner_found_by_search_and_mailbox_guessed(run):
 def test_two_rows_when_both_general_and_owner_exist(run, tmp_path):
     report, _, settings = run
     paths = export_results(report.results, settings.out_dir, formats=["csv"])
-    rows = list(csv.DictReader(next(p for p in paths if p.name == "leads.csv").open(encoding="utf-8-sig")))
+    rows = list(csv.DictReader(next(p for p in paths if p.name == "leads_detailed.csv").open(encoding="utf-8-sig")))
     hcl = [r for r in rows if r["name"] == "Hill Country Landscaping"]
     assert len(hcl) == 2
     by_type = {r["contact_type"]: r for r in hcl}

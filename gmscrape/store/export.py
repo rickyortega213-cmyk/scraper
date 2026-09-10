@@ -13,10 +13,21 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..models import BusinessResult
+from ..format import clean_state, format_phone, smart_title, split_name
+from ..models import BusinessResult, V_VALID
 
-# One row per contact (general inbox and/or owner). Everything about the
-# business repeats on each of its rows; only the contact columns differ.
+# The table people actually read. One row per contact; title-cased; phone
+# as (956)-324-6856. `verified_email` is filled only when a verifier said the
+# mailbox exists; `email` always shows the best candidate.
+CLEAN_COLUMNS = (
+    "company_name", "city", "state", "address", "phone_number", "verified_email",
+    "contact_first_name", "contact_last_name", "contact_title", "business_type",
+    "contact_type", "email", "email_status", "email_confidence", "website",
+    "google_maps_link", "rating", "reviews", "is_chain", "search_query", "run_date",
+)
+
+# Everything, one row per contact (general inbox and/or owner). Business
+# columns repeat on each of a business's rows; only the contact columns differ.
 LEAD_COLUMNS = (
     "name", "query", "category", "contact_type", "contact_name", "contact_title",
     "email", "email_source", "email_status", "email_confidence",
@@ -113,6 +124,73 @@ def lead_rows(result: BusinessResult) -> list[dict[str, Any]]:
     return rows
 
 
+def clean_rows(result: BusinessResult, run_date: str = "") -> list[dict[str, Any]]:
+    """The client-facing rows for one business."""
+    place = result.place
+    address = smart_title(place.address or ", ".join(
+        p for p in (place.street, place.city, place.state, place.postal_code) if p
+    ))
+    city = smart_title(place.city) or _city_from(address)
+    base = {
+        "company_name": smart_title(place.name),
+        "city": city,
+        "state": clean_state(place.state) or _state_from(address),
+        "address": address,
+        "phone_number": format_phone(place.phone),
+        "business_type": smart_title(place.category) or smart_title(_query_type(place.query)),
+        "website": place.website,
+        "google_maps_link": place.google_url,
+        "rating": place.rating if place.rating is not None else "",
+        "reviews": place.reviews if place.reviews is not None else "",
+        "is_chain": "Yes" if result.is_chain else "No",
+        "search_query": place.query,
+        "run_date": run_date,
+    }
+    contacts = result.lead_contacts()
+    if not contacts:
+        return [{**base, "verified_email": "", "contact_first_name": "", "contact_last_name": "",
+                 "contact_title": "", "contact_type": "", "email": "", "email_status": "",
+                 "email_confidence": ""}]
+    rows: list[dict[str, Any]] = []
+    for candidate in contacts:
+        first, last = split_name(candidate.contact_name)
+        rows.append({
+            **base,
+            "verified_email": candidate.email if candidate.status == V_VALID else "",
+            "contact_first_name": first,
+            "contact_last_name": last,
+            "contact_title": smart_title(candidate.contact_title),
+            "contact_type": smart_title(candidate.contact_type),
+            "email": candidate.email,
+            "email_status": candidate.status,
+            "email_confidence": candidate.confidence,
+        })
+    return rows
+
+
+def _query_type(query: str) -> str:
+    from ..query import parse_query
+
+    try:
+        return parse_query(query).business_type if query else ""
+    except ValueError:
+        return ""
+
+
+def _city_from(address: str) -> str:
+    from ..util import city_from_address
+
+    return smart_title(city_from_address(address))
+
+
+def _state_from(address: str) -> str:
+    import re
+
+    match = re.search(r",\s*([A-Za-z]{2})(?:\s+\d{5}(?:-\d{4})?)?(?:,\s*(?:USA|US|United States))?\s*$",
+                      address or "")
+    return match.group(1).upper() if match else ""
+
+
 def email_rows(result: BusinessResult) -> list[dict[str, Any]]:
     place = result.place
     rows: list[dict[str, Any]] = []
@@ -203,8 +281,14 @@ def export_results(
     *,
     basename: str = "leads",
     formats: Sequence[str] = ("csv", "json"),
+    run_date: str = "",
 ) -> list[Path]:
-    """Write every requested format; returns the paths written."""
+    """Write every requested format; returns the paths written.
+
+    `<basename>.csv` is the clean table (title case, formatted phone, first /
+    last name). `<basename>_detailed.csv` has every diagnostic column and
+    `<basename>_emails.csv` every address considered.
+    """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -212,13 +296,17 @@ def export_results(
     if "all" in formats:
         formats = ["csv", "json", "jsonl", "xlsx"]
 
+    clean = [row for r in results for row in clean_rows(r, run_date)]
     leads = [row for r in results for row in lead_rows(r)]
     emails = [row for r in results for row in email_rows(r)]
 
     if "csv" in formats:
         path = directory / f"{basename}.csv"
-        _write_csv(path, LEAD_COLUMNS, leads)
+        _write_csv(path, CLEAN_COLUMNS, clean)
         written.append(path)
+        detailed_path = directory / f"{basename}_detailed.csv"
+        _write_csv(detailed_path, LEAD_COLUMNS, leads)
+        written.append(detailed_path)
         email_path = directory / f"{basename}_emails.csv"
         _write_csv(email_path, EMAIL_COLUMNS, emails)
         written.append(email_path)
@@ -239,7 +327,7 @@ def export_results(
         written.append(path)
 
     if "xlsx" in formats:
-        path = _write_xlsx(directory / f"{basename}.xlsx", leads, emails)
+        path = _write_xlsx(directory / f"{basename}.xlsx", clean, leads, emails)
         if path is not None:
             written.append(path)
 
@@ -247,7 +335,8 @@ def export_results(
 
 
 def _write_xlsx(
-    path: Path, leads: list[dict[str, Any]], emails: list[dict[str, Any]]
+    path: Path, clean: list[dict[str, Any]], leads: list[dict[str, Any]],
+    emails: list[dict[str, Any]],
 ) -> Path | None:
     try:
         from openpyxl import Workbook
@@ -258,7 +347,8 @@ def _write_xlsx(
 
     workbook = Workbook()
     for index, (title, columns, rows) in enumerate(
-        (("Leads", LEAD_COLUMNS, leads), ("Emails", EMAIL_COLUMNS, emails))
+        (("Leads", CLEAN_COLUMNS, clean), ("Detailed", LEAD_COLUMNS, leads),
+         ("Emails", EMAIL_COLUMNS, emails))
     ):
         sheet = workbook.active if index == 0 else workbook.create_sheet()
         sheet.title = title

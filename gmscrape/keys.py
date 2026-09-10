@@ -60,6 +60,9 @@ KEY_FIELDS: tuple[KeyField, ...] = (
     KeyField("SUPABASE_URL", "Supabase project URL", "https://<project>.supabase.co", "supabase",
              secret=False),
     KeyField("SUPABASE_KEY", "Supabase service_role key", "Project Settings → API", "supabase"),
+    KeyField("SUPABASE_ACCESS_TOKEN", "Supabase access token (optional)",
+             "sbp_... from supabase.com/dashboard/account/tokens - lets gmscrape create the tables",
+             "supabase"),
 )
 
 GROUP_TITLES = {
