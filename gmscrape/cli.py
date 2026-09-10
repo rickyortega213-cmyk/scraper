@@ -309,9 +309,16 @@ def configure_logging(level: str) -> None:
 
 
 # --- commands --------------------------------------------------------------
+def _launch() -> None:
+    from .banner import print_banner
+
+    print_banner(_console)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     from .keys import run_setup
 
+    _launch()
     settings_from_args(args)             # loads .env + saved keys so current values show
     groups = (args.only,) if getattr(args, "only", None) else ("maps", "verify", "search", "supabase")
     run_setup(echo=lambda m: echo(m), groups=groups)
@@ -384,6 +391,7 @@ def _startup_key_check(settings: Settings, args: argparse.Namespace) -> Optional
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    _launch()
     settings = settings_from_args(args)
     queries: list[str] = list(args.queries or [])
     if args.queries_file:
@@ -423,6 +431,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_enrich(args: argparse.Namespace) -> int:
+    _launch()
     args.maps_provider = "file"
     settings = settings_from_args(args)
     settings.maps_provider = "file"
