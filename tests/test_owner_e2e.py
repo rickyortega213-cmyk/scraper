@@ -35,9 +35,13 @@ class _Ninja(http.server.BaseHTTPRequestHandler):
     site_base = ""
     queries: list[str] = []
 
+    accepted_keys = {SEARCH_KEY}
+    keys_seen: list[str] = []
+
     def do_GET(self) -> None:  # noqa: N802
-        if self.headers.get("x-api-key") != SEARCH_KEY:
+        if self.headers.get("x-api-key") not in self.accepted_keys:
             return self._send(401, {"status": "ERROR", "message": "invalid key"})
+        self.keys_seen.append(self.headers.get("x-api-key", ""))
         q = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
         self.queries.append(q)
         base = self.site_base
@@ -89,6 +93,8 @@ class _Ninja(http.server.BaseHTTPRequestHandler):
 def ninja(site_server, monkeypatch):
     _Ninja.site_base = site_server
     _Ninja.queries = []
+    _Ninja.keys_seen = []
+    _Ninja.accepted_keys = {SEARCH_KEY}
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -253,3 +259,28 @@ def test_search_calls_are_cached_across_runs(tmp_path, settings, site_server, ni
     assert stats["websites_discovered"] == 1
     assert stats["owners_found"] == 2 and stats["owner_emails"] == 1
     assert stats["lead_rows"] == 5          # 4 businesses, one of them with two contacts
+
+
+def test_several_search_keys_rotate_and_a_refused_one_is_dropped(ninja, settings):
+    """OPENWEBNINJA_KEY=key1,key2: calls alternate; a dead key is dropped, not fatal."""
+    ninja.accepted_keys = {SEARCH_KEY, "ak_second"}
+    settings.openwebninja_key = f"{SEARCH_KEY}, ak_second"
+    search = OpenWebNinjaSearch(settings)
+    assert search.key_count == 2
+    for i in range(4):
+        assert search.search(f"query {i}").error == ""
+    assert ninja.keys_seen == [SEARCH_KEY, "ak_second", SEARCH_KEY, "ak_second"]
+
+    ninja.keys_seen = []
+    settings.openwebninja_key = f"ak_dead, {SEARCH_KEY}"
+    search = OpenWebNinjaSearch(settings)
+    assert search.search("query a").error == ""          # dead key refused -> retried on the good one
+    assert search.key_count == 1 and ninja.keys_seen == [SEARCH_KEY]
+    for i in range(3):
+        assert search.search(f"query {i}").error == ""
+    assert set(ninja.keys_seen) == {SEARCH_KEY}
+
+    from gmscrape.providers.base import ProviderError
+    settings.openwebninja_key = "ak_dead"
+    with pytest.raises(ProviderError, match="rejected"):
+        OpenWebNinjaSearch(settings).search("query z")

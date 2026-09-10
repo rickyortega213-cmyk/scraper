@@ -58,8 +58,8 @@ KEY_FIELDS: tuple[KeyField, ...] = (
     KeyField("REOON_KEY", "Reoon key", "emailverifier.reoon.com/api-settings", "verify"),
     KeyField("EMAILLISTVERIFY_KEY", "EmailListVerify key", "emaillistverify.com/api", "verify"),
     KeyField("BOUNCER_KEY", "Bouncer key", "app.usebouncer.com/api", "verify"),
-    KeyField("OPENWEBNINJA_KEY", "OpenWeb Ninja key",
-             "ak_... from openwebninja.com - website discovery + owner lookup", "search"),
+    KeyField("OPENWEBNINJA_KEY", "OpenWeb Ninja key(s)",
+             "ak_... from openwebninja.com - website discovery + owner lookup; several: key1,key2", "search"),
     KeyField("SUPABASE_URL", "Supabase project URL",
              "https://<project>.supabase.co - Project Settings → API", "supabase", secret=False),
     KeyField("SUPABASE_KEY", "Supabase project API key",
@@ -242,7 +242,7 @@ def check_value(env: str, value: str) -> Optional[str]:
                 "a copy/paste went wrong; copy it again from the provider's dashboard")
     if env == "MCP_MAPS_URL" and "mcp.scraper.tech/" not in v:
         return "expected a link like https://mcp.scraper.tech/<your key>"
-    if env == "OPENWEBNINJA_KEY" and not v.startswith("ak_"):
+    if env == "OPENWEBNINJA_KEY" and not all(k.strip().startswith("ak_") for k in v.split(",") if k.strip()):
         return "OpenWeb Ninja keys start with ak_"
     if env == "SUPABASE_URL" and not v.endswith(".supabase.co"):
         return "expected https://<project>.supabase.co"

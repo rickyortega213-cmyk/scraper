@@ -14,6 +14,7 @@ shape can be checked on a live call.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Iterable
 
 from ...util import dig, squeeze
@@ -128,12 +129,42 @@ def _flatten_knowledge(node: dict[str, Any], prefix: str = "") -> dict[str, Any]
 
 
 class OpenWebNinjaSearch(WebSearchProvider):
+    """OPENWEBNINJA_KEY may hold several keys (key1,key2): each plan's rate
+    limit and quota is per key, so calls rotate across them. A key the
+    service refuses is dropped while another still works."""
+
     name = "openwebninja"
 
+    def __init__(self, settings: Any) -> None:
+        super().__init__(settings)
+        raw = str(settings.openwebninja_key or "")
+        self._keys: list[str] = [k.strip() for k in raw.split(",") if k.strip()]
+        self._next = 0
+        self._lock = threading.Lock()
+
+    @property
+    def key_count(self) -> int:
+        return len(self._keys)
+
+    def _pick_key(self) -> str:
+        with self._lock:
+            if not self._keys:
+                raise ProviderError("OPENWEBNINJA_KEY is not set (or every key was refused)")
+            key = self._keys[self._next % len(self._keys)]
+            self._next += 1
+            return key
+
+    def _drop_key(self, key: str, why: str) -> None:
+        with self._lock:
+            if key in self._keys and len(self._keys) > 1:
+                self._keys.remove(key)
+                log.warning("OpenWeb Ninja key %s… refused (%s); continuing with %d key(s)",
+                            key[:6], why, len(self._keys))
+                return
+        raise ProviderError(f"OpenWeb Ninja rejected the key ({why})")
+
     def search(self, query: str, limit: int = 10) -> SearchResponse:
-        key = self.settings.openwebninja_key
-        if not key:
-            raise ProviderError("OPENWEBNINJA_KEY is not set")
+        key = self._pick_key()
         params: dict[str, Any] = {"q": query, "limit": max(1, min(limit, 20))}
         if self.settings.country:
             params["gl"] = self.settings.country
@@ -146,10 +177,8 @@ class OpenWebNinjaSearch(WebSearchProvider):
         except ProviderError as exc:
             return SearchResponse(query=query, error=str(exc))
         if response.status_code in (401, 403):
-            raise ProviderError(
-                f"OpenWeb Ninja rejected the key (HTTP {response.status_code}): "
-                f"{response.text[:160]}"
-            )
+            self._drop_key(key, f"HTTP {response.status_code}: {response.text[:160]}")
+            return self.search(query, limit)          # once more on the next key
         if response.status_code >= 400:
             return SearchResponse(
                 query=query, error=f"HTTP {response.status_code}: {response.text[:160]}"

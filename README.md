@@ -596,7 +596,12 @@ When time runs out the unchecked guesses stay flagged in the database and
 `scraper resume` continues them later, re-buying nothing. **Several keys
 share the work**: `MAILTESTER_KEY=key1,key2` gives each its own plan-rate
 limiter and every check goes to whichever key is free soonest, so two keys
-finish in half the time.
+finish in half the time. The same goes for the search side:
+`OPENWEBNINJA_KEY=key1,key2` rotates calls across keys (each plan's rate
+limit and quota is per key) and the number of searches in flight scales with
+the number of keys. Everything inside one machine is already parallel; every
+remaining ceiling is a per-key limit at a provider, so more keys is what
+buys more speed.
 
 ## If something breaks mid-run
 
@@ -664,7 +669,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 246 tests, no network or API keys needed
+make test     # 247 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

@@ -286,11 +286,15 @@ class Pipeline:
                        "search_n": 0, "search_s": 0.0, "fetch_n": 0, "fetch_s": 0.0}
         # Web searches run in their own pool: asyncio's default one is capped
         # at a dozen threads, which silently capped WEB_SEARCH_CONCURRENCY.
-        self._search_pool = ThreadPoolExecutor(
-            max_workers=max(1, settings.web_search_concurrency), thread_name_prefix="gmscrape-search")
+        self._search_pool = None            # sized once the search provider is known (below)
         self._search_gate = AdaptiveGate(max(1, settings.web_search_concurrency))
         self._window: collections.deque = collections.deque(maxlen=12)   # (time, done) per batch
         self.web_search = web_search if web_search is not None else get_web_search(settings)
+        search_keys = max(1, int(getattr(self.web_search, "key_count", 1) or 1))
+        self._search_slots = max(1, settings.web_search_concurrency) * search_keys   # per-key limits add up
+        self._search_pool = ThreadPoolExecutor(max_workers=self._search_slots,
+                                               thread_name_prefix="gmscrape-search")
+        self._search_gate = AdaptiveGate(self._search_slots)
         self.progress = progress or (lambda event, data: None)
         self._search_calls = 0
         self._search_cache_hits = 0
@@ -842,7 +846,7 @@ class Pipeline:
         if not targets:
             return
 
-        search_sem = asyncio.Semaphore(max(1, self.settings.web_search_concurrency))
+        search_sem = asyncio.Semaphore(self._search_slots)
         lanes = max(1, self.settings.prepare_ahead)          # batches crawled at once share the sockets
         per_batch_sockets = max(8, self.settings.http_concurrency // lanes)
         site_budget = float(self.settings.site_timeout or 0)

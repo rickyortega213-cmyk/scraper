@@ -79,5 +79,10 @@ class WebSearchProvider(ABC):
     def search(self, query: str, limit: int = 10) -> SearchResponse:
         """Run one query. Must not raise on API errors - set `error` instead."""
 
+    @property
+    def key_count(self) -> int:
+        """How many independent keys (each with its own rate limit) carry the calls."""
+        return 1
+
     def close(self) -> None:
         self.client.close()
