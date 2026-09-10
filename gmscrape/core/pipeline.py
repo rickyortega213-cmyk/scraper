@@ -76,7 +76,13 @@ ProgressHook = Callable[[str, dict], None]
 
 @dataclass
 class RunReport:
-    """Summary of one pipeline run."""
+    """Summary of one pipeline run.
+
+    `results` holds every finished business for ordinary runs. In lean mode
+    (large runs) it holds only a recent sample - the database has the rest -
+    and every number in `stats()` comes from the counters, which are kept
+    identically in both modes.
+    """
 
     run_id: str
     queries: list[str] = field(default_factory=list)
@@ -93,41 +99,77 @@ class RunReport:
     errors: list[str] = field(default_factory=list)
     sinks: list[Any] = field(default_factory=list)
     resumed: int = 0                 # businesses restored from a previous attempt
-    total: int = 0                   # businesses in the run (restored + pending)
+    total: int = 0                   # businesses known so far (restored + pending); grows while streaming
     status: str = "running"          # running | done | interrupted | failed
     maps_cache_hits: int = 0
+    lean: bool = False
+    sample_size: int = 200
+    counters: dict[str, int] = field(default_factory=dict)
+    queries_done: int = 0
+
+    @property
+    def done(self) -> int:
+        return self.counters.get("businesses", 0)
 
     @property
     def duration(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
 
+    def absorb(self, batch: Sequence[BusinessResult]) -> None:
+        """Fold a finished batch into the counters (and the sample, in lean mode)."""
+        c = self.counters
+        for r in batch:
+            contacts = r.lead_contacts()
+            found = r.found_emails
+            owner_email = r.best_owner_email
+            best = r.best_email
+            c["businesses"] = c.get("businesses", 0) + 1
+            c["with_website"] = c.get("with_website", 0) + (1 if r.place.website else 0)
+            c["websites_discovered"] = c.get("websites_discovered", 0) + (
+                1 if r.website_source == "search" and r.place.website else 0)
+            c["owners_found"] = c.get("owners_found", 0) + (1 if r.owner else 0)
+            c["owners_from_site"] = c.get("owners_from_site", 0) + (
+                1 if r.owner and r.owner.source.startswith("site") else 0)
+            c["owners_from_search"] = c.get("owners_from_search", 0) + (
+                1 if r.owner and r.owner.source.startswith("search") else 0)
+            c["owner_emails"] = c.get("owner_emails", 0) + (1 if owner_email else 0)
+            c["lead_rows"] = c.get("lead_rows", 0) + max(1, len(contacts))
+            c["with_any_email"] = c.get("with_any_email", 0) + (1 if best else 0)
+            c["emails_scraped_from_site"] = c.get("emails_scraped_from_site", 0) + (1 if found else 0)
+            c["emails_guessed_only"] = c.get("emails_guessed_only", 0) + (1 if best and not found else 0)
+            c["best_email_verified_valid"] = c.get("best_email_verified_valid", 0) + (
+                1 if best and best.status == V_VALID else 0)
+            c["personal_domain_emails"] = c.get("personal_domain_emails", 0) + sum(
+                1 for e in r.emails if e.is_personal_domain)
+            c["chains_flagged"] = c.get("chains_flagged", 0) + (1 if r.is_chain else 0)
+            c["total_emails"] = c.get("total_emails", 0) + len(r.emails)
+        if self.lean:
+            self.results.extend(batch)
+            if len(self.results) > self.sample_size:
+                del self.results[: len(self.results) - self.sample_size]
+        else:
+            self.results.extend(batch)
+
     def stats(self) -> dict[str, object]:
-        with_email = [r for r in self.results if r.best_email]
-        scraped = [r for r in self.results if r.found_emails]
-        guessed_only = [r for r in with_email if not r.found_emails]
-        valid = [r for r in with_email if r.best_email and r.best_email.status == V_VALID]
-        owners = [r for r in self.results if r.owner]
+        c = self.counters
         return {
             "queries": len(self.queries),
-            "businesses": len(self.results),
-            "with_website": sum(1 for r in self.results if r.place.website),
-            "websites_discovered": sum(
-                1 for r in self.results if r.website_source == "search" and r.place.website
-            ),
-            "owners_found": len(owners),
-            "owners_from_site": sum(1 for r in owners if r.owner.source.startswith("site")),
-            "owners_from_search": sum(1 for r in owners if r.owner.source.startswith("search")),
-            "owner_emails": sum(1 for r in self.results if r.best_owner_email),
-            "lead_rows": sum(max(1, len(r.lead_contacts())) for r in self.results),
-            "with_any_email": len(with_email),
-            "emails_scraped_from_site": len(scraped),
-            "emails_guessed_only": len(guessed_only),
-            "best_email_verified_valid": len(valid),
-            "personal_domain_emails": sum(
-                1 for r in self.results for e in r.emails if e.is_personal_domain
-            ),
-            "chains_flagged": sum(1 for r in self.results if r.is_chain),
-            "total_emails": sum(len(r.emails) for r in self.results),
+            "queries_done": self.queries_done,
+            "businesses": c.get("businesses", 0),
+            "with_website": c.get("with_website", 0),
+            "websites_discovered": c.get("websites_discovered", 0),
+            "owners_found": c.get("owners_found", 0),
+            "owners_from_site": c.get("owners_from_site", 0),
+            "owners_from_search": c.get("owners_from_search", 0),
+            "owner_emails": c.get("owner_emails", 0),
+            "lead_rows": c.get("lead_rows", 0),
+            "with_any_email": c.get("with_any_email", 0),
+            "emails_scraped_from_site": c.get("emails_scraped_from_site", 0),
+            "emails_guessed_only": c.get("emails_guessed_only", 0),
+            "best_email_verified_valid": c.get("best_email_verified_valid", 0),
+            "personal_domain_emails": c.get("personal_domain_emails", 0),
+            "chains_flagged": c.get("chains_flagged", 0),
+            "total_emails": c.get("total_emails", 0),
             "verification_api_calls": self.verification_calls,
             "verification_cache_hits": self.verification_cache_hits,
             "web_search_calls": self.search_calls,
@@ -135,6 +177,7 @@ class RunReport:
             "maps_cache_hits": self.maps_cache_hits,
             "resumed_businesses": self.resumed,
             "status": self.status,
+            "lean_mode": self.lean,
             "duration_seconds": round(self.duration, 1),
         }
 
@@ -184,24 +227,32 @@ class Pipeline:
         run_id: Optional[str] = None,
         resume: bool = False,
     ) -> RunReport:
-        """Run every query. With `resume`, businesses already finished under
-        `run_id` are restored from the database rather than processed again.
+        """Run every query, streaming: a chunk of queries is fetched, its
+        businesses enriched in checkpointed batches, then the next chunk.
+        Memory stays bounded however many queries there are, the first leads
+        land minutes in rather than hours in, and a resume skips whole
+        finished queries as well as finished businesses.
 
-        Work happens in batches (settings.batch_size); each finished batch is
-        checkpointed, so a crash or Ctrl-C costs at most one batch of work and
-        no API calls that already returned (maps results, pages, searches and
-        verifications are all cached the moment they arrive)."""
+        Every API result is cached the moment it arrives, so a crash costs at
+        most one batch of work and no API calls that already returned."""
         specs = parse_queries(queries)
         if not specs:
             raise ValueError("no usable queries provided")
+        lean = self.settings.lean_memory or len(specs) > self.settings.lean_threshold_queries
+        if lean and self.settings.cache_http:
+            # A million pages do not belong in SQLite; the per-business
+            # checkpoint already makes resume free of re-crawling.
+            self.settings.cache_http = False
         report = RunReport(
             run_id=run_id or uuid.uuid4().hex[:12],
             queries=[s.search_string for s in specs],
             maps_provider=self.maps.name,
             verify_provider=self.verifier.name,
             search_provider=self.web_search.name if self.web_search else "none",
+            lean=lean,
         )
         self.store.start_run(report.run_id, report.queries, asdict(self.settings))
+        self.store.add_run_queries(report.run_id, report.queries)
         try:
             self.store.prune(self.settings.cache_ttl_hours, self.settings.search_cache_ttl_hours)
         except Exception as exc:  # noqa: BLE001 - housekeeping must never block a run
@@ -212,55 +263,76 @@ class Pipeline:
             "verify_provider": report.verify_provider,
         })
 
+        seen_keys: set[str] = set()
+        pending_specs = list(specs)
         try:
-            places = self._collect_places(specs, report)
-            results = self._classify(places)
-
-            pending = results
             if resume:
-                done_keys = self.store.done_business_keys(report.run_id)
-                restored = [self.store.load_business(k) for k in done_keys]
-                restored = [r for r in restored if r is not None]
-                pending = [r for r in results if r.place.dedupe_key() not in done_keys]
-                report.results.extend(restored)
-                report.resumed = len(restored)
-                if restored:
+                done_queries = self.store.done_queries(report.run_id)
+                seen_keys = self.store.done_business_keys(report.run_id)
+                report.counters = self.store.run_counters(report.run_id)
+                report.resumed = report.done
+                report.queries_done = sum(1 for s in specs if s.search_string in done_queries)
+                pending_specs = [s for s in specs if s.search_string not in done_queries]
+                if not lean and seen_keys:
+                    restored = [r for r in (self.store.load_business(k) for k in seen_keys) if r]
+                    report.results.extend(restored)
                     self._publish(restored, STATUS_DONE)
-            report.total = len(report.results) + len(pending)
-            self.store.set_run_state(report.run_id, "running", total=report.total,
-                                     done=len(report.results))
+                self.progress("resumed", {"businesses": report.resumed, "queries": report.queries_done})
+            report.total = report.done
+            self.store.set_run_state(report.run_id, "running", total=report.total, done=report.done)
 
-            if pending:
-                # Publish and flush before any slow work, so the table is fully
-                # populated the moment the run starts rather than after the crawl.
-                self._publish(pending, STATUS_QUEUED)
-                self._sink_call("flush")
-
-            size = max(1, self.settings.batch_size)
-            batches = [pending[i: i + size] for i in range(0, len(pending), size)]
+            chunk_size = max(1, self.settings.query_chunk_size)
+            batch_size = max(1, self.settings.batch_size)
             started = time.time()
-            for index, batch in enumerate(batches, start=1):
-                self._process_batch(batch, report)
-                report.results.extend(batch)
-                self.store.set_run_state(report.run_id, "running", done=len(report.results))
-                elapsed = time.time() - started
-                self.progress("batch_done", {
-                    "batch": index, "batches": len(batches),
-                    "done": len(report.results), "total": report.total,
-                    "elapsed": elapsed,
-                    "eta": (elapsed / index) * (len(batches) - index),
-                    "results": report.results,
-                })
+            businesses_per_query: list[int] = []
+            for offset in range(0, len(pending_specs), chunk_size):
+                chunk = pending_specs[offset: offset + chunk_size]
+                found_per_query: dict[str, int] = {}
+                places = self._collect_places(chunk, report, found_per_query)
+                fresh = [p for p in places if p.dedupe_key() not in seen_keys]
+                seen_keys.update(p.dedupe_key() for p in fresh)
+                results = self._classify(fresh)
+                businesses_per_query.extend(found_per_query.values())
+                remaining_queries = len(pending_specs) - offset - len(chunk)
+                avg = (sum(businesses_per_query) / len(businesses_per_query)) if businesses_per_query else 0
+                report.total = report.done + len(results) + int(avg * remaining_queries)
+
+                if results:
+                    self._publish(results, STATUS_QUEUED)
+                    self._sink_call("flush")
+                for b in range(0, len(results), batch_size):
+                    batch = results[b: b + batch_size]
+                    self._process_batch(batch, report)
+                    report.absorb(batch)
+                    self.store.set_run_state(report.run_id, "running", total=report.total, done=report.done)
+                    elapsed = time.time() - started
+                    rate = (report.done - report.resumed) / elapsed if elapsed > 0 else 0.0
+                    self.progress("batch_done", {
+                        "done": report.done, "total": report.total,
+                        "queries_done": report.queries_done, "queries": len(specs),
+                        "elapsed": elapsed,
+                        "eta": ((report.total - report.done) / rate) if rate > 0 else 0.0,
+                        "rate_per_hour": rate * 3600,
+                        "batch_results": batch,
+                        "results": report.results,
+                    })
+                    if lean:
+                        for r in batch:
+                            r.place.raw = {}
+                self.store.mark_queries_done(report.run_id, [c.search_string for c in chunk], found_per_query)
+                report.queries_done += len(chunk)
+                self.progress("chunk_done", {"queries_done": report.queries_done, "queries": len(specs)})
         except BaseException as exc:
             status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             report.status = status
             report.finished_at = time.time()
-            self.store.set_run_state(report.run_id, status, done=len(report.results))
+            self.store.set_run_state(report.run_id, status, done=report.done)
             self._sink_call("flush")
             if not isinstance(exc, KeyboardInterrupt):
                 log.exception("run %s failed", report.run_id)
             raise RunStopped(report, exc) from exc
 
+        report.total = report.done
         report.verification_calls = self._verify_calls
         report.verification_cache_hits = self._cache_hits
         report.search_calls = self._search_calls
@@ -377,7 +449,10 @@ class Pipeline:
         data["query"] = spec.search_string
         return Place(**data)
 
-    def _collect_places(self, specs: Sequence[QuerySpec], report: RunReport) -> list[Place]:
+    def _collect_places(
+        self, specs: Sequence[QuerySpec], report: RunReport,
+        found_per_query: Optional[dict[str, int]] = None,
+    ) -> list[Place]:
         """Fetch every query (a few at a time), then dedupe across them in order."""
         per_query: dict[int, list[Place]] = {}
         workers = max(1, min(self.settings.maps_concurrency, len(specs)))
@@ -391,6 +466,8 @@ class Pipeline:
                 except Exception as exc:  # noqa: BLE001 - one bad query must not end the run
                     report.errors.append(f"{specs[index].search_string}: {exc}")
                     per_query[index] = []
+                if found_per_query is not None:
+                    found_per_query[specs[index].search_string] = len(per_query[index])
                 self.progress("query_done", {"query": specs[index].search_string,
                                              "found": len(per_query[index])})
         seen: set[str] = set()

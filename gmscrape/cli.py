@@ -35,7 +35,7 @@ from .providers.base import ProviderError
 from .providers.registry import detect_maps_provider, detect_verify_provider
 from .query import parse_queries, read_query_file
 from .store.db import Store
-from .store.export import export_results
+from .store.export import CsvAppender, export_results
 
 log = logging.getLogger("gmscrape")
 
@@ -478,29 +478,32 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
         echo(f"[red]{exc}[/red]")
         return 2
 
+    lean = settings.lean_memory or len(queries) > settings.lean_threshold_queries
     with pipeline:
         echo(f"maps: [green]{pipeline.maps.name}[/green]   "
              f"verification: [green]{pipeline.verifier.name}[/green]   "
              f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
-             f"batches of {settings.batch_size}")
+             f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
+        if lean:
+            exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
         try:
             report = pipeline.run(queries, run_id=run_id, resume=resume)
         except RunStopped as stopped:
             report = stopped.report
-            paths = exporter.export(report.results)
+            paths = exporter.finish(report)
             echo("")
             if isinstance(stopped.cause, KeyboardInterrupt):
-                echo(f"[yellow]Stopped.[/yellow] {len(report.results)}/{report.total} businesses were "
+                echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
                      f"finished and are in {paths[0] if paths else 'the export'}.")
             else:
                 echo(f"[red]The run hit an error:[/red] {stopped.cause}")
-                echo(f"{len(report.results)}/{report.total} businesses were finished and are in "
+                echo(f"{report.done}/{report.total} businesses were finished and are in "
                      f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
                      "re-bought on resume.")
             echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
                  f"(run id {report.run_id})")
             return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
-        paths = exporter.export(report.results)
+        paths = exporter.finish(report)
     _print_report(report, paths)
     _print_final_table(report)
     _print_supabase_link(settings, report)
@@ -508,15 +511,44 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
 
 
 class _Exporter:
-    """Writes the exports; called after every batch so a partial CSV always exists."""
+    """Writes the exports after every batch so a partial CSV always exists.
+
+    Small runs rewrite the full export each time (and get JSON/XLSX at the
+    end). Large runs append rows per batch instead - the file is never
+    rewritten, whatever the size."""
 
     def __init__(self, settings: Settings, basename: str) -> None:
         self.settings = settings
         self.basename = basename
+        self.appender: Optional[CsvAppender] = None
+
+    def begin_lean(self, store: Store, run_id: str, resumed: bool) -> None:
+        self.appender = CsvAppender(self.settings.out_dir, self.basename, _today())
+        self.appender.start(fresh=True)
+        if resumed:
+            # Rebuild what earlier attempts finished, streaming from the database.
+            buffer: list = []
+            for result in store.iter_run_businesses(run_id):
+                buffer.append(result)
+                if len(buffer) >= 500:
+                    self.appender.append(buffer)
+                    buffer = []
+            self.appender.append(buffer)
 
     def export(self, results) -> list[Path]:
         return export_results(results, self.settings.out_dir, basename=self.basename,
                               formats=self.settings.export_formats, run_date=_today())
+
+    def on_batch(self, data: dict) -> None:
+        if self.appender is not None:
+            self.appender.append(data.get("batch_results") or [])
+        else:
+            self.export(data["results"])
+
+    def finish(self, report: RunReport) -> list[Path]:
+        if self.appender is not None:
+            return self.appender.written()
+        return self.export(report.results)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -1126,13 +1158,16 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
             state["sites"] += 1
             if state["sites"] % 25 == 0 or data["done"] == data["total"]:
                 echo(f"  crawled {data['done']}/{data['total']} websites")
+        elif event == "resumed":
+            echo(f"  restored {data['businesses']} finished businesses, {data['queries']} finished searches")
         elif event == "batch_done":
-            echo(f"  [bold]checkpoint[/bold] batch {data['batch']}/{data['batches']} · "
-                 f"{data['done']}/{data['total']} businesses · {_fmt_duration(data['elapsed'])} elapsed"
-                 + (f" · ~{_fmt_duration(data['eta'])} left" if data['batch'] < data['batches'] else ""))
+            eta = f" · ~{_fmt_duration(data['eta'])} left" if data["eta"] else ""
+            echo(f"  [bold]checkpoint[/bold] {data['done']}/{data['total']} businesses · "
+                 f"searches {data['queries_done']}/{data['queries']} · "
+                 f"{int(data['rate_per_hour'])}/h · {_fmt_duration(data['elapsed'])} elapsed{eta}")
             if exporter is not None:
                 try:
-                    exporter.export(data["results"])
+                    exporter.on_batch(data)
                 except Exception as exc:  # noqa: BLE001 - never let an export break a run
                     echo(f"  [yellow]partial export failed: {exc}[/yellow]")
     return hook
@@ -1169,9 +1204,11 @@ def _print_final_table(report: RunReport) -> None:
     rows = [row for r in report.results for row in clean_rows(r, _today())]
     if not rows:
         return
-    shown = rows[:MAX_TERMINAL_ROWS]
+    shown = rows[-MAX_TERMINAL_ROWS:] if report.lean else rows[:MAX_TERMINAL_ROWS]
+    total_rows = report.counters.get("lead_rows", len(rows))
     _print_table(
-        f"Leads ({len(rows)} row{'s' if len(rows) != 1 else ''})",
+        f"Leads ({total_rows} row{'s' if total_rows != 1 else ''}"
+        + (f", last {len(shown)} shown" if report.lean else "") + ")",
         ("Company", "City", "State", "Phone", "Verified Email", "First", "Last",
          "Title", "Business Type"),
         [
@@ -1184,8 +1221,8 @@ def _print_final_table(report: RunReport) -> None:
             for r in shown
         ],
     )
-    if len(rows) > len(shown):
-        echo(f"[dim]… {len(rows) - len(shown)} more rows in the CSV[/dim]")
+    if total_rows > len(shown):
+        echo(f"[dim]… {total_rows - len(shown)} more rows in the CSV[/dim]")
 
 
 def _print_supabase_link(settings: Settings, report: RunReport) -> None:

@@ -114,6 +114,9 @@ class Settings:
     maps_concurrency: int = 6          # queries fetched in parallel
     maps_cache_ttl_hours: int = 168    # a crash never re-buys the same search
     batch_size: int = 100              # businesses per checkpoint
+    query_chunk_size: int = 25         # queries fetched, then enriched, at a time (streaming)
+    lean_threshold_queries: int = 200  # above this: append-only exports, no page cache, no full in-memory results
+    lean_memory: bool = False          # force the large-run mode
 
     # --- website crawling --------------------------------------------------
     crawl_websites: bool = True

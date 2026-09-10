@@ -505,6 +505,31 @@ Fetched pages are cached compressed and capped at 400 KB each, and expired
 cache rows are pruned at the start of every run, so a big database stays in
 the hundreds of megabytes rather than gigabytes.
 
+## Very large runs (10,000+ searches)
+
+Above 200 searches the program switches to **large-run mode** on its own:
+
+- searches stream through in chunks of 25 — the first leads land minutes in,
+  not after every search has been fetched, and memory stays flat at a million
+  businesses
+- exports are **append-only**: `leads.csv` grows by a batch at a time and is
+  never rewritten (JSON/XLSX are skipped — Excel can't open a million rows
+  anyway)
+- the page cache is off (the per-business checkpoint already makes resume free
+  of re-crawling); Maps results, searches and verifications stay cached
+- resume skips whole finished searches as well as finished businesses
+- the progress line shows the running rate and a real ETA:
+
+```
+checkpoint 41,300/612,000 businesses · searches 1,032/25,000 · 1,410/h · 29h 17m elapsed · ~16d 21h left
+```
+
+The throughput ceiling is not the program, it's the three providers: how fast
+scraper.tech, MailTester Ninja and OpenWeb Ninja answer, and their plan limits.
+Roughly, per 1,000 businesses: ~1,000 Maps results, ~2,500 page fetches,
+~700 web searches, ~1,500 verifications. Check your plans against that before
+a 25,000-search run, and start with 500 searches to measure your own rate.
+
 ## If something breaks mid-run
 
 Nothing you've paid for is ever bought twice, and nothing finished is lost:
@@ -559,7 +584,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 205 tests, no network or API keys needed
+make test     # 210 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

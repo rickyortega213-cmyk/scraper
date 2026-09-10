@@ -62,10 +62,10 @@ def test_batches_checkpoint_and_report_progress(settings, site_server):
                   progress=lambda e, d: events.append({"event": e, **d})) as pipeline:
         report = pipeline.run(["plumber in austin tx"])
     batches = [e for e in events if e["event"] == "batch_done"]
-    assert [(b["batch"], b["batches"], b["done"], b["total"]) for b in batches] == [
-        (1, 3, 2, 5), (2, 3, 4, 5), (3, 3, 5, 5),
-    ]
-    assert all("eta" in b and "elapsed" in b for b in batches)
+    assert [(b["done"], b["total"]) for b in batches] == [(2, 5), (4, 5), (5, 5)]
+    assert all("eta" in b and "elapsed" in b and "rate_per_hour" in b for b in batches)
+    chunks = [e for e in events if e["event"] == "chunk_done"]
+    assert [(c["queries_done"], c["queries"]) for c in chunks] == [(1, 1)]
     assert len(report.results) == 5 and report.status == "done"
     assert store.done_business_keys(report.run_id) == {f"pid:b{i}" for i in range(5)}
     assert store.list_runs()[0]["status"] == "done"

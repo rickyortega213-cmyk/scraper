@@ -368,3 +368,42 @@ def _write_xlsx(
             )
     workbook.save(path)
     return path
+
+
+class CsvAppender:
+    """Append-only CSV writers for large runs: headers once, then rows per batch,
+    so the file is always complete up to the last checkpoint and never rewritten."""
+
+    def __init__(self, out_dir: str | Path, basename: str = "leads", run_date: str = "") -> None:
+        self.directory = Path(out_dir)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.basename = basename
+        self.run_date = run_date
+        self.paths = {
+            "clean": self.directory / f"{basename}.csv",
+            "detailed": self.directory / f"{basename}_detailed.csv",
+            "emails": self.directory / f"{basename}_emails.csv",
+        }
+
+    def start(self, fresh: bool = True) -> None:
+        if not fresh and all(p.exists() for p in self.paths.values()):
+            return
+        for kind, columns in (("clean", CLEAN_COLUMNS), ("detailed", LEAD_COLUMNS), ("emails", EMAIL_COLUMNS)):
+            with self.paths[kind].open("w", newline="", encoding="utf-8-sig") as handle:
+                csv.DictWriter(handle, fieldnames=list(columns)).writeheader()
+
+    def append(self, results: Sequence[BusinessResult]) -> None:
+        if not results:
+            return
+        batches = (
+            ("clean", CLEAN_COLUMNS, [row for r in results for row in clean_rows(r, self.run_date)]),
+            ("detailed", LEAD_COLUMNS, [row for r in results for row in lead_rows(r)]),
+            ("emails", EMAIL_COLUMNS, [row for r in results for row in email_rows(r)]),
+        )
+        for kind, columns, rows in batches:
+            with self.paths[kind].open("a", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
+                writer.writerows(rows)
+
+    def written(self) -> list[Path]:
+        return list(self.paths.values())

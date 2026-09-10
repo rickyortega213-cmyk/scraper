@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS web_searches (
     payload     TEXT,
     fetched_at  REAL
 );
+CREATE TABLE IF NOT EXISTS run_queries (
+    run_id      TEXT,
+    query       TEXT,
+    status      TEXT,
+    found       INTEGER,
+    updated_at  REAL,
+    PRIMARY KEY (run_id, query)
+);
 CREATE TABLE IF NOT EXISTS maps_cache (
     query_key   TEXT PRIMARY KEY,
     provider    TEXT,
@@ -489,6 +497,69 @@ class Store:
                 notes=json.loads(e["notes"] or "[]"),
             ))
         return result
+
+    def add_run_queries(self, run_id: str, queries: list[str]) -> None:
+        with self._lock:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO run_queries(run_id, query, status, found, updated_at) "
+                "VALUES(?,?,'pending',0,?)",
+                [(run_id, q, time.time()) for q in queries],
+            )
+            self.conn.commit()
+
+    def mark_queries_done(self, run_id: str, queries: list[str], found: dict[str, int]) -> None:
+        with self._lock:
+            self.conn.executemany(
+                "UPDATE run_queries SET status='done', found=?, updated_at=? WHERE run_id=? AND query=?",
+                [(found.get(q, 0), time.time(), run_id, q) for q in queries],
+            )
+            self.conn.commit()
+
+    def done_queries(self, run_id: str) -> set[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT query FROM run_queries WHERE run_id = ? AND status = 'done'", (run_id,)
+            ).fetchall()
+            return {str(r["query"]) for r in rows}
+
+    def run_counters(self, run_id: str) -> dict[str, int]:
+        """The run's headline numbers straight from the database - what a
+        resumed large run reports without holding results in memory."""
+        with self._lock:
+            def count(sql: str, *params: Any) -> int:
+                return int(self.conn.execute(sql, params).fetchone()[0])
+
+            return {
+                "businesses": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND stage='done'", run_id),
+                "with_website": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND stage='done' AND website<>''", run_id),
+                "websites_discovered": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND website_source='search' AND website<>''", run_id),
+                "owners_found": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND owner_name IS NOT NULL AND owner_name<>''", run_id),
+                "owners_from_site": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND owner_source LIKE 'site%'", run_id),
+                "owners_from_search": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND owner_source LIKE 'search%'", run_id),
+                "chains_flagged": count("SELECT COUNT(*) FROM businesses WHERE run_id=? AND is_chain=1", run_id),
+                "with_any_email": count(
+                    "SELECT COUNT(DISTINCT b.key) FROM businesses b JOIN emails e ON e.business_key=b.key "
+                    "WHERE b.run_id=? AND e.lead_eligible=1", run_id),
+                "owner_emails": count(
+                    "SELECT COUNT(DISTINCT b.key) FROM businesses b JOIN emails e ON e.business_key=b.key "
+                    "WHERE b.run_id=? AND e.lead_eligible=1 AND e.contact_type IN ('owner','manager')", run_id),
+                "best_email_verified_valid": count(
+                    "SELECT COUNT(DISTINCT b.key) FROM businesses b JOIN emails e ON e.business_key=b.key "
+                    "WHERE b.run_id=? AND e.lead_eligible=1 AND e.status='valid'", run_id),
+                "total_emails": count(
+                    "SELECT COUNT(*) FROM emails e JOIN businesses b ON e.business_key=b.key WHERE b.run_id=?", run_id),
+            }
+
+    def iter_run_businesses(self, run_id: str):
+        """Stream every finished business of a run (for re-exporting on resume)."""
+        with self._lock:
+            keys = [str(r["key"]) for r in self.conn.execute(
+                "SELECT key FROM businesses WHERE run_id = ? AND stage = 'done' ORDER BY updated_at", (run_id,)
+            ).fetchall()]
+        for key in keys:
+            result = self.load_business(key)
+            if result is not None:
+                yield result
 
     def set_run_state(self, run_id: str, status: str, *, total: Optional[int] = None,
                       done: Optional[int] = None, run_table: Optional[str] = None) -> None:
