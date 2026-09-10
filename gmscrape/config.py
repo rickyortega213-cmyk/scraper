@@ -98,7 +98,7 @@ class Settings:
     discover_websites: bool = True      # search for a site when Maps has none
     find_owners: bool = True            # look for the owner on the website
     owner_search: bool = True           # ...and via web search when the site is silent
-    web_search_concurrency: int = 16
+    web_search_concurrency: int = 24
     search_cache_ttl_hours: int = 720
     website_min_confidence: int = 60    # accept a discovered site at/above this
     owner_min_confidence: int = 60      # guess owner addresses at/above this
@@ -123,15 +123,16 @@ class Settings:
     # --- website crawling --------------------------------------------------
     crawl_websites: bool = True
     max_pages_per_site: int = 5
-    http_timeout: float = 15.0
+    http_timeout: float = 10.0
     http_concurrency: int = 96
     per_host_concurrency: int = 2
-    http_retries: int = 2
+    http_retries: int = 1              # a dead host costs one retry, not a minute
     http_max_bytes: int = 3_000_000
     obey_robots: bool = True
     user_agent: str = DEFAULT_USER_AGENTS[0]
     rotate_user_agent: bool = True
     crawl_delay: float = 0.0
+    site_timeout: float = 45.0        # whole-site budget: discover + crawl + owner search, then move on
     follow_social_profiles: bool = False
 
     # --- permutations ------------------------------------------------------
@@ -148,7 +149,8 @@ class Settings:
     verify_emails: bool = True
     verify_found: bool = True
     verify_found_max: int = 1         # found addresses checked per business per contact type, best first (0 = all)
-    prepare_ahead: int = 2            # batches crawled while the current one is being verified
+    prepare_ahead: int = 4            # batches crawled at once, ahead of verification; one slow site
+                                      # only holds up its own batch, and HTTP_CONCURRENCY is shared
     verify_permutations: bool = True
     verify_concurrency: int = 16      # enough in flight to use the Ultimate rate
     verify_budget: int = 0            # 0 = unlimited API calls for the run

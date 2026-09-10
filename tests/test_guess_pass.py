@@ -118,3 +118,66 @@ def test_owner_guesses_go_before_generic_ones(settings, site_server):
     store.save_businesses([business("generic", False, 0), business("weak", True, 60),
                            business("strong", True, 90)], "r1")
     assert store.deferred_guess_keys("r1") == ["pid:strong", "pid:weak", "pid:generic"]
+
+
+def test_a_hanging_site_only_costs_its_own_budget(settings, site_server):
+    """One dead host must not hold the batch: the site gets SITE_TIMEOUT, then
+    the business moves on with whatever was gathered."""
+    import socket
+    import time as _time
+
+    # A host that accepts the connection and never answers.
+    black_hole = socket.socket()
+    black_hole.bind(("127.0.0.1", 0))
+    black_hole.listen(8)
+    hang_url = f"http://127.0.0.1:{black_hole.getsockname()[1]}/"
+
+    class Mixed(MapsProvider):
+        name = "mixed"
+        requires_key = False
+
+        def search(self, spec: QuerySpec, limit: int):
+            yield Place(name="Joe's Plumbing", place_id="ok", website=f"{site_server}/site1/",
+                        domain="joesplumbing.com", category="Plumber", query=spec.search_string)
+            yield Place(name="Black Hole Roofing", place_id="hang", website=hang_url,
+                        domain="blackhole-roofing.example", category="Roofer", query=spec.search_string)
+
+    settings.site_timeout = 0.5
+    settings.http_timeout = 30.0                      # the per-request timeout is not what saves us
+    settings.run_hours = 0
+    started = _time.monotonic()
+    try:
+        with Pipeline(settings, store=Store(settings.db_path), maps=Mixed(settings),
+                      verifier=StubVerifier(settings)) as pipeline:
+            report = pipeline.run(["roofer in austin tx"])
+    finally:
+        black_hole.close()
+    assert _time.monotonic() - started < 15
+    hang = next(r for r in report.results if r.place.place_id == "hang")
+    assert hang.website_status == "timeout" and any(n.startswith("site_timeout:") for n in hang.notes)
+    ok = next(r for r in report.results if r.place.place_id == "ok")
+    assert ok.best_email is not None                  # the good site was unaffected
+
+
+def test_mail_domains_are_checked_in_the_guess_pass_not_the_crawl(settings, site_server, monkeypatch):
+    """DNS happens right before guesses are spent - never on the crawl's critical path."""
+    import gmscrape.core.pipeline as P
+
+    looked_up: list[str] = []
+
+    def fake_mx(domain):
+        looked_up.append(domain)
+        return () if domain == "silent-roofing-x9.com" else ("mx." + domain,)
+
+    monkeypatch.setattr(P, "mx_lookup", fake_mx)
+    monkeypatch.setattr(P, "prefetch_mx", lambda domains, workers=16: [fake_mx(d) for d in domains])
+    settings = _settings(settings, site_server, hours=0)
+    settings.permutation_require_mx = True
+    verifier = StubVerifier(settings)
+    with Pipeline(settings, store=Store(settings.db_path), maps=TwoKinds(settings), verifier=verifier) as pipeline:
+        report = pipeline.run(["roofer in austin tx"])
+    silent = next(r for r in report.results if r.place.place_id == "silent")
+    assert "silent-roofing-x9.com" in looked_up
+    assert not any(c.endswith("@silent-roofing-x9.com") for c in verifier.calls)   # no MX: nothing spent
+    assert silent.guessed_emails == [] and "guesses_dropped:no_mx" in silent.notes
+    assert silent.permutations_skipped_reason == "domain_has_no_mx"

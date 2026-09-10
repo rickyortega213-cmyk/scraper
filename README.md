@@ -565,10 +565,15 @@ keeps the rest of the machine busy around them:
 1. **Addresses published on websites come first, and always get done.** One
    check per contact type per business, best candidate first (a company-domain
    address before a free-mail one), stopping at the first deliverable one. A
-   site listing twenty staff mailboxes costs one check. Crawling, website
-   discovery and the owner search for the next batches run *while* this batch
-   is being checked (`PREPARE_AHEAD`), and Maps results for the next 25
-   searches are fetched meanwhile.
+   site listing twenty staff mailboxes costs one check. Several batches are
+   crawled at once (`PREPARE_AHEAD`, default 4, sharing `HTTP_CONCURRENCY`
+   sockets) while earlier ones are being checked, so one dead host that hangs
+   through its timeouts only delays its own batch; each site gets
+   `SITE_TIMEOUT` (45 s) for discovery, crawl and owner search combined, then
+   the business moves on with what was gathered. Maps results for the next 25
+   searches are fetched meanwhile, and DNS is never on the crawl's path: whether
+   a domain can receive mail is checked in the guess pass, right before its
+   guesses would be spent.
 2. **Then the guesses, in a second pass, most valuable first.** Businesses
    whose site named an owner but not their mailbox (`first@`, `first.last@`,
    the most confidently named owner first), then sites that published nothing
@@ -659,7 +664,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 243 tests, no network or API keys needed
+make test     # 245 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

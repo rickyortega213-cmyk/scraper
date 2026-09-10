@@ -430,50 +430,58 @@ class Pipeline:
         maps_pool.shutdown(wait=False)
 
     def _prepared(self, items, ahead: int):
-        """Yield work with its crawl/guess stage done. With `ahead` > 0 that
-        stage runs on a helper thread up to `ahead` batches in front, so the
-        rate-limited verification of one batch overlaps the crawling of the
-        next instead of the whole run being the sum of both."""
+        """Yield work with its crawl/guess stage done, in order.
+
+        With `ahead` > 0 up to `ahead` batches are crawled at once on helper
+        threads. A batch is only as fast as its slowest site, so crawling one
+        batch at a time let a single dead host hold up ninety-nine finished
+        businesses; with several in flight that tail only delays its own
+        batch, and the metered verification never waits for the crawl."""
         if ahead <= 0:
             for work in items:
                 self._prepare_batch(work.batch)
                 yield work
             return
 
-        handoff: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=ahead)
+        pool = ThreadPoolExecutor(max_workers=ahead, thread_name_prefix="gmscrape-prepare")
+        in_flight = threading.BoundedSemaphore(ahead)
+        ordered: "queue.Queue[tuple[str, object, object]]" = queue.Queue()
         stop = threading.Event()
 
-        def hand(kind: str, item: object) -> None:
-            while not stop.is_set():
-                try:
-                    handoff.put((kind, item), timeout=0.5)
-                    return
-                except queue.Full:
-                    continue
-
-        def producer() -> None:
+        def feeder() -> None:
             try:
                 for work in items:
                     if stop.is_set():
                         return
-                    self._prepare_batch(work.batch)
-                    hand("work", work)
-                hand("done", None)
+                    in_flight.acquire()
+                    if stop.is_set():
+                        return
+                    ordered.put(("work", work, pool.submit(self._prepare_batch, work.batch)))
+                ordered.put(("done", None, None))
             except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
-                hand("error", exc)
+                ordered.put(("error", exc, None))
 
-        thread = threading.Thread(target=producer, name="gmscrape-prepare", daemon=True)
+        thread = threading.Thread(target=feeder, name="gmscrape-feed", daemon=True)
         thread.start()
         try:
             while True:
-                kind, item = handoff.get()
+                kind, item, future = ordered.get()
                 if kind == "error":
                     raise item  # type: ignore[misc]
                 if kind == "done":
                     return
+                try:
+                    future.result()  # type: ignore[union-attr]  # re-raises a crawl-stage failure
+                finally:
+                    in_flight.release()
                 yield item  # type: ignore[misc]
         finally:
             stop.set()
+            try:
+                in_flight.release()          # unblock a feeder waiting for a slot
+            except ValueError:
+                pass
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _prepare_batch(self, batch: list[BusinessResult]) -> None:
         """Everything that is not metered: crawl, discover, find the owner, plan guesses."""
@@ -534,6 +542,25 @@ class Pipeline:
         self.store.save_businesses(batch, report.run_id, stage="done")
         self._publish(batch, STATUS_DONE)
 
+    def _drop_guesses_without_mx(self, batch: list[BusinessResult]) -> None:
+        """A domain that cannot receive mail makes every guess on it worthless;
+        find that out (all domains at once) before a single check is spent."""
+        if not self.settings.permutation_require_mx:
+            return
+        domains = {
+            r.place.domain or registered_domain(r.place.website)
+            for r in batch if r.guessed_emails
+        }
+        prefetch_mx(d for d in domains if d and not self.store.get_domain_facts(d))
+        for result in batch:
+            if not result.guessed_emails:
+                continue
+            domain = result.place.domain or registered_domain(result.place.website)
+            if domain and not self._domain_has_mx(result, domain):
+                result.emails = [c for c in result.emails if not c.from_permutation]
+                result.permutations_skipped_reason = result.permutations_skipped_reason or "domain_has_no_mx"
+                result.notes.append("guesses_dropped:no_mx")
+
     def _stage_summary(self) -> dict[str, float]:
         st = self._stage
         return {
@@ -577,6 +604,7 @@ class Pipeline:
                     if DEFERRED in candidate.notes:
                         candidate.notes.remove(DEFERRED)
                         candidate.lead_eligible = True
+            self._drop_guesses_without_mx(batch)
             self._verify_all(batch, found=False)
             self._score_and_save(batch, report)
             done += len(batch)
@@ -763,8 +791,11 @@ class Pipeline:
             return
 
         search_sem = asyncio.Semaphore(max(1, self.settings.web_search_concurrency))
+        lanes = max(1, self.settings.prepare_ahead)          # batches crawled at once share the sockets
+        per_batch_sockets = max(8, self.settings.http_concurrency // lanes)
+        site_budget = float(self.settings.site_timeout or 0)
         async with Fetcher(self.settings, cache=self.store) as fetcher:
-            semaphore = asyncio.Semaphore(max(1, self.settings.http_concurrency))
+            semaphore = asyncio.Semaphore(per_batch_sockets)
             done = 0
             fetched_before = [0, 0.0]
 
@@ -772,10 +803,16 @@ class Pipeline:
                 nonlocal done
                 async with semaphore:
                     try:
-                        await self._process_site(
-                            result, fetcher, search_sem, discover=discover,
-                            owner_search=owner_search,
-                        )
+                        job = self._process_site(result, fetcher, search_sem, discover=discover,
+                                                 owner_search=owner_search)
+                        if site_budget > 0:
+                            await asyncio.wait_for(job, timeout=site_budget)
+                        else:
+                            await job
+                    except asyncio.TimeoutError:
+                        # Whatever was gathered so far stands; the rest of the batch moves on.
+                        result.website_status = result.website_status or "timeout"
+                        result.notes.append(f"site_timeout:{int(site_budget)}s")
                     except Exception as exc:  # a single bad site must not kill the run
                         log.warning("processing failed for %s: %s", result.place.name, exc)
                         result.website_status = result.website_status or f"error:{type(exc).__name__}"
@@ -1062,12 +1099,9 @@ class Pipeline:
                     result.permutations_skipped_reason = "permutations_disabled"
             return
 
-        # DNS is pure latency: look every domain up at once instead of one by one.
-        prefetch_mx(
-            result.place.domain or registered_domain(result.place.website)
-            for result in results
-            if not self.store.get_domain_facts(result.place.domain or registered_domain(result.place.website) or "")
-        )
+        # No DNS here: whether the domain can receive mail is checked in the
+        # guess pass, right before its guesses would be spent - so a slow or
+        # dead resolver never holds up the crawl of the businesses behind it.
         for result in results:
             domain = result.place.domain or registered_domain(result.place.website)
             known = [c.email for c in result.emails]
@@ -1081,7 +1115,6 @@ class Pipeline:
                 if not domain:
                     result.permutations_skipped_reason = "no_domain"
                 else:
-                    self._domain_has_mx(result, domain)
                     plan = build_permutations(
                         domain,
                         business_name=result.place.name,
@@ -1089,7 +1122,7 @@ class Pipeline:
                         business_type=result.place.query,
                         tier=self.settings.permutation_tier,
                         max_candidates=self.settings.permutation_max,
-                        require_mx=self.settings.permutation_require_mx,
+                        require_mx=False,
                         is_chain=result.is_chain,
                         allow_chains=self.settings.permutations_for_chains,
                         exclude=known,
@@ -1110,12 +1143,11 @@ class Pipeline:
                 continue
             if any(c.is_owner and not c.from_permutation for c in result.emails):
                 continue
-            self._domain_has_mx(result, domain)
             plan = build_owner_permutations(
                 domain,
                 owner,
                 max_candidates=self.settings.owner_permutation_max,
-                require_mx=self.settings.permutation_require_mx,
+                require_mx=False,
                 is_chain=result.is_chain,
                 allow_chains=self.settings.chain_person_guesses,
                 exclude=known,

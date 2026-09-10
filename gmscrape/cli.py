@@ -350,7 +350,22 @@ def configure_logging(level: str) -> None:
 
 
 # --- commands --------------------------------------------------------------
+def _raise_open_file_limit() -> None:
+    """macOS shells default to 256 open files; a crawl with a few hundred
+    sockets in flight would die with 'Too many open files'."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = min(hard if hard != resource.RLIM_INFINITY else 8192, 8192)
+        if soft < wanted:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def _launch() -> None:
+    _raise_open_file_limit()
     from .banner import print_banner
 
     print_banner(_console)
