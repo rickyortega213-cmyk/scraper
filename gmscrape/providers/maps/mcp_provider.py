@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Iterator, Optional
 
 from ...models import Place, QuerySpec
@@ -146,7 +147,9 @@ class MCPMaps(MapsProvider):
         seen: set[str] = set()
         yielded = 0
         per_page = min(limit, 20)
-        for page in range(1, self.settings.maps_max_pages + 1):
+        retried = False
+        page = 1
+        while page <= self.settings.maps_max_pages:
             args = build_arguments(tool, spec, per_page, page, template)
             try:
                 payload = mcp.call_tool(tool.name, args)
@@ -155,14 +158,28 @@ class MCPMaps(MapsProvider):
                     raise ProviderError(f"{tool.name}: {exc}") from exc
                 return
             _, rows = find_result_rows(payload)
-            if not rows and isinstance(payload, str):
-                log.warning("mcp tool %s returned text, not listings: %s", tool.name, payload[:160])
             if not rows:
+                problem = _looks_like_failure(payload)
+                if problem:
+                    # A 200 with an error inside: quota, throttling, bad input. Never "0 businesses".
+                    raise ProviderError(f"{tool.name}: {problem}")
+                if page == 1 and not _looks_like_no_results(payload) and not retried:
+                    # Unrecognised answer: could be a hiccup. One retry, then say what came back.
+                    log.warning("mcp tool %s answered without listings for %r; retrying once: %s",
+                                tool.name, spec.search_string, _snippet(payload))
+                    retried = True
+                    time.sleep(2.0)
+                    continue
+                if page == 1 and not _looks_like_no_results(payload):
+                    log.warning("mcp tool %s: no listings recognised for %r: %s",
+                                tool.name, spec.search_string, _snippet(payload))
                 return
             new = 0
+            dropped = 0
             for raw in rows:
                 place = place_from_mapping(raw, query=spec.search_string, source=self.name)
                 if place is None:
+                    dropped += 1
                     continue
                 key = place.dedupe_key()
                 if key in seen:
@@ -173,8 +190,15 @@ class MCPMaps(MapsProvider):
                 yielded += 1
                 if yielded >= limit:
                     return
+            if dropped and new == 0:
+                raise ProviderError(
+                    f"{tool.name}: {dropped} listing(s) came back but none had a business name; "
+                    f"first row keys: {', '.join(list(rows[0])[:12])}. Set MCP_MAPS_ARGS / MCP_MAPS_TOOL "
+                    "or run `gmscrape probe-mcp --call --raw`."
+                )
             if new == 0 or not any(p in tool.properties for p in _PAGE_PARAMS) and not template:
                 return
+            page += 1
 
     def close(self) -> None:
         if self._mcp is not None:
@@ -184,3 +208,55 @@ class MCPMaps(MapsProvider):
 
 def _redact(url: str) -> str:
     return re.sub(r"/([A-Za-z0-9_\-]{12,})(?=/|$)", "/…", url)
+
+
+_FAILURE_KEYS = ("error", "errors", "error_message", "errorMessage", "detail")
+_FAILURE_WORDS = ("rate limit", "too many", "quota", "credit", "exceeded", "unauthori", "forbidden",
+                  "invalid api", "invalid key", "expired", "subscription", "not allowed", "timeout",
+                  "timed out", "failed", "blocked", "captcha", "unavailable")
+_NO_RESULT_WORDS = ("no results", "no result", "nothing found", "no businesses", "0 results")
+
+
+def _snippet(payload: Any, width: int = 220) -> str:
+    try:
+        text = payload if isinstance(payload, str) else json.dumps(payload, default=str)
+    except (TypeError, ValueError):
+        text = str(payload)
+    text = " ".join(text.split())
+    return text[:width] + ("…" if len(text) > width else "")
+
+
+def _looks_like_failure(payload: Any) -> str:
+    """The error text when a 'successful' tool answer is really a failure, else ''."""
+    if isinstance(payload, str):
+        lowered = payload.lower()
+        if any(w in lowered for w in _FAILURE_WORDS):
+            return _snippet(payload)
+        return ""
+    if isinstance(payload, dict):
+        for key in _FAILURE_KEYS:
+            value = payload.get(key)
+            if value:
+                return _snippet(value)
+        status = str(payload.get("status") or payload.get("success") or "").lower()
+        if status in ("error", "failed", "false", "fail"):
+            return _snippet(payload.get("message") or payload)
+        message = str(payload.get("message") or payload.get("msg") or "").lower()
+        if message and any(w in message for w in _FAILURE_WORDS):
+            return _snippet(payload.get("message") or payload.get("msg"))
+    return ""
+
+
+def _looks_like_no_results(payload: Any) -> bool:
+    """A recognisable, honest 'nothing matched' answer."""
+    if payload in (None, "", [], {}):
+        return True
+    if isinstance(payload, str):
+        return any(w in payload.lower() for w in _NO_RESULT_WORDS)
+    if isinstance(payload, dict):
+        lists = [v for v in payload.values() if isinstance(v, list)]
+        if lists and all(len(v) == 0 for v in lists):
+            return True
+        message = str(payload.get("message") or "").lower()
+        return any(w in message for w in _NO_RESULT_WORDS)
+    return False

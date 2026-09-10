@@ -100,6 +100,7 @@ class RunReport:
     verification_calls: int = 0
     verification_cache_hits: int = 0
     errors: list[str] = field(default_factory=list)
+    empty_queries: list[str] = field(default_factory=list)   # searches that found nothing
     sinks: list[Any] = field(default_factory=list)
     resumed: int = 0                 # businesses restored from a previous attempt
     total: int = 0                   # businesses known so far (restored + pending); grows while streaming
@@ -180,6 +181,7 @@ class RunReport:
             "web_search_calls": self.search_calls,
             "web_search_cache_hits": self.search_cache_hits,
             "maps_cache_hits": self.maps_cache_hits,
+            "searches_with_no_results": len(self.empty_queries),
             "guess_pass_businesses": self.guesses_checked,
             "guess_pass_left": self.guesses_left,
             "resumed_businesses": self.resumed,
@@ -614,6 +616,12 @@ class Pipeline:
             if places:
                 self.store.put_maps(self.maps.name, spec.search_string,
                                     [asdict(p) for p in places], complete=False)
+            return places
+        if not places:
+            # Remembered, but never as final: an empty answer is re-asked next time
+            # (a throttled or hiccuping provider must not turn into a week of zeros).
+            report.empty_queries.append(spec.search_string)
+            self.store.put_maps(self.maps.name, spec.search_string, [], complete=False)
             return places
         # Fewer than asked for means the provider ran out: the list is complete.
         self.store.put_maps(self.maps.name, spec.search_string,

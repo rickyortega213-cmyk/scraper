@@ -607,6 +607,13 @@ Stopped. 240/3600 businesses were finished and are in out/leads.csv.
 Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
 ```
 
+- **A search that returns no businesses is never final.** Throttling or a
+  hiccup at the Maps provider must not become "0 businesses" for a week, so an
+  empty answer is asked again on the next run, an error hidden inside a
+  successful-looking answer (quota, rate limit) is raised as an error instead
+  of zero, and the end of the run lists the searches that found nothing with
+  the command that shows the provider's raw answer:
+  `gmscrape probe-mcp --call --raw --query "hotels in banning ca"`.
 - **`scraper resume`** restores the finished businesses from the database and
   continues with the rest — no re-crawling, no re-verifying, no second Maps
   call. `scraper buddy` offers this itself when it finds an unfinished run.
@@ -648,7 +655,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 235 tests, no network or API keys needed
+make test     # 239 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

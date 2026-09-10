@@ -249,3 +249,30 @@ def test_cli_checks_the_verification_key_before_spending(monkeypatch, tmp_path, 
     assert code == 2
     assert any("rejected the API key" in t for t in said) and any("Nothing was spent" in t for t in said)
     assert maps.calls == []                                   # not one Maps credit spent
+
+
+def test_a_search_that_found_nothing_is_asked_again_next_run(settings, site_server):
+    """An empty Maps answer (throttling, a hiccup) must not be remembered as
+    final for a week: the next run asks again, and old cached zeros are dropped."""
+    class Flaky(CountingMaps):
+        def search(self, spec, limit):
+            if not self.calls:
+                self.calls.append(spec.search_string)
+                return iter(())                      # first time: nothing
+            return super().search(spec, limit)       # (the parent records the call)
+
+    maps = Flaky(settings, _places(site_server, 2))
+    store = Store(settings.db_path)
+    with Pipeline(settings, store=store, maps=maps, verifier=StubVerifier(settings)) as pipeline:
+        first = pipeline.run(["plumber in banning ca"])
+    assert first.done == 0 and first.empty_queries == ["plumber in banning ca"]
+    assert first.stats()["searches_with_no_results"] == 1
+    with Pipeline(settings, store=Store(settings.db_path), maps=maps, verifier=StubVerifier(settings)) as pipeline:
+        second = pipeline.run(["plumber in banning ca"])
+    assert maps.calls == ["plumber in banning ca"] * 2 and second.done == 2
+
+    # A zero remembered as final by an older version is forgotten on open.
+    store.put_maps("counting", "hotels in banning ca", [], complete=True)
+    store.conn.commit()
+    reopened = Store(settings.db_path)
+    assert reopened.get_maps("counting", "hotels in banning ca", 168) is None

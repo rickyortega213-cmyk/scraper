@@ -1290,7 +1290,10 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
 
     def hook(event: str, data: dict) -> None:
         if event == "query_done":
-            echo(f"  [green]✓[/green] {data['query']}: {data['found']} businesses")
+            if data["found"]:
+                echo(f"  [green]✓[/green] {data['query']}: {data['found']} businesses")
+            else:
+                echo(f"  [yellow]○[/yellow] {data['query']}: no businesses returned")
         elif event == "classified":
             echo(f"  [bold]{data['businesses']}[/bold] unique businesses to process")
         elif event == "site_done":
@@ -1403,6 +1406,11 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
         echo("[yellow]Errors:[/yellow]")
         for error in report.errors[:10]:
             echo(f"  • {error}")
+    if report.empty_queries:
+        shown = report.empty_queries[:5]
+        echo(f"[yellow]{len(report.empty_queries)} search(es) returned no businesses:[/yellow] "
+             + "; ".join(shown) + (" …" if len(report.empty_queries) > 5 else ""))
+        echo(f"  see the raw answer with:  [cyan]gmscrape probe-mcp --call --raw --query \"{shown[0]}\"[/cyan]")
     for sink in getattr(report, "sinks", []) or []:
         stats_obj = getattr(sink, "stats", None)
         if stats_obj is not None:

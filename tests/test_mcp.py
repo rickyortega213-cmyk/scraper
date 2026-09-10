@@ -153,3 +153,87 @@ def test_mcp_url_is_the_auto_selected_maps_provider():
     from gmscrape.providers.registry import detect_maps_provider
 
     assert detect_maps_provider(Settings.from_env(mcp_maps_url="https://mcp.x/k", serpapi_key="s")) == "mcp"
+
+
+class _Scripted(_MCP):
+    """A server whose tools/call answer is whatever the test puts in `answer`."""
+
+    answer: dict = {}
+    hits = 0
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        message = json.loads(self.rfile.read(length))
+        if message.get("method") == "tools/call":
+            type(self).hits += 1
+            result = {"content": [{"type": "text", "text": json.dumps(self.answer)}]}
+            body = json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Mcp-Session-Id", self.session)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.rfile = _Rewind(json.dumps(message).encode())   # hand the rest to the base handler
+        self.headers.replace_header("Content-Length", str(len(self.rfile.data)))
+        super().do_POST()
+
+
+class _Rewind:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def read(self, n: int = -1) -> bytes:
+        out, self.data = self.data, b""
+        return out
+
+
+@pytest.fixture
+def scripted_url():
+    _Scripted.sse = False
+    _Scripted.hits = 0
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Scripted)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{port}/a25e-fake-key"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_error_inside_a_successful_answer_is_never_zero_businesses(scripted_url):
+    _Scripted.answer = {"status": "error", "message": "Rate limit exceeded, retry later"}
+    provider = MCPMaps(Settings.from_env(mcp_maps_url=scripted_url))
+    with pytest.raises(ProviderError, match="Rate limit"):
+        list(provider.search(parse_query("hotels in banning ca"), limit=20))
+    provider.close()
+
+
+def test_listings_without_a_name_field_are_a_loud_error(scripted_url):
+    _Scripted.answer = {"data": [{"phone": "555-0100", "site": "x.com", "rating": 4, "addr": "1 Main"}] * 3}
+    provider = MCPMaps(Settings.from_env(mcp_maps_url=scripted_url))
+    with pytest.raises(ProviderError, match="none had a business name"):
+        list(provider.search(parse_query("hotels in banning ca"), limit=20))
+    provider.close()
+
+
+def test_an_unrecognised_empty_answer_is_retried_once(scripted_url, monkeypatch):
+    import gmscrape.providers.maps.mcp_provider as M
+
+    monkeypatch.setattr(M.time, "sleep", lambda s: None)
+    _Scripted.answer = {"weird": "shape"}
+    provider = MCPMaps(Settings.from_env(mcp_maps_url=scripted_url))
+    assert list(provider.search(parse_query("hotels in banning ca"), limit=20)) == []
+    assert _Scripted.hits == 2                       # asked twice before giving up
+    provider.close()
+    _Scripted.hits = 0
+    _Scripted.answer = {"status": "ok", "data": []}   # an honest "nothing matched": no retry
+    provider = MCPMaps(Settings.from_env(mcp_maps_url=scripted_url))
+    assert list(provider.search(parse_query("hotels in banning ca"), limit=20)) == []
+    assert _Scripted.hits == 1
+    provider.close()

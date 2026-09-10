@@ -152,6 +152,9 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        # Earlier versions remembered "0 businesses" as a final answer for a week.
+        self.conn.execute("DELETE FROM maps_cache WHERE complete = 1 AND places IN ('[]', '')")
+        self.conn.commit()
         self.conn.commit()
 
     def _migrate(self) -> None:
