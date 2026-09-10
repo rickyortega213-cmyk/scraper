@@ -190,7 +190,7 @@ normalized to `valid / invalid / risky / catch_all / disposable / unknown`.
 
 ```bash
 MAILTESTER_KEY=...              # the key from mailtester.ninja's key page, exactly as shown
-MAILTESTER_RATE=5               # requests per 10 s your plan allows: 5 Starter, 11 Pro, 57 Ultimate
+MAILTESTER_RATE=57              # requests per 10 s: Ultimate plan (11 Pro, 5 Starter)
 ```
 
 MailTester Ninja has two ways in and the program finds the one your key

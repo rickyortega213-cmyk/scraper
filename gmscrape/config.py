@@ -84,7 +84,7 @@ class Settings:
 
     mailtester_key: str = ""
     mailtester_auth: str = "auto"     # auto | direct (key= on every call) | token (exchange first)
-    mailtester_rate: int = 5          # requests per 10 s: 5 Starter, 11 Pro, 57 Ultimate; 0 = no limit
+    mailtester_rate: int = 57         # requests per 10 s: Ultimate plan (11 Pro, 5 Starter); 0 = no limit
     millionverifier_key: str = ""
     zerobounce_key: str = ""
     neverbounce_key: str = ""
@@ -148,7 +148,7 @@ class Settings:
     verify_emails: bool = True
     verify_found: bool = True
     verify_permutations: bool = True
-    verify_concurrency: int = 8
+    verify_concurrency: int = 16      # enough in flight to use the Ultimate rate
     verify_budget: int = 0            # 0 = unlimited API calls for the run
     keep_risky: bool = True
     keep_invalid: bool = False
