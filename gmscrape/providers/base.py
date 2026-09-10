@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import random
 import time
 from abc import ABC, abstractmethod
@@ -175,6 +176,8 @@ def place_from_mapping(
     name = squeeze(str(pick("name") or ""))
     if not name:
         return None
+    if _permanently_closed(raw):
+        return None          # a closed business is not a lead
 
     website_raw = pick("website")
     if isinstance(website_raw, dict):
@@ -198,17 +201,29 @@ def place_from_mapping(
     if isinstance(category, (list, tuple)):
         category = ", ".join(str(c) for c in category[:3])
 
+    address = squeeze(str(pick("address") or ""))
+    parts = raw.get("full_address_array") or raw.get("address_array")
+    if isinstance(parts, (list, tuple)) and any(isinstance(x, str) and x.strip() for x in parts):
+        # scraper.tech prefixes full_address with the business name; the array is clean.
+        address = ", ".join(squeeze(str(x)) for x in parts if isinstance(x, str) and x.strip())
+    elif name and address.lower().startswith(name.lower() + ","):
+        address = squeeze(address[len(name) + 1:])
+    city = squeeze(str(pick("city") or ""))
+    state = squeeze(str(pick("state") or ""))
+    postal = squeeze(str(pick("postal_code") or ""))
+    city, state, postal = _split_locality(city, state, postal, address)
+
     return Place(
         name=name,
         query=query,
         source=source,
         place_id=squeeze(str(pick("place_id") or "")),
         category=squeeze(str(category or "")),
-        address=squeeze(str(pick("address") or "")),
+        address=address,
         street=squeeze(str(pick("street") or "")),
-        city=squeeze(str(pick("city") or "")),
-        state=squeeze(str(pick("state") or "")),
-        postal_code=squeeze(str(pick("postal_code") or "")),
+        city=city,
+        state=state,
+        postal_code=postal,
         country=squeeze(str(pick("country") or "")),
         phone=clean_phone(pick("phone")),
         website=website,
@@ -222,6 +237,36 @@ def place_from_mapping(
         google_url=squeeze(str(pick("google_url") or "")),
         raw=raw,
     )
+
+
+_LOCALITY_RE = re.compile(r"^(?P<city>.+?),\s*(?P<state>[A-Za-z]{2})(?:\s+(?P<zip>\d{5}(?:-\d{4})?))?$")
+_CLOSED_KEYS = ("is_permanently_closed", "permanently_closed", "permanentlyClosed", "closed")
+
+
+def _permanently_closed(raw: dict[str, Any]) -> bool:
+    for key in _CLOSED_KEYS:
+        value = raw.get(key)
+        if value is True or (isinstance(value, str) and value.strip().lower() in ("true", "yes", "1")):
+            return True
+    status = str(raw.get("business_status") or raw.get("businessStatus") or "").upper()
+    return "PERMANENTLY" in status
+
+
+def _split_locality(city: str, state: str, postal: str, address: str) -> tuple[str, str, str]:
+    """'Banning, CA' as the city (state missing) -> ('Banning', 'CA', zip from the address)."""
+    match = _LOCALITY_RE.match(city) if city else None
+    if match:
+        city = squeeze(match.group("city"))
+        state = state or match.group("state").upper()
+        postal = postal or (match.group("zip") or "")
+    if address and (not city or not state or not postal):
+        tail = squeeze(address.split(",")[-2] + "," + address.split(",")[-1]) if address.count(",") >= 1 else address
+        tail_match = _LOCALITY_RE.match(tail)
+        if tail_match:
+            city = city or squeeze(tail_match.group("city"))
+            state = state or tail_match.group("state").upper()
+            postal = postal or (tail_match.group("zip") or "")
+    return city, state, postal
 
 
 class MapsProvider(ABC):

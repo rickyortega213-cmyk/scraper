@@ -66,10 +66,16 @@ def smart_title(text: str) -> str:
     if not text:
         return ""
     out: list[str] = []
+    letters = [ch for ch in text if ch.isalpha()]
+    shouting = bool(letters) and all(ch.isupper() for ch in letters)
     # Split on spaces but keep hyphenated / slashed parts cased individually.
     for index, token in enumerate(re.split(r"(\s+)", text)):
         if not token or token.isspace():
             out.append(token)
+            continue
+        bare = token.strip("&,.!()")
+        if (not shouting and bare.isalpha() and bare.isupper() and 2 <= len(bare) <= 4):
+            out.append(token)               # IHG, KFC, DDS: an acronym the source wrote in caps
             continue
         parts = re.split(r"([-/])", token)
         cased = []

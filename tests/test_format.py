@@ -22,6 +22,8 @@ from gmscrape.store.export import CLEAN_COLUMNS, clean_rows, export_results
     ("1st choice hvac", "1st Choice HVAC"),
     ("iPhone repair", "iPhone Repair"),
     ("Bright Now! Dental", "Bright Now! Dental"),
+    ("Holiday Inn Express & Suites Banning by IHG", "Holiday Inn Express & Suites Banning by IHG"),
+    ("BANNING TIRE CENTER LLC", "Banning Tire Center LLC"),
     ("", ""),
 ])
 def test_smart_title(raw, expected):
@@ -106,3 +108,35 @@ def test_csv_is_the_clean_table(tmp_path):
     rows = list(csv.DictReader((tmp_path / "leads.csv").open(encoding="utf-8-sig")))
     assert list(rows[0]) == list(CLEAN_COLUMNS)
     assert rows[0]["phone_number"] == "(512)-555-0100"
+
+
+def test_scraper_tech_listing_maps_to_clean_columns():
+    """The real shape scraper.tech returns: name-prefixed full_address, city
+    carrying the state, state null, phone in E.164."""
+    from gmscrape.models import BusinessResult
+    from gmscrape.providers.base import place_from_mapping
+    from gmscrape.store.export import clean_rows
+
+    raw = {"business_id": "0x80db:0xae5d", "phone_number": "+19515725550",
+           "name": "Holiday Inn Express & Suites Banning by IHG",
+           "full_address": "Holiday Inn Express & Suites Banning by IHG, 3020 W Ramsey St, Banning, CA 92220",
+           "full_address_array": ["3020 W Ramsey St", "Banning, CA 92220"],
+           "review_count": 759, "rating": 3.9, "website": "https://www.ihg.com/holidayinnexpress/x",
+           "place_id": "ChIJ673", "types": ["Hotel", "Inn"], "city": "Banning, CA", "state": None,
+           "is_permanently_closed": False}
+    place = place_from_mapping(raw, query="hotels in banning ca", source="mcp")
+    assert (place.address, place.city, place.state, place.postal_code) == (
+        "3020 W Ramsey St, Banning, CA 92220", "Banning", "CA", "92220")
+    assert place.category == "Hotel" and place.reviews == 759 and place.domain == "ihg.com"
+    row = clean_rows(BusinessResult(place=place), "2026-09-10")[0]
+    assert row["company_name"] == "Holiday Inn Express & Suites Banning by IHG"
+    assert (row["city"], row["state"], row["phone_number"]) == ("Banning", "CA", "(951)-572-5550")
+    assert row["address"] == "3020 W Ramsey St, Banning, CA 92220"
+
+    # A permanently closed listing is not a lead.
+    assert place_from_mapping({**raw, "is_permanently_closed": True}, query="q", source="mcp") is None
+    assert place_from_mapping({**raw, "business_status": "CLOSED_PERMANENTLY"}, query="q", source="mcp") is None
+    # No array and no prefix: the plain address and a comma city still split.
+    plain = place_from_mapping({"name": "Joe's", "address": "1 Main St, Austin, TX 78702", "city": "Austin, TX"},
+                               query="q", source="x")
+    assert (plain.city, plain.state, plain.postal_code, plain.address) == ("Austin", "TX", "78702", "1 Main St, Austin, TX 78702")

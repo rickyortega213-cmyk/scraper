@@ -190,7 +190,9 @@ class MCPMaps(MapsProvider):
                 yielded += 1
                 if yielded >= limit:
                     return
-            if dropped and new == 0:
+            named = sum(1 for raw in rows if isinstance(raw, dict) and any(
+                k in raw for k in ("name", "title", "business_name", "businessName")))
+            if dropped and new == 0 and named == 0:
                 raise ProviderError(
                     f"{tool.name}: {dropped} listing(s) came back but none had a business name; "
                     f"first row keys: {', '.join(list(rows[0])[:12])}. Set MCP_MAPS_ARGS / MCP_MAPS_TOOL "
