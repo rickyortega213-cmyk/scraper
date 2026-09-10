@@ -32,6 +32,12 @@ class ProviderError(RuntimeError):
     """Raised when a provider is misconfigured or the API refuses to answer."""
 
 
+class ProviderAuthError(ProviderError):
+    """The provider rejected the key or the subscription itself. Retrying is
+    pointless and every further call would be wasted: the run must stop and
+    the person must fix the key."""
+
+
 class ApiClient:
     """Small synchronous HTTP client with retry/backoff for provider APIs."""
 
@@ -252,6 +258,11 @@ class EmailVerifier(ABC):
     @abstractmethod
     def verify(self, email: str) -> VerificationResult:
         """Check one address."""
+
+    def preflight(self) -> None:
+        """Cheap check that the key will work, done before any money is spent.
+        Raises ProviderAuthError when it will not; other errors mean "unsure"."""
+        return None
 
     def verify_many(self, emails: Sequence[str]) -> dict[str, VerificationResult]:
         return {email: self.verify(email) for email in emails}

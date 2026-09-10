@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from gmscrape.config import Settings
 from gmscrape.core.pipeline import Pipeline, RunStopped
 from gmscrape.models import Place, QuerySpec
 from gmscrape.providers.base import MapsProvider
@@ -196,3 +197,54 @@ def test_buddy_asks_for_the_table_name_after_the_searches(tmp_path, monkeypatch)
     assert any("Supabase table" in t and "run_" in t for t in asked)   # default offered
     assert captured["supabase_table_name"] == "austin_dentists_sept"
     assert captured["queries"] == ["dentist in austin tx"]
+
+
+def test_a_refused_verification_key_stops_the_run_resumably(settings, site_server):
+    """A dead subscription must not burn Maps/search credits on unverifiable
+    leads: the run stops, is marked failed, and can be resumed once fixed."""
+    from gmscrape.core.pipeline import RunStopped
+    from gmscrape.providers.base import ProviderAuthError
+
+    class Refusing(StubVerifier):
+        def verify(self, email):
+            raise ProviderAuthError("MailTester Ninja rejected the API key")
+
+    settings.batch_size = 2
+    store = Store(settings.db_path)
+    with Pipeline(settings, store=store, maps=CountingMaps(settings, _places(site_server, 3)),
+                  verifier=Refusing(settings)) as pipeline:
+        with pytest.raises(RunStopped) as stopped:
+            pipeline.run(["plumber in austin tx"])
+    assert isinstance(stopped.value.cause, ProviderAuthError)
+    run = store.list_runs()[0]
+    assert run["status"] == "failed" and store.latest_unfinished_run()["run_id"] == run["run_id"]
+
+
+def test_cli_checks_the_verification_key_before_spending(monkeypatch, tmp_path, site_server):
+    from gmscrape import cli
+    from gmscrape.providers.base import ProviderAuthError
+
+    class Refusing(StubVerifier):
+        requires_key = True
+
+        def preflight(self):
+            raise ProviderAuthError("MailTester Ninja rejected the API key (HTTP 401)")
+
+    maps = CountingMaps(Settings.from_env(), _places(site_server, 2))
+    monkeypatch.setattr(cli, "get_verifier", lambda settings, name=None: Refusing(settings))
+    monkeypatch.setattr("gmscrape.core.pipeline.get_verifier", lambda settings, name=None: Refusing(settings))
+    monkeypatch.setattr("gmscrape.core.pipeline.get_maps_provider", lambda settings, name=None: maps)
+    monkeypatch.setattr("gmscrape.keys.interactive", lambda: False)
+    said: list[str] = []
+    monkeypatch.setattr(cli, "echo", lambda text="", *a, **k: said.append(str(text)))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GMSCRAPE_CONFIG", str(tmp_path / "cfg.env"))
+    monkeypatch.setenv("MAILTESTER_KEY", "sub_dead")
+    places = tmp_path / "places.csv"
+    places.write_text("name,website\n", encoding="utf-8")
+    code = cli.main(["run", "plumber in austin tx", "-y", "--maps-provider", "file",
+                     "--places-file", str(places),
+                     "--db", str(tmp_path / "t.sqlite"), "-o", str(tmp_path / "out")])
+    assert code == 2
+    assert any("rejected the API key" in t for t in said) and any("Nothing was spent" in t for t in said)
+    assert maps.calls == []                                   # not one Maps credit spent

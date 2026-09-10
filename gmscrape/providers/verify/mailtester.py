@@ -39,7 +39,7 @@ from ...models import (
     V_VALID,
 )
 from ...util import as_float
-from ..base import EmailVerifier, ProviderError
+from ..base import EmailVerifier, ProviderAuthError, ProviderError
 from .vendors import normalize_status
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,7 @@ class MailTesterNinja(EmailVerifier):
         self._token: str = ""
         self._token_expires_at: float = 0.0
         self._token_lock = threading.Lock()
+        self._auth_error: str = ""          # once the key is refused, stop asking
 
     # --- token handling ----------------------------------------------------
     def _api_key(self) -> str:
@@ -112,8 +113,25 @@ class MailTesterNinja(EmailVerifier):
             raise ProviderError("MAILTESTER_KEY is not set")
         return str(key)
 
+    def _auth_message(self, status: int, body: str) -> str:
+        body = (body or "").strip()
+        pointer = f" and pointed to {body}" if body.startswith("http") and " " not in body else ""
+        reason = ("the subscription is not active (or the key is wrong)"
+                  if "subscribe" in body.lower() else "the key was refused")
+        return (
+            f"MailTester Ninja rejected the API key (HTTP {status}{pointer}): {reason}. "
+            "Log in at https://mailtester.ninja, check the subscription is active, copy the "
+            "API key from the dashboard, then:  scraper keys set MAILTESTER_KEY=<paste>"
+        )
+
+    def preflight(self) -> None:
+        self._get_token()
+
     def _fetch_token(self) -> str:
         response = self.client.request("GET", TOKEN_URL, params={"key": self._api_key()})
+        if response.status_code in (401, 403):
+            self._auth_error = self._auth_message(response.status_code, response.text[:200])
+            raise ProviderAuthError(self._auth_error)
         if response.status_code >= 400:
             raise ProviderError(
                 f"mailtester token request failed (HTTP {response.status_code}): "
@@ -146,6 +164,8 @@ class MailTesterNinja(EmailVerifier):
 
     def _get_token(self, force: bool = False) -> str:
         with self._token_lock:
+            if self._auth_error:
+                raise ProviderAuthError(self._auth_error)
             if force or not self._token or time.time() >= self._token_expires_at:
                 self._token = self._fetch_token()
             return self._token

@@ -143,3 +143,28 @@ def test_catch_all_probe_reads_the_domain():
     flaky = make_verifier(Api({}, default={"code": "mb", "message": "Mailbox busy"}))
     assert flaky.is_catch_all("acme.com") is None
     assert flaky.is_catch_all("") is None
+
+
+def test_a_refused_key_fails_fast_and_says_what_to_do():
+    """HTTP 401 from the token endpoint (body: a subscribe link) means the
+    subscription is dead. One clear error, no further network calls."""
+    from gmscrape.providers.base import ProviderAuthError
+
+    class Refusing(Api):
+        def handler(self, request):
+            if request.url.host == "token.mailtester.ninja":
+                self.token_calls += 1
+                return httpx.Response(401, text="https://mailtester.ninja/subscribe")
+            return super().handler(request)
+
+    api = Refusing({})
+    verifier = make_verifier(api)
+    with pytest.raises(ProviderAuthError) as err:
+        verifier.preflight()
+    text = str(err.value)
+    assert "subscription is not active" in text and "https://mailtester.ninja/subscribe" in text
+    assert "scraper keys set MAILTESTER_KEY" in text
+    for email in ("a@x.com", "b@x.com", "c@x.com"):
+        with pytest.raises(ProviderAuthError):
+            verifier.verify(email)
+    assert api.token_calls == 1 and api.verify_calls == []     # never hammered again

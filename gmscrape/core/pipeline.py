@@ -48,7 +48,7 @@ from ..models import (
     V_VALID,
 )
 from ..providers import get_maps_provider, get_verifier, get_web_search
-from ..providers.base import EmailVerifier, MapsProvider, ProviderError
+from ..providers.base import EmailVerifier, MapsProvider, ProviderAuthError, ProviderError
 from ..providers.search.base import SearchResponse, WebSearchProvider
 from ..providers.search.openwebninja import parse_response
 from ..providers.verify.local import prefilter
@@ -331,7 +331,9 @@ class Pipeline:
             report.finished_at = time.time()
             self.store.set_run_state(report.run_id, status, done=report.done)
             self._sink_call("flush")
-            if not isinstance(exc, KeyboardInterrupt):
+            if isinstance(exc, ProviderAuthError):
+                log.error("run %s stopped: %s", report.run_id, exc)
+            elif not isinstance(exc, KeyboardInterrupt):
                 log.exception("run %s failed", report.run_id)
             raise RunStopped(report, exc) from exc
 
@@ -1011,6 +1013,8 @@ class Pipeline:
             result = self.verifier.verify(email)
             if self.verifier.requires_key:
                 self._verify_calls += 1
+        except ProviderAuthError:
+            raise                       # a refused key stops the run; see Pipeline.run
         except ProviderError as exc:
             log.warning("verification failed for %s: %s", email, exc)
             return VerificationResult(

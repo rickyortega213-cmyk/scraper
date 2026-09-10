@@ -31,7 +31,7 @@ from .config import Settings, load_env
 from .core.pipeline import Pipeline, RunReport, RunStopped
 from .emails.patterns import build_permutations
 from .providers import get_maps_provider, get_verifier, list_maps_providers, list_verify_providers
-from .providers.base import ProviderError
+from .providers.base import ProviderAuthError, ProviderError
 from .providers.registry import detect_maps_provider, detect_verify_provider
 from .query import parse_queries, read_query_file
 from .store.db import Store
@@ -578,6 +578,16 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
              f"verification: [green]{pipeline.verifier.name}[/green]   "
              f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
              f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
+        if settings.verify_emails and getattr(pipeline.verifier, "requires_key", False):
+            # Prove the verification key works before a single Maps credit is spent.
+            try:
+                pipeline.verifier.preflight()
+            except ProviderAuthError as exc:
+                echo(f"[red]{exc}[/red]")
+                echo("Nothing was spent. Fix the key and start again.")
+                return 2
+            except ProviderError as exc:
+                echo(f"[yellow]could not check the verification key up front ({exc}); continuing[/yellow]")
         if lean:
             exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
         try:
@@ -589,6 +599,12 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
             if isinstance(stopped.cause, KeyboardInterrupt):
                 echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
                      f"finished and are in {paths[0] if paths else 'the export'}.")
+            elif isinstance(stopped.cause, ProviderAuthError):
+                echo(f"[red]Stopped: {stopped.cause}[/red]")
+                echo(f"{report.done}/{report.total} businesses were finished and are in "
+                     f"{paths[0] if paths else 'the export'}. Fix the key, then pick it up with:  "
+                     f"[cyan]scraper resume[/cyan]   (run id {report.run_id})")
+                return 2
             else:
                 echo(f"[red]The run hit an error:[/red] {stopped.cause}")
                 echo(f"{report.done}/{report.total} businesses were finished and are in "
@@ -714,7 +730,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
         for email in args.emails:
             email = email.strip().lower()
             cached = store.get_verification(email)
-            result = cached or verifier.verify(email)
+            try:
+                result = cached or verifier.verify(email)
+            except ProviderAuthError as exc:
+                echo(f"[red]{exc}[/red]")
+                verifier.close()
+                return 2
             if cached is None:
                 store.put_verification(email, result)
             rows.append((

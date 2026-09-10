@@ -196,7 +196,10 @@ MailTester Ninja's two-step flow is handled for you: the key is exchanged for a
 short-lived bearer token, the token is cached for its whole lifetime (read from
 its JWT `exp`), and it is re-fetched automatically when it lapses or the API
 rejects it mid-run. Their `code` values map as `ok` → valid, `ko` → invalid,
-`mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all; an `ok` whose
+`mb` (mailbox busy/greylisted) → unknown, `ca` → catch-all. A key the service
+refuses (HTTP 401 pointing at their subscribe page: the subscription lapsed or
+the key is wrong) is caught **before** a run spends anything, and stops a run
+in progress resumably instead of logging one failure per address; an `ok` whose
 message reveals a catch-all domain is downgraded rather than sold as
 deliverable. An unrecognized code becomes `unknown`, never `valid` — the raw
 `code:message` is always kept in `sub_status`, so `gmscrape verify` shows you
@@ -602,7 +605,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 217 tests, no network or API keys needed
+make test     # 220 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the
