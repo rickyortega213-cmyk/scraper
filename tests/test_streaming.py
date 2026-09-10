@@ -212,3 +212,18 @@ def test_only_the_best_few_found_addresses_are_verified(settings, site_server):
     assert len(verified_found) <= 2 and skipped                  # at most one general + one owner
     assert all(not c.lead_eligible for c in skipped)
     assert result.best_email is not None and result.best_email.email in verifier.calls
+
+
+def test_progress_reports_pace_by_stage_and_a_settled_eta(settings, site_server):
+    settings.batch_size = 2
+    events: list[dict] = []
+    with Pipeline(settings, store=Store(settings.db_path), maps=ManyQueriesMaps(settings, site_server),
+                  verifier=StubVerifier(settings),
+                  progress=lambda e, d: events.append({"event": e, **d})) as pipeline:
+        pipeline.run(QUERIES)
+    batches = [e for e in events if e["event"] == "batch_done"]
+    assert batches and batches[0]["eta_settled"] is False           # too early to call a pace
+    stages = batches[-1]["stages"]
+    assert set(stages) >= {"maps", "crawl", "verify", "search_avg", "fetch_avg", "fetches"}
+    assert stages["crawl"] > 0 and stages["fetches"] > 0 and stages["fetch_avg"] > 0
+    assert stages["maps"] >= 0 and "time_left" in batches[-1]

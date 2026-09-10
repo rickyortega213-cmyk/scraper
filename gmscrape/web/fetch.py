@@ -77,6 +77,7 @@ class Fetcher:
     """Async HTTP client with politeness controls."""
 
     def __init__(self, settings: Settings, cache: Optional[PageCache] = None) -> None:
+        self.stats: dict[str, float] = {"n": 0, "s": 0.0}     # pages fetched, seconds on the wire
         self.settings = settings
         self.cache = cache if settings.cache_http else None
         self._global_sem = asyncio.Semaphore(max(1, settings.http_concurrency))
@@ -181,7 +182,10 @@ class Fetcher:
         async with self._global_sem, self._host_sem(host):
             if self.settings.crawl_delay > 0:
                 await asyncio.sleep(self.settings.crawl_delay)
+            inner = time.perf_counter()
             page = await self._get_with_retries(url)
+            self.stats["n"] += 1
+            self.stats["s"] += time.perf_counter() - inner      # on the wire, not queueing
         page.elapsed = time.perf_counter() - started
 
         if page.ok and self.cache is not None:

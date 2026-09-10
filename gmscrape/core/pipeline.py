@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import queue
 import threading
@@ -233,6 +234,14 @@ class Pipeline:
         self.verifier = verifier or get_verifier(settings)
         self._outstanding = 0               # businesses handed out but not yet finished
         self._deadline = 0.0                # run_hours turned into a wall-clock deadline
+        # Where the time goes, so the progress line can say what sets the pace.
+        self._stage = {"maps": 0.0, "crawl": 0.0, "verify": 0.0,
+                       "search_n": 0, "search_s": 0.0, "fetch_n": 0, "fetch_s": 0.0}
+        # Web searches run in their own pool: asyncio's default one is capped
+        # at a dozen threads, which silently capped WEB_SEARCH_CONCURRENCY.
+        self._search_pool = ThreadPoolExecutor(
+            max_workers=max(1, settings.web_search_concurrency), thread_name_prefix="gmscrape-search")
+        self._window: collections.deque = collections.deque(maxlen=12)   # (time, done) per batch
         self.web_search = web_search if web_search is not None else get_web_search(settings)
         self.progress = progress or (lambda event, data: None)
         self._search_calls = 0
@@ -320,13 +329,25 @@ class Pipeline:
                     self._outstanding -= len(work.batch)
                     self.store.set_run_state(report.run_id, "running", total=report.total, done=report.done)
                     elapsed = time.time() - started
-                    rate = (report.done - report.resumed) / elapsed if elapsed > 0 else 0.0
+                    now = time.time()
+                    self._window.append((now, report.done))
+                    # The pace is measured over the last dozen batches, not since
+                    # the start: the first minutes (key checks, the first Maps
+                    # fetch, a crawl with nothing to overlap) are not the run's pace.
+                    span = now - self._window[0][0] if len(self._window) > 1 else 0.0
+                    gained = report.done - self._window[0][1]
+                    settled = len(self._window) >= 3 and span >= 60
+                    rate = (gained / span) if (settled and span > 0) else (
+                        (report.done - report.resumed) / elapsed if elapsed > 0 else 0.0)
                     self.progress("batch_done", {
                         "done": report.done, "total": report.total,
                         "queries_done": report.queries_done, "queries": len(specs),
                         "elapsed": elapsed,
                         "eta": ((report.total - report.done) / rate) if rate > 0 else 0.0,
+                        "eta_settled": settled,
                         "rate_per_hour": rate * 3600,
+                        "stages": self._stage_summary(),
+                        "time_left": self._time_left(),
                         "batch_results": work.batch,
                         "results": report.results,
                     })
@@ -377,7 +398,11 @@ class Pipeline:
 
         def fetch(chunk: list[QuerySpec]) -> tuple[list[Place], dict[str, int]]:
             counts: dict[str, int] = {}
-            return self._collect_places(chunk, report, counts), counts
+            started = time.perf_counter()
+            try:
+                return self._collect_places(chunk, report, counts), counts
+            finally:
+                self._stage["maps"] += time.perf_counter() - started
 
         # Maps for the next chunk are fetched while this chunk is being crawled.
         maps_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gmscrape-maps")
@@ -454,7 +479,9 @@ class Pipeline:
         """Everything that is not metered: crawl, discover, find the owner, plan guesses."""
         if not batch:
             return
+        started = time.perf_counter()
         asyncio.run(self._scrape_websites(batch))
+        self._stage["crawl"] += time.perf_counter() - started
         self._publish(batch, STATUS_CRAWLED)
         self._plan_permutations(batch)
         self._publish([r for r in batch if r.guessed_emails], STATUS_GUESSED)
@@ -471,7 +498,9 @@ class Pipeline:
         goes to guessing."""
         if not batch:
             return
+        started = time.perf_counter()
         self._verify_all(batch, guesses=False)
+        self._stage["verify"] += time.perf_counter() - started
         self._publish(batch, STATUS_VERIFIED)
         for result in batch:
             for candidate in result.guessed_emails:
@@ -504,6 +533,16 @@ class Pipeline:
                         candidate.notes.append("not_lead_eligible:unverified_guess")
         self.store.save_businesses(batch, report.run_id, stage="done")
         self._publish(batch, STATUS_DONE)
+
+    def _stage_summary(self) -> dict[str, float]:
+        st = self._stage
+        return {
+            "maps": st["maps"], "crawl": st["crawl"], "verify": st["verify"],
+            "search_avg": (st["search_s"] / st["search_n"]) if st["search_n"] else 0.0,
+            "searches": st["search_n"],
+            "fetch_avg": (st["fetch_s"] / st["fetch_n"]) if st["fetch_n"] else 0.0,
+            "fetches": st["fetch_n"],
+        }
 
     # --- pass 2: the guesses, most valuable first, while time allows ----------
     def _time_left(self) -> float:
@@ -577,6 +616,7 @@ class Pipeline:
                 log.warning("sink %s.%s failed: %s", type(sink).__name__, method, exc)
 
     def close(self) -> None:
+        self._search_pool.shutdown(wait=False)
         self.maps.close()
         self.verifier.close()
         if self.web_search is not None:
@@ -726,6 +766,7 @@ class Pipeline:
         async with Fetcher(self.settings, cache=self.store) as fetcher:
             semaphore = asyncio.Semaphore(max(1, self.settings.http_concurrency))
             done = 0
+            fetched_before = [0, 0.0]
 
             async def worker(result: BusinessResult) -> None:
                 nonlocal done
@@ -739,6 +780,9 @@ class Pipeline:
                         log.warning("processing failed for %s: %s", result.place.name, exc)
                         result.website_status = result.website_status or f"error:{type(exc).__name__}"
                     done += 1
+                    self._stage["fetch_n"] += fetcher.stats["n"] - fetched_before[0]
+                    self._stage["fetch_s"] += fetcher.stats["s"] - fetched_before[1]
+                    fetched_before[0], fetched_before[1] = fetcher.stats["n"], fetcher.stats["s"]
                     self._publish([result], STATUS_CRAWLED)
                     self.progress(
                         "site_done",
@@ -968,7 +1012,13 @@ class Pipeline:
             response.from_cache = True
             return response
         async with search_sem:
-            return await asyncio.to_thread(self._search_sync, query)
+            loop = asyncio.get_running_loop()
+            started = time.perf_counter()
+            try:
+                return await loop.run_in_executor(self._search_pool, self._search_sync, query)
+            finally:
+                self._stage["search_n"] += 1
+                self._stage["search_s"] += time.perf_counter() - started
 
     def _search_sync(self, query: str) -> SearchResponse:
         assert self.web_search is not None

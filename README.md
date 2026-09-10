@@ -541,10 +541,14 @@ Above 200 searches the program switches to **large-run mode** on its own:
 - the page cache is off (the per-business checkpoint already makes resume free
   of re-crawling); Maps results, searches and verifications stay cached
 - resume skips whole finished searches as well as finished businesses
-- the progress line shows the running rate and a real ETA:
+- the progress line shows the running rate and an ETA measured over the last
+  dozen batches (the first minutes are startup, not the run's pace, so it says
+  "estimating pace…" until it has settled), plus every fifth batch a line that
+  says where the time goes, so the slowest stage is never a mystery:
 
 ```
-checkpoint 41,300/612,000 businesses · searches 1,032/25,000 · 1,410/h · 29h 17m elapsed · ~16d 21h left
+checkpoint 41,300/~612,000 businesses · searches 1,032/25,000 · 9,410/h · 4h 17m elapsed · ~2d 12h left
+pace per batch: crawl+search 38s (pages 1.2s avg, searches 3.9s avg) · verify 21s · maps 6m 02s total
 ```
 
 The throughput ceiling is not the program, it's the three providers: how fast
@@ -655,7 +659,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 239 tests, no network or API keys needed
+make test     # 240 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

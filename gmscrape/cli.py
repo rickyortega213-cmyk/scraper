@@ -1315,10 +1315,29 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
             echo(f"  [yellow]time budget used up:[/yellow] {data['left']:,} businesses still have unchecked "
                  f"guesses (found addresses are all done). `scraper resume` continues them.")
         elif event == "batch_done":
-            eta = f" · ~{_fmt_duration(data['eta'])} left" if data["eta"] else ""
-            echo(f"  [bold]checkpoint[/bold] {data['done']}/{data['total']} businesses · "
+            if not data.get("eta_settled", True):
+                eta = " · estimating pace…"
+            elif data["eta"]:
+                eta = f" · ~{_fmt_duration(data['eta'])} left"
+            else:
+                eta = ""
+            echo(f"  [bold]checkpoint[/bold] {data['done']:,}/~{data['total']:,} businesses · "
                  f"searches {data['queries_done']}/{data['queries']} · "
-                 f"{int(data['rate_per_hour'])}/h · {_fmt_duration(data['elapsed'])} elapsed{eta}")
+                 f"{int(data['rate_per_hour']):,}/h · {_fmt_duration(data['elapsed'])} elapsed{eta}")
+            state["batches"] = state.get("batches", 0) + 1
+            stages = data.get("stages") or {}
+            if stages and state["batches"] % 5 == 0:
+                n = state["batches"]
+                echo(f"  [dim]pace per batch: crawl+search {_fmt_duration(stages['crawl'] / n)} "
+                     f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg) · "
+                     f"verify {_fmt_duration(stages['verify'] / n)} · maps {_fmt_duration(stages['maps'])} total[/dim]")
+            budget = data.get("time_left")
+            if (data.get("eta_settled") and data["eta"] and budget not in (None, float("inf"))
+                    and data["eta"] > budget and not state.get("budget_warned")):
+                state["budget_warned"] = True
+                echo(f"  [yellow]at this pace the found-address pass alone needs ~{_fmt_duration(data['eta'])}, "
+                     f"more than the time budget; it will finish anyway, but guessing will be cut.[/yellow] "
+                     "Look at the pace line: the slowest stage is what to speed up.")
             if exporter is not None:
                 try:
                     exporter.on_batch(data)
