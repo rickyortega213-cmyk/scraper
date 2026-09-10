@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools
+import threading
 import re
 import unicodedata
 from typing import Any, Iterable, Optional
@@ -161,16 +161,36 @@ def trim_context(text: str, index: int, width: int = 60) -> str:
     return squeeze(text[start:end])
 
 
-@functools.lru_cache(maxsize=16384)
+_MX_CACHE: dict[str, tuple[str, ...]] = {}
+_MX_CACHE_MAX = 200_000
+_MX_LOCK = threading.Lock()
+
+
 def mx_lookup(domain: str) -> Optional[tuple[str, ...]]:
     """MX hostnames for a domain (A/AAAA fallback per RFC 5321).
 
     Returns () when DNS says the domain cannot receive mail, and None when
     DNS could not answer (timeout, server failure) - which is not the same
-    thing, and must never be cached as "no MX".
+    thing, and must never be cached as "no MX". Only definite answers are
+    remembered, so a transient DNS hiccup is retried the next time the
+    domain comes up instead of silently disabling permutations for it.
     """
     if not domain:
         return ()
+    domain = domain.lower()
+    with _MX_LOCK:
+        if domain in _MX_CACHE:
+            return _MX_CACHE[domain]
+    answer = _mx_lookup_uncached(domain)
+    if answer is not None:
+        with _MX_LOCK:
+            if len(_MX_CACHE) >= _MX_CACHE_MAX:
+                _MX_CACHE.clear()
+            _MX_CACHE[domain] = answer
+    return answer
+
+
+def _mx_lookup_uncached(domain: str) -> Optional[tuple[str, ...]]:
     try:
         import dns.resolver  # imported lazily so DNS stays optional
         from dns.exception import Timeout
