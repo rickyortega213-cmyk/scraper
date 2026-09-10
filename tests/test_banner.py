@@ -8,7 +8,7 @@ def test_side_by_side_when_wide_enough():
     lines = text.splitlines()
     assert all(len(line) <= WIDE for line in lines)
     assert any("SCRAPER" not in line and "███████╗" in line for line in lines)   # wordmark present
-    assert any(line.startswith(":@@@@@@") for line in lines)                      # the mark, left column
+    assert any(line.startswith("@@@@@@") for line in lines)                       # the mark, left column
     assert "B U D D Y   2 . 0" in text and "P R O F I T   S Y S T E M S" in text
     # the wordmark sits to the right of the mark, on the same rows
     row = next(line for line in lines if "███████╗ ██████╗" in line)
