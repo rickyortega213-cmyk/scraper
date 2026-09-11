@@ -635,9 +635,10 @@ Pick it up where it stopped with:  scraper resume   (run id 3f9c1d2a8b7e)
   `HTTP_CONCURRENCY` and resume).
 - **Every run also writes `out/scraper.log`** (rotating, 20 MB × 3), so a
   run that ends without a word on the terminal still leaves a record of its
-  last minutes. On a Mac the program also runs `caffeinate` for as long as it
-  lives, so the machine will not idle-sleep mid-run (a closed lid still
-  sleeps it; `scraper resume` picks up afterwards).
+  last minutes. To keep a Mac from idle-sleeping during a long run, start it
+  as `caffeinate -i scraper resume` yourself (the program deliberately does
+  not spawn it: a script that keeps the machine awake is a pattern security
+  scanners flag).
 - **`scraper resume`** restores the finished businesses from the database and
   continues with the rest — no re-crawling, no re-verifying, no second Maps
   call. `scraper buddy` offers this itself when it finds an unfinished run.

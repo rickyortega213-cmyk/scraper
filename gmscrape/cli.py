@@ -371,24 +371,6 @@ def add_log_file(path: str) -> None:
         logging.getLogger(__name__).info("log file: %s", path)
 
 
-def _keep_awake() -> None:
-    """On a Mac, stop idle sleep for as long as this process lives (caffeinate
-    exits by itself when the run does). A closed lid still sleeps the machine."""
-    if sys.platform != "darwin":
-        return
-    import shutil
-    import subprocess
-
-    if not shutil.which("caffeinate"):
-        return
-    try:
-        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        pass
-
-
-# --- commands --------------------------------------------------------------
 def _raise_open_file_limit() -> None:
     """macOS shells default to 256 open files; a crawl with a few hundred
     sockets in flight would die with 'Too many open files'."""
@@ -405,7 +387,6 @@ def _raise_open_file_limit() -> None:
 
 def _launch() -> None:
     _raise_open_file_limit()
-    _keep_awake()
     from .banner import print_banner
 
     print_banner(_console)
