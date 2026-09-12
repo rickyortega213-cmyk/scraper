@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""Verifier Buddy - a fast, dependency-free MailTester Ninja email verifier.
+
+    verifier                       interactive: banner, key prompt, paste emails
+    verifier a@b.com c@d.com       verify the given addresses
+    verifier leads.csv             verify every address found in a file
+    verifier --help                all options
+
+Only the Python standard library is used, so it runs anywhere python3 does.
+The API key is remembered in ~/.config/verifier-buddy/config.json (mode 0600).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import csv
+import http.client
+import json
+import os
+import re
+import signal
+import ssl
+import stat
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlencode, urlsplit
+
+__version__ = "1.0.0"
+
+# --------------------------------------------------------------------------- #
+# MailTester Ninja API
+# --------------------------------------------------------------------------- #
+# Overridable for tests / self-hosted proxies.
+VERIFY_URL = os.environ.get("VERIFIER_API_URL", "https://happy.mailtester.ninja/ninja")
+TOKEN_URL = os.environ.get("VERIFIER_TOKEN_URL", "https://token.mailtester.ninja/token")
+PROBE_EMAIL = "probe@example.com"
+
+HTTP_TIMEOUT = 45.0
+RATE_WINDOW = 10.0                       # plan limits are "per 10 seconds"
+PLANS = {"starter": 5, "pro": 11, "ultimate": 57}
+DEFAULT_PLAN = "starter"
+
+LIMITED_BACKOFF = (2.0, 5.0, 10.0, 20.0)  # after "Limited" / HTTP 429
+NETWORK_RETRIES = 3                       # transient socket / 5xx errors
+RECHECK_PASSES = 2                        # re-ask about busy / timed-out mailboxes
+RECHECK_PAUSE = 4.0
+
+TOKEN_SAFETY_MARGIN = 120.0
+TOKEN_FALLBACK_TTL = 1800.0
+
+UNAUTHORIZED_HINTS = ("token", "unauthorized", "expired", "invalid key", "forbidden", "subscribe")
+LIMITED_HINTS = ("limited", "rate limit", "too many")
+CATCH_ALL_HINTS = ("catch-all", "catch all", "catchall", "accept-all", "accept all")
+DISPOSABLE_HINTS = ("disposable", "temporary")
+RETRY_MESSAGES = ("timeout", "mx error", "busy", "greylist")   # worth a second look
+
+STATUS_VALID, STATUS_INVALID, STATUS_CATCH_ALL = "valid", "invalid", "catch-all"
+STATUS_RISKY, STATUS_UNKNOWN, STATUS_BAD_SYNTAX = "risky", "unknown", "bad-syntax"
+
+CODE_MAP = {
+    "ok": STATUS_VALID, "valid": STATUS_VALID, "accepted": STATUS_VALID,
+    "ko": STATUS_INVALID, "invalid": STATUS_INVALID, "rejected": STATUS_INVALID,
+    "mb": STATUS_UNKNOWN, "busy": STATUS_UNKNOWN, "greylisted": STATUS_UNKNOWN,
+    "ca": STATUS_CATCH_ALL, "catch_all": STATUS_CATCH_ALL, "catch-all": STATUS_CATCH_ALL,
+    "accept_all": STATUS_CATCH_ALL,
+    "dis": STATUS_RISKY, "disposable": STATUS_RISKY,
+    "err": STATUS_UNKNOWN, "error": STATUS_UNKNOWN, "unknown": STATUS_UNKNOWN,
+    "timeout": STATUS_UNKNOWN,
+}
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+CONFIG_DIR = Path(os.environ.get("VERIFIER_CONFIG_DIR", Path.home() / ".config" / "verifier-buddy"))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+BANNER = r"""
+ _    __          _ _____              ____            __    __
+| |  / /__  _____(_) __(_)__  _____   / __ )__  ______/ /___/ /_  __
+| | / / _ \/ ___/ / /_/ / _ \/ ___/  / __  / / / / __  / __  / / / /
+| |/ /  __/ /  / / __/ /  __/ /     / /_/ / /_/ / /_/ / /_/ / /_/ /
+|___/\___/_/  /_/_/ /_/\___/_/     /_____/\__,_/\__,_/\__,_/\__, /
+                                                           /____/
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Terminal helpers
+# --------------------------------------------------------------------------- #
+class Style:
+    enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+    @classmethod
+    def paint(cls, text: str, *codes: str) -> str:
+        if not cls.enabled or not codes:
+            return text
+        return "".join(f"\033[{c}m" for c in codes) + text + "\033[0m"
+
+    @classmethod
+    def bold(cls, t: str) -> str: return cls.paint(t, "1")
+    @classmethod
+    def dim(cls, t: str) -> str: return cls.paint(t, "2")
+    @classmethod
+    def green(cls, t: str) -> str: return cls.paint(t, "32")
+    @classmethod
+    def red(cls, t: str) -> str: return cls.paint(t, "31")
+    @classmethod
+    def yellow(cls, t: str) -> str: return cls.paint(t, "33")
+    @classmethod
+    def cyan(cls, t: str) -> str: return cls.paint(t, "36")
+    @classmethod
+    def magenta(cls, t: str) -> str: return cls.paint(t, "35")
+
+
+STATUS_COLOR = {
+    STATUS_VALID: Style.green,
+    STATUS_INVALID: Style.red,
+    STATUS_CATCH_ALL: Style.yellow,
+    STATUS_RISKY: Style.magenta,
+    STATUS_UNKNOWN: Style.dim,
+    STATUS_BAD_SYNTAX: Style.red,
+}
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def ask(prompt: str, default: str = "") -> str:
+    """Prompt on stdin; Ctrl-C / Ctrl-D exit cleanly."""
+    try:
+        answer = input(Style.cyan("? ") + prompt + " ").strip()
+    except (KeyboardInterrupt, EOFError):
+        say()
+        say(Style.dim("bye!"))
+        sys.exit(130)
+    return answer or default
+
+
+def ask_yes_no(prompt: str, default: bool = True) -> bool:
+    hint = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = ask(f"{prompt} {hint}").lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        say(Style.dim("  please answer y or n"))
+
+
+def mask_key(key: str) -> str:
+    key = key.strip()
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}…{key[-4:]}"
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+def load_config() -> dict[str, Any]:
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(tmp, CONFIG_FILE)
+
+
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+class ApiError(Exception):
+    """Transient: network trouble, a 5xx, a non-JSON body."""
+
+
+class AuthError(Exception):
+    """The service refused the key. Not retried."""
+
+
+class RateLimited(Exception):
+    """HTTP 429 or a "Limited" answer."""
+
+
+class Cancelled(Exception):
+    """The run was stopped (Ctrl-C or a dead key); the worker should bail."""
+
+
+# --------------------------------------------------------------------------- #
+# HTTP: one keep-alive connection per thread
+# --------------------------------------------------------------------------- #
+_ssl_context = ssl.create_default_context()
+_thread_local = threading.local()
+
+
+def _connection(url: str) -> http.client.HTTPConnection:
+    parts = urlsplit(url)
+    key = (parts.scheme, parts.netloc)
+    pool: dict = getattr(_thread_local, "pool", None) or {}
+    conn = pool.get(key)
+    if conn is None:
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                               timeout=HTTP_TIMEOUT, context=_ssl_context)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80,
+                                              timeout=HTTP_TIMEOUT)
+        pool[key] = conn
+        _thread_local.pool = pool
+    return conn
+
+
+def _drop_connection(url: str) -> None:
+    parts = urlsplit(url)
+    pool = getattr(_thread_local, "pool", None) or {}
+    conn = pool.pop((parts.scheme, parts.netloc), None)
+    if conn is not None:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def http_get(url: str, params: dict[str, str]) -> tuple[int, str]:
+    """GET with keep-alive; a dead connection is rebuilt and the call
+    retried once before the caller sees an error."""
+    parts = urlsplit(url)
+    path = (parts.path or "/") + "?" + urlencode(params)
+    headers = {"User-Agent": f"verifier-buddy/{__version__}", "Accept": "application/json"}
+    last: Optional[Exception] = None
+    for attempt in range(2):
+        conn = _connection(url)
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            if resp.getheader("Connection", "").lower() == "close":
+                _drop_connection(url)
+            return resp.status, body
+        except (http.client.HTTPException, OSError) as exc:
+            last = exc
+            _drop_connection(url)
+            if attempt == 0:
+                continue
+    raise ApiError(f"network error: {last}")
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiter: a steady drip, never a burst
+# --------------------------------------------------------------------------- #
+class RateLimiter:
+    """`limit` calls per `window` seconds, spaced evenly across all threads.
+    A 429 stretches the gap and pauses everyone; clean answers relax it."""
+
+    MAX_STRETCH = 8.0
+    RECOVER_AFTER = 60
+
+    def __init__(self, limit: int, window: float = RATE_WINDOW) -> None:
+        self.limit = max(1, int(limit))
+        self.base_interval = window / self.limit
+        self.interval = self.base_interval
+        self._next_slot = 0.0
+        self._hold_until = 0.0
+        self._clean = 0
+        self._lock = threading.Lock()
+
+    def wait(self, stop: Optional[threading.Event] = None) -> None:
+        """Block until this thread's slot comes up. Stops early if `stop`
+        is set (raises Cancelled) so Ctrl-C never waits on the drip."""
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot, self._hold_until)
+            self._next_slot = slot + self.interval
+        while True:
+            if stop is not None and stop.is_set():
+                raise Cancelled()
+            pause = slot - time.monotonic()
+            if pause <= 0:
+                return
+            time.sleep(min(pause, 0.25))
+
+    def penalize(self, hold: float) -> None:
+        with self._lock:
+            self._hold_until = max(self._hold_until, time.monotonic() + hold)
+            self.interval = min(self.base_interval * self.MAX_STRETCH, self.interval * 1.5)
+            self._clean = 0
+
+    def reward(self) -> None:
+        with self._lock:
+            self._clean += 1
+            if self._clean >= self.RECOVER_AFTER and self.interval > self.base_interval:
+                self.interval = max(self.base_interval, self.interval / 1.25)
+                self._clean = 0
+
+
+# --------------------------------------------------------------------------- #
+# The client
+# --------------------------------------------------------------------------- #
+def _jwt_expiry(token: str) -> Optional[float]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = float(claims.get("exp"))
+    except (binascii.Error, ValueError, TypeError, AttributeError):
+        return None
+    return exp if exp > time.time() else None
+
+
+class Result:
+    __slots__ = ("email", "status", "code", "message", "mx", "attempts")
+
+    def __init__(self, email: str, status: str, code: str = "", message: str = "",
+                 mx: str = "", attempts: int = 0) -> None:
+        self.email, self.status, self.code = email, status, code
+        self.message, self.mx, self.attempts = message, mx, attempts
+
+    @property
+    def retryable(self) -> bool:
+        """Busy / timed-out mailboxes deserve another look; a firm answer doesn't."""
+        if self.status != STATUS_UNKNOWN:
+            return False
+        if self.code in ("mb", "busy", "greylisted", "timeout", "err", "error", ""):
+            return True
+        return any(h in self.message.lower() for h in RETRY_MESSAGES)
+
+    def as_row(self) -> dict[str, str]:
+        return {"email": self.email, "status": self.status, "code": self.code,
+                "message": self.message, "mx": self.mx}
+
+
+class MailTester:
+    def __init__(self, key: str, rate: int) -> None:
+        self.key = key.strip()
+        self.limiter = RateLimiter(rate)
+        self.mode = ""              # "direct" or "token" once known
+        self.key_param = ""
+        self.token = ""
+        self.token_expires_at = 0.0
+        self._auth_lock = threading.Lock()
+        self.stop: Optional[threading.Event] = None
+
+    # -- auth ---------------------------------------------------------------
+    def _key_variants(self) -> list[str]:
+        bare = self.key.strip("{}").strip()
+        return [self.key, bare] if bare != self.key else [self.key, "{" + self.key + "}"]
+
+    def authenticate(self) -> str:
+        """Find the door this key opens. Returns "direct" or "token";
+        raises AuthError if the service refuses the key both ways."""
+        with self._auth_lock:
+            if self.mode:
+                return self.mode
+            refusals: list[str] = []
+            for variant in self._key_variants():
+                for _ in range(3):                      # a 429 on the probe is not a refusal
+                    self.limiter.wait()
+                    status, body = http_get(VERIFY_URL, {"email": PROBE_EMAIL, "key": variant})
+                    if status != 429:
+                        break
+                    time.sleep(3.0)
+                payload = self._parse(body)
+                if status in (401, 403):
+                    refusals.append(f"direct key: HTTP {status}")
+                    continue
+                if status >= 400:
+                    raise ApiError(f"HTTP {status}: {body[:160]}")
+                if payload is None:
+                    refusals.append("direct key: non-JSON answer")
+                    continue
+                message = str(payload.get("message") or "").lower()
+                if payload.get("code") or (payload.get("email")
+                                           and not any(h in message for h in UNAUTHORIZED_HINTS)):
+                    self.key_param, self.mode = variant, "direct"
+                    return self.mode
+                refusals.append(f"direct key: {message or 'refused'}")
+            try:
+                self._fetch_token()
+                self.mode = "token"
+                return self.mode
+            except AuthError as exc:
+                refusals.append(f"token: {exc}")
+            raise AuthError("; ".join(refusals))
+
+    def _fetch_token(self) -> None:
+        status, body = http_get(TOKEN_URL, {"key": self.key})
+        if status in (401, 403):
+            raise AuthError(f"HTTP {status}")
+        if status >= 400:
+            raise ApiError(f"token request failed (HTTP {status}): {body[:160]}")
+        payload = self._parse(body)
+        token = ""
+        if isinstance(payload, dict):
+            token = str(payload.get("token") or payload.get("access_token") or "")
+            if not token and payload.get("message"):
+                raise AuthError(str(payload["message"]))
+        if not token:
+            candidate = body.strip().strip('"')
+            if candidate and " " not in candidate and "{" not in candidate:
+                token = candidate
+        if not token:
+            raise AuthError(f"no token in answer: {body[:120]}")
+        exp = _jwt_expiry(token)
+        self.token = token
+        self.token_expires_at = (exp - TOKEN_SAFETY_MARGIN) if exp else time.time() + TOKEN_FALLBACK_TTL
+
+    def _auth_params(self, force: bool = False) -> dict[str, str]:
+        if self.mode == "direct":
+            return {"key": self.key_param}
+        with self._auth_lock:
+            if force or not self.token or time.time() >= self.token_expires_at:
+                self._fetch_token()
+            return {"token": self.token}
+
+    @staticmethod
+    def _parse(body: str) -> Optional[dict[str, Any]]:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    # -- one call -------------------------------------------------------------
+    def _call(self, email: str) -> dict[str, Any]:
+        params = self._auth_params()
+        for retry_auth in (False, True):
+            self.limiter.wait(self.stop)
+            status, body = http_get(VERIFY_URL, {"email": email, **params})
+            if status == 429:
+                raise RateLimited("HTTP 429")
+            if status in (401, 403):
+                if self.mode == "token" and not retry_auth:
+                    params = self._auth_params(force=True)
+                    continue
+                raise AuthError(f"HTTP {status} {body[:100].strip()}")
+            if status >= 400:
+                raise ApiError(f"HTTP {status}: {body[:120]}")
+            payload = self._parse(body)
+            if payload is None:
+                raise ApiError(f"non-JSON answer: {body[:120]}")
+            message = str(payload.get("message") or "").lower()
+            if not payload.get("code") and any(h in message for h in UNAUTHORIZED_HINTS):
+                if self.mode == "token" and not retry_auth:
+                    params = self._auth_params(force=True)
+                    continue
+                raise AuthError(message)
+            if payload.get("code") != "ok" and any(h in message for h in LIMITED_HINTS):
+                raise RateLimited(message)
+            return payload
+        raise ApiError("no usable answer")
+
+    def verify(self, email: str) -> Result:
+        """Verify one address. Rate limits and network hiccups are retried
+        here; only an AuthError escapes."""
+        attempts = 0
+        limited = 0
+        errors = 0
+        while True:
+            if self.stop is not None and self.stop.is_set():
+                raise Cancelled()
+            attempts += 1
+            try:
+                payload = self._call(email)
+                self.limiter.reward()
+                return self._to_result(email, payload, attempts)
+            except RateLimited:
+                if limited >= len(LIMITED_BACKOFF):
+                    return Result(email, STATUS_UNKNOWN, "limited", "rate limited", attempts=attempts)
+                pause = LIMITED_BACKOFF[limited]
+                limited += 1
+                self.limiter.penalize(pause)
+                self._nap(pause)
+            except ApiError as exc:
+                errors += 1
+                if errors > NETWORK_RETRIES:
+                    return Result(email, STATUS_UNKNOWN, "error", str(exc)[:120], attempts=attempts)
+                self._nap(min(1.0 * errors, 5.0))
+
+    def _nap(self, seconds: float) -> None:
+        if self.stop is not None:
+            if self.stop.wait(seconds):
+                raise Cancelled()
+        else:
+            time.sleep(seconds)
+
+    @staticmethod
+    def _to_result(email: str, payload: dict[str, Any], attempts: int) -> Result:
+        code = str(payload.get("code") or "").strip().lower()
+        message = str(payload.get("message") or "").strip()
+        lowered = message.lower()
+        status = CODE_MAP.get(code, STATUS_UNKNOWN)
+        if any(h in lowered for h in CATCH_ALL_HINTS) and status != STATUS_INVALID:
+            status = STATUS_CATCH_ALL
+        elif any(h in lowered for h in DISPOSABLE_HINTS) and status == STATUS_VALID:
+            status = STATUS_RISKY
+        return Result(email, status, code, message, str(payload.get("mx") or ""), attempts)
+
+
+# --------------------------------------------------------------------------- #
+# Input gathering
+# --------------------------------------------------------------------------- #
+def extract_emails(text: str) -> list[str]:
+    """Every address in the text, lower-cased, de-duplicated, in first-seen order."""
+    seen: dict[str, None] = {}
+    for match in EMAIL_RE.findall(text):
+        seen.setdefault(match.strip(".'").lower(), None)
+    return list(seen)
+
+
+def looks_like_email(token: str) -> bool:
+    return EMAIL_RE.fullmatch(token.strip()) is not None
+
+
+def read_sources(items: list[str]) -> tuple[list[str], list[str]]:
+    """Each item is an address, a file path, or free text. Returns
+    (emails, bad_tokens) where bad tokens are things that were neither."""
+    emails: list[str] = []
+    bad: list[str] = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        path = Path(os.path.expanduser(item))
+        if path.is_file():
+            try:
+                emails.extend(extract_emails(path.read_text(encoding="utf-8", errors="replace")))
+            except OSError as exc:
+                bad.append(f"{item} ({exc})")
+            continue
+        found = extract_emails(item)
+        if found:
+            emails.extend(found)
+        else:
+            bad.append(item)
+    # de-dupe, keep order
+    return list(dict.fromkeys(emails)), bad
+
+
+def read_pasted() -> list[str]:
+    say(Style.dim("  Paste emails (any format: one per line, commas, a whole CSV…)."))
+    say(Style.dim("  Or type a file path. Finish with an empty line."))
+    lines: list[str] = []
+    while True:
+        try:
+            line = input(Style.cyan("> ") if not lines else Style.cyan("  "))
+        except (KeyboardInterrupt, EOFError):
+            say()
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line)
+    emails, _ignored = read_sources(lines)
+    return emails
+
+
+# --------------------------------------------------------------------------- #
+# Running a batch
+# --------------------------------------------------------------------------- #
+class Progress:
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.done = 0
+        self._lock = threading.Lock()
+
+    def record(self, result: Result, count: bool = True) -> None:
+        with self._lock:
+            if count:
+                self.done += 1
+            done, total = self.done, self.total
+        paint = STATUS_COLOR.get(result.status, str)
+        counter = Style.dim(f"{'[%d/%d]' % (done, total):<10}")
+        label = paint(f"{result.status:<10}")
+        tail = Style.dim(result.message) if result.message else ""
+        say(f"  {counter} {label} {result.email}  {tail}")
+
+
+def run_batch(client: MailTester, emails: list[str], workers: int,
+              recheck_passes: int = RECHECK_PASSES) -> tuple[list[Result], str]:
+    """Verify every address concurrently under the rate limit, then re-ask
+    about busy / timed-out mailboxes. Returns (results, note) where note is
+    "" on a clean run, or why it stopped early; results are always complete
+    (unchecked addresses are marked unknown) so nothing is lost on Ctrl-C."""
+    results: dict[str, Result] = {}
+    todo: list[str] = []
+    for email in emails:
+        if looks_like_email(email):
+            todo.append(email)
+        else:
+            results[email] = Result(email, STATUS_BAD_SYNTAX, "", "not an email address")
+
+    progress = Progress(len(emails))
+    for bad in list(results.values()):
+        progress.record(bad)
+
+    stop = threading.Event()
+    client.stop = stop
+    note = ""
+
+    def work(email: str) -> Optional[Result]:
+        nonlocal note
+        if stop.is_set():
+            return None
+        try:
+            return client.verify(email)
+        except AuthError as exc:
+            note = note or f"key stopped working mid-run: {exc}"
+            stop.set()
+            return None
+        except Cancelled:
+            return None
+
+    def run_pass(batch: list[str], label: str) -> None:
+        if not batch or stop.is_set():
+            return
+        if label:
+            say(Style.dim(f"  {label}: {len(batch)} address(es)"))
+        pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(batch))))
+        try:
+            futures = [pool.submit(work, e) for e in batch]
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None:
+                    results[result.email] = result
+                    progress.record(result, count=not label)
+        except KeyboardInterrupt:
+            stop.set()
+            say(Style.yellow("\n  interrupted - saving what finished"))
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    try:
+        run_pass(todo, "")
+        for n in range(recheck_passes):
+            retry = [e for e in todo if e in results and results[e].retryable]
+            if not retry or stop.is_set():
+                break
+            if stop.wait(RECHECK_PAUSE):
+                break
+            run_pass(retry, f"re-checking busy mailboxes, pass {n + 1}")
+    except KeyboardInterrupt:
+        note = "interrupted"
+    finally:
+        client.stop = None
+
+    for email in todo:
+        results.setdefault(email, Result(email, STATUS_UNKNOWN, "", "not checked"))
+    return [results[e] for e in emails], note
+
+
+def write_results(results: list[Result], out: Path) -> None:
+    with open(out, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["email", "status", "code", "message", "mx"])
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r.as_row())
+
+
+def summarize(results: list[Result], elapsed: float, out: Optional[Path]) -> None:
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    say()
+    say(Style.bold("  Summary"))
+    for status in (STATUS_VALID, STATUS_CATCH_ALL, STATUS_RISKY, STATUS_INVALID,
+                   STATUS_UNKNOWN, STATUS_BAD_SYNTAX):
+        if counts.get(status):
+            paint = STATUS_COLOR.get(status, str)
+            say(f"    {paint(f'{status:<11}')} {counts[status]}")
+    per_min = (len(results) / elapsed * 60) if elapsed > 0 else 0
+    say(Style.dim(f"    {len(results)} address(es) in {elapsed:.1f}s  (~{per_min:.0f}/min)"))
+    if out:
+        say(f"    saved → {Style.bold(str(out))}")
+    say()
+
+
+# --------------------------------------------------------------------------- #
+# Interactive flow
+# --------------------------------------------------------------------------- #
+def choose_plan(cfg: dict[str, Any]) -> int:
+    say()
+    say("  Which MailTester Ninja plan is this key on? (sets the safe request rate)")
+    say(f"    1) Starter   {PLANS['starter']} / 10s")
+    say(f"    2) Pro       {PLANS['pro']} / 10s")
+    say(f"    3) Ultimate  {PLANS['ultimate']} / 10s")
+    say("    4) custom    (requests per 10 seconds)")
+    while True:
+        choice = ask("Plan", "1")
+        if choice in ("1", "starter"):
+            cfg["plan"], cfg["rate"] = "starter", PLANS["starter"]
+        elif choice in ("2", "pro"):
+            cfg["plan"], cfg["rate"] = "pro", PLANS["pro"]
+        elif choice in ("3", "ultimate"):
+            cfg["plan"], cfg["rate"] = "ultimate", PLANS["ultimate"]
+        elif choice in ("4", "custom"):
+            raw = ask("Requests per 10 seconds", "5")
+            if not raw.isdigit() or int(raw) < 1:
+                say(Style.dim("  please enter a whole number"))
+                continue
+            cfg["plan"], cfg["rate"] = "custom", int(raw)
+        else:
+            say(Style.dim("  choose 1-4"))
+            continue
+        return int(cfg["rate"])
+
+
+def obtain_key(cfg: dict[str, Any], forced_key: str = "", reset: bool = False) -> tuple[str, bool]:
+    """Returns (key, is_new). Follows the remembered-key rule: ask once, then
+    every later run offers to keep the saved key."""
+    if forced_key:
+        return forced_key.strip(), forced_key.strip() != cfg.get("api_key")
+    saved = str(cfg.get("api_key") or "").strip()
+    if saved and not reset:
+        if ask_yes_no(f"Keep the saved API key ({mask_key(saved)})?", True):
+            return saved, False
+    while True:
+        key = ask("Paste your MailTester Ninja API key:")
+        if len(key) >= 8:
+            return key, True
+        say(Style.dim("  that doesn't look like a key, try again"))
+
+
+def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
+            interactive: bool = True) -> MailTester:
+    """Authenticate and persist the key. A refused key is asked for again
+    when the flow is interactive; a refused --key is a hard exit (2)."""
+    while True:
+        if is_new and not rate_override and sys.stdin.isatty():
+            rate = choose_plan(cfg)
+        else:
+            rate = rate_override or int(cfg.get("rate") or PLANS[DEFAULT_PLAN])
+        client = MailTester(key, rate)
+        say(Style.dim("  checking key…"))
+        try:
+            mode = client.authenticate()
+        except AuthError as exc:
+            say(Style.red(f"  ✗ MailTester Ninja refused this key ({exc})."))
+            say(Style.dim("    Copy it exactly from the API page at https://mailtester.ninja "
+                          "and check the subscription is active."))
+            if not interactive:
+                sys.exit(2)
+            key, is_new = "", True
+            while len(key) < 8:
+                key = ask("Paste a different API key:")
+            continue
+        except ApiError as exc:
+            say(Style.red(f"  ✗ could not reach MailTester Ninja: {exc}"))
+            sys.exit(3)
+        cfg["api_key"] = key
+        cfg["rate"] = rate
+        cfg["auth_mode"] = mode
+        try:
+            save_config(cfg)
+        except OSError as exc:
+            say(Style.yellow(f"  ! could not save config: {exc}"))
+        say(Style.green(f"  ✓ key accepted ({mode} auth, {rate} req / 10s, "
+                        f"saved to {CONFIG_FILE})"))
+        return client
+
+
+def default_output(source_hint: str = "") -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = Path(source_hint).stem if source_hint else ""
+    return Path.cwd() / f"{stem + '-' if stem else ''}verified-{stamp}.csv"
+
+
+def workers_for(rate: int, requested: int) -> int:
+    if requested > 0:
+        return requested
+    # Each check can take several seconds of SMTP chatter; enough threads keep
+    # the drip full without ever exceeding the limiter.
+    return max(4, min(64, rate * 3))
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="verifier",
+        description="Verifier Buddy - MailTester Ninja email verifier for the terminal.",
+        epilog="Run with no arguments for the interactive flow.")
+    parser.add_argument("items", nargs="*", help="email addresses and/or files to verify")
+    parser.add_argument("-k", "--key", default="", help="use this API key (also saved)")
+    parser.add_argument("-r", "--rate", type=int, default=0, help="requests per 10 seconds")
+    parser.add_argument("-w", "--workers", type=int, default=0, help="concurrent requests")
+    parser.add_argument("-o", "--output", default="", help="results CSV path")
+    parser.add_argument("--no-recheck", action="store_true", help="skip second looks at busy mailboxes")
+    parser.add_argument("--reset", action="store_true", help="forget the saved key and ask again")
+    parser.add_argument("--no-banner", action="store_true")
+    parser.add_argument("--version", action="version", version=f"verifier buddy {__version__}")
+    args = parser.parse_args(argv)
+
+    if not args.no_banner:
+        say(Style.cyan(BANNER))
+        say(Style.dim(f"  MailTester Ninja verifier · v{__version__} · Ctrl-C to quit"))
+    say()
+
+    cfg = load_config()
+    if args.reset:
+        cfg.pop("api_key", None)
+    key, is_new = obtain_key(cfg, args.key, args.reset)
+    client = connect(cfg, key, is_new, args.rate, interactive=not args.key)
+    rate = client.limiter.limit
+    workers = workers_for(rate, args.workers)
+    passes = 0 if args.no_recheck else RECHECK_PASSES
+
+    def verify_and_report(emails: list[str], hint: str) -> None:
+        if not emails:
+            say(Style.yellow("  no email addresses found"))
+            return
+        say()
+        say(f"  verifying {Style.bold(str(len(emails)))} address(es) "
+            f"{Style.dim(f'({workers} threads, {rate} req / 10s)')}")
+        out = Path(args.output) if args.output else default_output(hint)
+        started = time.monotonic()
+        results, note = run_batch(client, emails, workers, passes)
+        if note and note != "interrupted":
+            say(Style.red(f"  ✗ {note}"))
+        write_results(results, out)
+        summarize(results, time.monotonic() - started, out)
+        if note == "interrupted":
+            raise KeyboardInterrupt
+
+    if args.items:
+        emails, bad = read_sources(args.items)
+        for b in bad:
+            say(Style.yellow(f"  skipping {b!r}: not an email or a readable file"))
+        hint = next((i for i in args.items if Path(os.path.expanduser(i)).is_file()), "")
+        verify_and_report(emails, hint)
+        return 0
+
+    while True:
+        say()
+        emails = read_pasted()
+        verify_and_report(emails, "")
+        if not ask_yes_no("Verify more?", True):
+            say(Style.dim("  bye!"))
+            return 0
+
+
+if __name__ == "__main__":
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say()
+        sys.exit(130)
