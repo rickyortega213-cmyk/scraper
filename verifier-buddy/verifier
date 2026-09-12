@@ -972,7 +972,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not args.no_banner:
         say(Style.cyan(BANNER))
-        say(Style.dim(f"  MailTester Ninja verifier · v{__version__} · Ctrl-C to quit"))
+        bits = [f"MailTester Ninja verifier · v{__version__}"]
+        if os.environ.get("VERIFIER_REV"):
+            bits.append(f"rev {os.environ['VERIFIER_REV']}")
+        bits.append("Ctrl-C to quit")
+        say(Style.dim("  " + " · ".join(bits)))
+        if os.environ.get("VERIFIER_UPDATED"):
+            say(Style.green(f"  ✓ updated from GitHub ({os.environ['VERIFIER_UPDATED']})"))
     say()
 
     cfg = load_config()

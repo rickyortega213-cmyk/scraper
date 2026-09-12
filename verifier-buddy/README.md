@@ -14,16 +14,25 @@ One file, no dependencies beyond Python 3.9+, and it remembers your API key.
 
 ## Install
 
+One line, on a Mac or Linux terminal:
+
 ```bash
-bash verifier-buddy/install.sh          # copies `verifier` into ~/.local/bin
-bash verifier-buddy/install.sh --link   # symlinks it instead, so your edits are live
-bash verifier-buddy/install.sh --system # system-wide, in /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/claude/loving-lamport-9qut59/verifier-buddy/install.sh | bash
 ```
 
 Open a new terminal and type `verifier`.
 
-**Updating:** after editing `verifier-buddy/verifier`, or pulling a newer
-version, re-run the installer (not needed if you installed with `--link`).
+GitHub is the single source of truth. The installer clones the repo into
+`~/.verifier-buddy` and puts a tiny launcher at `~/.local/bin/verifier`.
+**Every time you run `verifier` it pulls the latest commit from GitHub
+first**, so a change pushed to the branch is live in your terminal on the
+next run (the banner shows the revision and says when it just updated).
+Offline, it simply runs the version it already has.
+
+- `VERIFIER_NO_UPDATE=1 verifier` skips the update check for one run.
+- Run the installer from inside your own checkout of the repo and it uses
+  that checkout instead of `~/.verifier-buddy`.
+- `bash ~/.verifier-buddy/verifier-buddy/install.sh --uninstall` removes the launcher.
 
 ## Use
 
