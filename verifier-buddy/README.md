@@ -66,7 +66,9 @@ Ann,Acme,ann@acme.com,111,ann@acme.com,valid,Accepted
 - By default only `valid` counts as verified. `--keep valid,catch-all` widens it.
 - A cell holding several addresses is fine: the ones that verified land in `verified_email`.
 - The same address in many rows is verified once; every row gets the verdict.
-- Tab- and semicolon-separated files come back with the same delimiter.
+- Tab- and semicolon-separated files come back with the same delimiter,
+  quoted multi-line cells and Windows line endings survive untouched, and
+  Excel's `sep=,` hint line is understood.
 - A plain list of addresses works too and produces a one-column table.
 
 Results print live, colour-coded, and are saved next to where you run
@@ -89,8 +91,11 @@ Results print live, colour-coded, and are saved next to where you run
 - HTTP 429 / "Limited" answers back off and retry; the gap between calls
   stretches on a 429 and relaxes again after a run of clean answers.
 - Network hiccups and 5xx answers retry with keep-alive connections.
-- Busy / timed-out mailboxes (`mb`, Timeout, Mx Error) are re-checked twice
-  at the end instead of being written off as unknown.
+- Inconclusive answers (busy, Timeout, Mx Error, SPAM Block, rate limited)
+  are never recorded as invalid, whatever code they arrive with; they are
+  re-checked twice at the end (after 5 s and 15 s) before being left unknown.
+- A worker hitting an unexpected error records that one address as unknown
+  instead of taking the batch down with it.
 - Duplicates and malformed addresses are dropped locally before any API call.
 - Ctrl-C stops within a moment and still writes everything that finished.
 - Both MailTester auth styles work: direct `key=` and the older token flow.

@@ -89,6 +89,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {**base, "code": "ok", "message": "Catch-All"})
         if local == "nomx":
             return self._json(200, {**base, "mx": "", "code": "ko", "message": "No Mx"})
+        if local == "spam":
+            return self._json(200, {**base, "code": "ko", "message": "SPAM Block"})
+        if local == "tko":                      # timeout reported with a ko code
+            return self._json(200, {**base, "code": "ko", "message": "Timeout"})
+        if local == "flagged":
+            return self._json(200, {**base, "code": "ok", "message": "Accepted", "catch_all": True})
         if local == "busy":
             with st.lock:
                 first = email not in st.busy_seen

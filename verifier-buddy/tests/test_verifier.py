@@ -107,6 +107,43 @@ def test_first_run_keeps_every_column_and_only_verified_rows():
         h.close()
 
 
+def test_inconclusive_answers_are_unknown_not_invalid():
+    h = Harness()
+    try:
+        r = h.run("--key", "good-key-12345", "--rate", "100", "--all", "--no-recheck",
+                  "spam@a.com", "tko@b.com", "flagged@c.com", "nomx@d.com")
+        assert r.returncode == 0, r.stderr + r.stdout
+        rows = by_email(next(h.tmp.glob("*.csv")))
+        assert rows["spam@a.com"]["verify_status"] == "unknown", rows
+        assert rows["tko@b.com"]["verify_status"] == "unknown", rows
+        assert rows["flagged@c.com"]["verify_status"] == "catch-all", rows
+        assert rows["nomx@d.com"]["verify_status"] == "invalid", rows
+    finally:
+        h.close()
+
+
+def test_csv_edge_cases_keep_every_data_row():
+    h = Harness()
+    try:
+        src = h.tmp / "edge.csv"
+        # no header, first row has an empty email cell, a quoted multi-line cell,
+        # Windows line endings, and an Excel sep= hint
+        src.write_bytes(b"sep=,\r\n"
+                        b"Bob,555-1234,,\"12 Main St\r\nSuite 4\"\r\n"
+                        b"Ann,555-9999,ok@a.com,\"Line one\r\nLine two\"\r\n"
+                        b"Cy,555-0000,ko@b.com,plain\r\n")
+        out = h.tmp / "edge-out.csv"
+        r = h.run("--key", "good-key-12345", "--rate", "100", "--all", str(src), "-o", str(out))
+        assert r.returncode == 0, r.stderr + r.stdout
+        rows = read_rows(out)
+        assert [x["col1"] for x in rows] == ["Bob", "Ann", "Cy"], rows
+        assert rows[1]["col4"] == "Line one\r\nLine two"
+        assert rows[0]["verify_status"] == "no-email"
+        assert rows[1]["verify_status"] == "valid" and rows[2]["verify_status"] == "invalid"
+    finally:
+        h.close()
+
+
 def test_tsv_and_semicolon_delimiters_are_kept():
     h = Harness()
     try:

@@ -17,6 +17,7 @@ import base64
 import binascii
 import csv
 import http.client
+import io
 import json
 import os
 import re
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlsplit
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --------------------------------------------------------------------------- #
 # MailTester Ninja API
@@ -49,8 +50,8 @@ DEFAULT_PLAN = "starter"
 
 LIMITED_BACKOFF = (2.0, 5.0, 10.0, 20.0)  # after "Limited" / HTTP 429
 NETWORK_RETRIES = 3                       # transient socket / 5xx errors
-RECHECK_PASSES = 2                        # re-ask about busy / timed-out mailboxes
-RECHECK_PAUSE = 4.0
+RECHECK_PAUSES = (5.0, 15.0)              # re-ask about busy / timed-out mailboxes
+RECHECK_PASSES = len(RECHECK_PAUSES)
 
 TOKEN_SAFETY_MARGIN = 120.0
 TOKEN_FALLBACK_TTL = 1800.0
@@ -59,7 +60,12 @@ UNAUTHORIZED_HINTS = ("token", "unauthorized", "expired", "invalid key", "forbid
 LIMITED_HINTS = ("limited", "rate limit", "too many")
 CATCH_ALL_HINTS = ("catch-all", "catch all", "catchall", "accept-all", "accept all")
 DISPOSABLE_HINTS = ("disposable", "temporary")
-RETRY_MESSAGES = ("timeout", "mx error", "busy", "greylist")   # worth a second look
+# Answers that mean "the check could not complete" rather than a verdict on
+# the mailbox. Whatever `code` they arrive with, they are recorded as unknown
+# and re-checked; recording them as invalid would throw away good leads.
+INCONCLUSIVE_HINTS = ("timeout", "mx error", "busy", "greylist", "spam block", "blocked",
+                      "blacklist", "temporarily", "try again", "limited")
+RETRY_CODES = ("mb", "busy", "greylisted", "timeout", "err", "error", "limited", "")
 
 STATUS_VALID, STATUS_INVALID, STATUS_CATCH_ALL = "valid", "invalid", "catch-all"
 STATUS_RISKY, STATUS_UNKNOWN, STATUS_BAD_SYNTAX = "risky", "unknown", "bad-syntax"
@@ -203,11 +209,29 @@ class Cancelled(Exception):
     """The run was stopped (Ctrl-C or a dead key); the worker should bail."""
 
 
+class FatalError(Exception):
+    """Nothing will succeed until the user fixes something (e.g. TLS trust)."""
+
+
 # --------------------------------------------------------------------------- #
 # HTTP: one keep-alive connection per thread
 # --------------------------------------------------------------------------- #
-_ssl_context = ssl.create_default_context()
+def _make_ssl_context() -> ssl.SSLContext:
+    """The system trust store, or certifi's bundle when it is installed
+    (python.org builds on macOS ship without a usable store)."""
+    try:
+        import certifi  # type: ignore
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_ssl_context = _make_ssl_context()
 _thread_local = threading.local()
+
+TLS_HELP = ("Python cannot verify MailTester's TLS certificate. On a Mac run "
+            "'/Applications/Python 3.x/Install Certificates.command', or: "
+            "python3 -m pip install certifi")
 
 
 def _connection(url: str) -> http.client.HTTPConnection:
@@ -254,6 +278,9 @@ def http_get(url: str, params: dict[str, str]) -> tuple[int, str]:
             if resp.getheader("Connection", "").lower() == "close":
                 _drop_connection(url)
             return resp.status, body
+        except ssl.SSLCertVerificationError as exc:
+            _drop_connection(url)
+            raise FatalError(f"{TLS_HELP} ({exc.reason or exc})") from exc
         except (http.client.HTTPException, OSError) as exc:
             last = exc
             _drop_connection(url)
@@ -326,6 +353,12 @@ def _jwt_expiry(token: str) -> Optional[float]:
     return exp if exp > time.time() else None
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y")
+    return bool(value) if isinstance(value, (bool, int)) else False
+
+
 class Result:
     __slots__ = ("email", "status", "code", "message", "mx", "attempts")
 
@@ -339,9 +372,9 @@ class Result:
         """Busy / timed-out mailboxes deserve another look; a firm answer doesn't."""
         if self.status != STATUS_UNKNOWN:
             return False
-        if self.code in ("mb", "busy", "greylisted", "timeout", "err", "error", ""):
+        if self.code in RETRY_CODES:
             return True
-        return any(h in self.message.lower() for h in RETRY_MESSAGES)
+        return any(h in self.message.lower() for h in INCONCLUSIVE_HINTS)
 
 
 class MailTester:
@@ -478,6 +511,8 @@ class MailTester:
                 payload = self._call(email)
                 self.limiter.reward()
                 return self._to_result(email, payload, attempts)
+            except FatalError:
+                raise
             except RateLimited:
                 if limited >= len(LIMITED_BACKOFF):
                     return Result(email, STATUS_UNKNOWN, "limited", "rate limited", attempts=attempts)
@@ -506,7 +541,16 @@ class MailTester:
         status = CODE_MAP.get(code, STATUS_UNKNOWN)
         if any(h in lowered for h in CATCH_ALL_HINTS) and status != STATUS_INVALID:
             status = STATUS_CATCH_ALL
-        elif any(h in lowered for h in DISPOSABLE_HINTS) and status == STATUS_VALID:
+        elif status == STATUS_VALID and any(h in lowered for h in DISPOSABLE_HINTS):
+            status = STATUS_RISKY
+        elif status != STATUS_VALID and any(h in lowered for h in INCONCLUSIVE_HINTS):
+            status = STATUS_UNKNOWN          # a blocked / timed-out check is not a "no"
+        # Some deployments add explicit flags; trust them when present.
+        if _truthy(payload.get("catch_all")) or _truthy(payload.get("catchall")) \
+                or _truthy(payload.get("accept_all")):
+            if status != STATUS_INVALID:
+                status = STATUS_CATCH_ALL
+        if _truthy(payload.get("disposable")) and status == STATUS_VALID:
             status = STATUS_RISKY
         return Result(email, status, code, message, str(payload.get("mx") or ""), attempts)
 
@@ -598,18 +642,38 @@ def _pick_email_column(columns: list[str], rows: list[list[str]], wanted: str) -
     return max(range(len(scores)), key=lambda i: scores[i]) if any(scores) else 0
 
 
+_NUMERIC_CELL = re.compile(r"^[\d\s()+\-.,/]*\d[\d\s()+\-.,/]*$")   # phone, id, zip…
+
+
+def _looks_like_header(row: list[str]) -> bool:
+    """A header has no address in it and nothing that reads like data
+    (a number, a phone, a URL). A data row with an empty email cell must
+    not be mistaken for one, or it would be dropped from the output."""
+    cells = [c.strip() for c in row]
+    if any(EMAIL_RE.search(c) for c in cells):
+        return False
+    if any(_NUMERIC_CELL.match(c) for c in cells if c):
+        return False
+    if any(c.lower().startswith(("http://", "https://", "www.")) for c in cells):
+        return False
+    return any(cells)
+
+
 def parse_table(text: str, source: str = "", column: str = "") -> Table:
     """Turn pasted text or a file's contents into a Table. Handles a real
     CSV/TSV with a header, a bare list of addresses, or free text."""
     text = text.lstrip("\ufeff")
+    if text.startswith("sep=") and "\n" in text:          # Excel's delimiter hint line
+        text = text.split("\n", 1)[1]
     delimiter = _sniff_delimiter(text)
-    raw = [r for r in csv.reader(text.splitlines(), delimiter=delimiter)]
+    try:
+        raw = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    except csv.Error:
+        raw = [ln.split(delimiter) for ln in text.splitlines()]
     rows = [r for r in raw if any(cell.strip() for cell in r)]
     if not rows:
         return Table(["email"], [], 0, True, delimiter, source)
-    # A header row is one with no address in it, followed by data rows.
-    first_has_email = any(EMAIL_RE.search(c) for c in rows[0])
-    has_header = not first_has_email and len(rows) > 1
+    has_header = _looks_like_header(rows[0]) and len(rows) > 1
     if has_header:
         columns = [c.strip() or f"col{i + 1}" for i, c in enumerate(rows[0])]
         body = rows[1:]
@@ -629,7 +693,9 @@ def parse_table(text: str, source: str = "", column: str = "") -> Table:
 
 
 def load_table_file(path: Path, column: str = "") -> Table:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # newline="" keeps line endings inside quoted cells exactly as they were.
+    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+        text = fh.read()
     return parse_table(text, source=str(path), column=column)
 
 
@@ -677,6 +743,10 @@ def read_pasted(column: str = "") -> list[Table]:
             continue
         lines.append(line)
     paths = [ln.strip() for ln in lines if Path(os.path.expanduser(ln.strip())).is_file()]
+    if not paths and len(lines) == 1 and not EMAIL_RE.search(lines[0]) \
+            and ("/" in lines[0] or lines[0].strip().lower().endswith((".csv", ".txt", ".tsv"))):
+        say(Style.yellow(f"  no such file: {lines[0].strip()}"))
+        return []
     if paths:
         tables, bad = tables_from_args(paths, column)
         for b in bad:
@@ -742,8 +812,14 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
             note = note or f"key stopped working mid-run: {exc}"
             stop.set()
             return None
+        except FatalError as exc:
+            note = note or str(exc)
+            stop.set()
+            return None
         except Cancelled:
             return None
+        except Exception as exc:  # noqa: BLE001 - a bug must not lose the batch
+            return Result(email, STATUS_UNKNOWN, "error", f"internal error: {exc!r}"[:160])
 
     def run_pass(batch: list[str], label: str) -> None:
         if not batch or stop.is_set():
@@ -767,13 +843,14 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
 
     try:
         run_pass(todo, "")
-        for n in range(recheck_passes):
+        for n in range(min(recheck_passes, len(RECHECK_PAUSES))):
             retry = [e for e in todo if e in results and results[e].retryable]
             if not retry or stop.is_set():
                 break
-            if stop.wait(RECHECK_PAUSE):
+            say(Style.dim(f"  {len(retry)} inconclusive; re-checking in {RECHECK_PAUSES[n]:.0f}s…"))
+            if stop.wait(RECHECK_PAUSES[n]):
                 break
-            run_pass(retry, f"re-checking busy mailboxes, pass {n + 1}")
+            run_pass(retry, f"re-check pass {n + 1}")
     except KeyboardInterrupt:
         note = "interrupted"
     finally:
@@ -912,6 +989,9 @@ def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
             while len(key) < 8:
                 key = ask("Paste a different API key:")
             continue
+        except FatalError as exc:
+            say(Style.red(f"  ✗ {exc}"))
+            sys.exit(3)
         except ApiError as exc:
             say(Style.red(f"  ✗ could not reach MailTester Ninja: {exc}"))
             sys.exit(3)
@@ -930,7 +1010,11 @@ def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
 def default_output(source_hint: str = "") -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = Path(source_hint).stem if source_hint else ""
-    return Path.cwd() / f"{stem + '-' if stem else ''}verified-{stamp}.csv"
+    base = Path.cwd() / f"{stem + '-' if stem else ''}verified-{stamp}"
+    out, n = base.with_suffix(".csv"), 2
+    while out.exists():
+        out, n = Path(f"{base}-{n}.csv"), n + 1
+    return out
 
 
 def workers_for(rate: int, requested: int) -> int:
