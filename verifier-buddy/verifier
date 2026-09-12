@@ -961,7 +961,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="write every row with its verdict instead of only verified ones")
     parser.add_argument("--no-recheck", action="store_true", help="skip second looks at busy mailboxes")
     parser.add_argument("--reset", action="store_true", help="forget the saved key and ask again")
-    parser.add_argument("--no-banner", action="store_true")
+    parser.add_argument("--no-banner", action="store_true", help="skip the ASCII art")
     parser.add_argument("--version", action="version", version=f"verifier buddy {__version__}")
     args = parser.parse_args(argv)
 

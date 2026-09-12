@@ -33,9 +33,7 @@ pass "piped install creates clone, launcher and PATH entry"
 # 2. launcher runs the tool and reports the revision
 out="$("$HOME/.local/bin/verifier" --version)"
 [[ "$out" == "verifier buddy "* ]] || fail "launcher did not run the tool: $out"
-rev="$(git -C "$ORIGIN" rev-parse --short HEAD)"
-out="$("$HOME/.local/bin/verifier" --help --no-banner 2>&1 || true)"
-pass "launcher runs verifier ($out | head -c 0)rev $rev"
+pass "launcher runs verifier"
 
 # 3. a new commit on "GitHub" is picked up on the next run
 scratch="$WORK/scratch"
