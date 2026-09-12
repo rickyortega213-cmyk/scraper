@@ -75,3 +75,11 @@ def test_memory_is_measured_and_bounded(settings, site_server):
         assert 1024 <= limit <= 6144
         settings.memory_limit_mb = 2500
         assert pipeline.memory_limit_mb() == 2500
+
+
+def test_supervisor_stops_a_tight_failure_loop(monkeypatch):
+    monkeypatch.setattr(cli, "echo", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "SUPERVISE_FAST_FAILS_MAX", 3)
+    calls = []
+    assert cli.supervise(_args(), run_child=lambda argv: calls.append(argv) or -9, pause=0) == -9
+    assert len(calls) == 3                                     # dying instantly three times: stop, say why

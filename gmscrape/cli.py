@@ -558,8 +558,10 @@ def _startup_key_check(settings: Settings, args: argparse.Namespace) -> Optional
 
 
 # --- the supervisor: a run that gets killed picks itself back up --------------
-SUPERVISE_MAX_RESTARTS = 25
+SUPERVISE_MAX_RESTARTS = 200
 SUPERVISE_PAUSE = 15.0
+SUPERVISE_FAST_FAIL = 60.0           # a child dying inside a minute, repeatedly, is not making progress
+SUPERVISE_FAST_FAILS_MAX = 5
 _CLEAN_EXITS = {0, 2, 130}          # done / refused to start / Ctrl-C: the person decides
 
 
@@ -616,9 +618,17 @@ def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUP
     import time as _time
 
     argv = list(args._argv)
+    fast_fails = 0
     for attempt in range(SUPERVISE_MAX_RESTARTS + 1):
+        started = _time.monotonic()
         code = run_child(argv)
         if code in _CLEAN_EXITS:
+            return code
+        lasted = _time.monotonic() - started
+        fast_fails = fast_fails + 1 if lasted < SUPERVISE_FAST_FAIL else 0
+        if fast_fails >= SUPERVISE_FAST_FAILS_MAX:
+            echo(f"[red]the run died within a minute {fast_fails} times in a row - something is stopping it "
+                 "from starting at all. See out/scraper.log; `scraper resume` continues it once fixed.[/red]")
             return code
         if attempt == SUPERVISE_MAX_RESTARTS:
             echo(f"[red]the run stopped {attempt + 1} times; giving up. `scraper resume` continues it.[/red]")
