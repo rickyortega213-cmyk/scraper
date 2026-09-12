@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Installs the `verifier` command so you can type `verifier` in any terminal.
 #
-#   bash install.sh            install to ~/.local/bin (no sudo)
+#   bash install.sh            copy to ~/.local/bin (no sudo)
+#   bash install.sh --link     symlink instead of copy: edits to this folder's
+#                              `verifier` take effect immediately
 #   bash install.sh --system   install to /usr/local/bin (uses sudo)
 #   bash install.sh --uninstall
 set -euo pipefail
@@ -10,13 +12,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/verifier"
 BIN_DIR="$HOME/.local/bin"
 SUDO=""
+LINK=""
 
-if [[ "${1:-}" == "--system" ]]; then
-  BIN_DIR="/usr/local/bin"
-  [[ $EUID -eq 0 ]] || SUDO="sudo"
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --system) BIN_DIR="/usr/local/bin"; [[ $EUID -eq 0 ]] || SUDO="sudo" ;;
+    --link) LINK=1 ;;
+    --uninstall) ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+if [[ " $* " == *" --uninstall "* ]]; then
   for dir in "$HOME/.local/bin" /usr/local/bin; do
     if [[ -e "$dir/verifier" ]]; then
       if [[ -w "$dir" ]]; then rm -f "$dir/verifier"; else sudo rm -f "$dir/verifier"; fi
@@ -36,8 +43,14 @@ import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)
 PY
 
 $SUDO mkdir -p "$BIN_DIR"
-$SUDO install -m 0755 "$SRC" "$BIN_DIR/verifier"
-echo "installed → $BIN_DIR/verifier"
+if [[ -n "$LINK" ]]; then
+  chmod 0755 "$SRC"
+  $SUDO ln -sfn "$SRC" "$BIN_DIR/verifier"
+  echo "linked → $BIN_DIR/verifier → $SRC  (edits to that file are live)"
+else
+  $SUDO install -m 0755 "$SRC" "$BIN_DIR/verifier"
+  echo "installed → $BIN_DIR/verifier  (re-run this installer after editing $SRC)"
+fi
 
 # Make sure the bin dir is on PATH for future shells.
 case ":$PATH:" in

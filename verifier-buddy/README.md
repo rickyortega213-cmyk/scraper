@@ -15,12 +15,15 @@ One file, no dependencies beyond Python 3.9+, and it remembers your API key.
 ## Install
 
 ```bash
-bash verifier-buddy/install.sh        # puts `verifier` in ~/.local/bin
-# or, system-wide:
-bash verifier-buddy/install.sh --system
+bash verifier-buddy/install.sh          # copies `verifier` into ~/.local/bin
+bash verifier-buddy/install.sh --link   # symlinks it instead, so your edits are live
+bash verifier-buddy/install.sh --system # system-wide, in /usr/local/bin
 ```
 
 Open a new terminal and type `verifier`.
+
+**Updating:** after editing `verifier-buddy/verifier`, or pulling a newer
+version, re-run the installer (not needed if you installed with `--link`).
 
 ## Use
 
