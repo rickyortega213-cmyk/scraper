@@ -343,10 +343,6 @@ class Result:
             return True
         return any(h in self.message.lower() for h in RETRY_MESSAGES)
 
-    def as_row(self) -> dict[str, str]:
-        return {"email": self.email, "status": self.status, "code": self.code,
-                "message": self.message, "mx": self.mx}
-
 
 class MailTester:
     def __init__(self, key: str, rate: int) -> None:
@@ -516,8 +512,13 @@ class MailTester:
 
 
 # --------------------------------------------------------------------------- #
-# Input gathering
+# Input: everything is a table (a plain list of emails is a one-column table)
 # --------------------------------------------------------------------------- #
+DELIMITERS = ",;\t|"
+EMAIL_HEADER_HINTS = ("email", "e-mail", "e_mail", "mail")
+APPENDED_COLUMNS = ("verified_email", "verify_status", "verify_message")
+
+
 def extract_emails(text: str) -> list[str]:
     """Every address in the text, lower-cased, de-duplicated, in first-seen order."""
     seen: dict[str, None] = {}
@@ -530,10 +531,113 @@ def looks_like_email(token: str) -> bool:
     return EMAIL_RE.fullmatch(token.strip()) is not None
 
 
-def read_sources(items: list[str]) -> tuple[list[str], list[str]]:
-    """Each item is an address, a file path, or free text. Returns
-    (emails, bad_tokens) where bad tokens are things that were neither."""
-    emails: list[str] = []
+class Table:
+    """Rows of the user's data with one column that holds the email(s).
+    Every original column is kept so it can be written back out unchanged."""
+
+    def __init__(self, columns: list[str], rows: list[list[str]], email_col: int,
+                 has_header: bool, delimiter: str = ",", source: str = "") -> None:
+        self.columns = columns
+        self.rows = rows
+        self.email_col = email_col
+        self.has_header = has_header
+        self.delimiter = delimiter
+        self.source = source
+
+    def row_emails(self, row: list[str]) -> list[str]:
+        if self.email_col < 0:                       # headerless: scan the whole row
+            return extract_emails(" ".join(row))
+        cell = row[self.email_col] if self.email_col < len(row) else ""
+        return extract_emails(cell)
+
+    @property
+    def email_column_name(self) -> str:
+        return "every column" if self.email_col < 0 else self.columns[self.email_col]
+
+    def unique_emails(self) -> list[str]:
+        seen: dict[str, None] = {}
+        for row in self.rows:
+            for email in self.row_emails(row):
+                seen.setdefault(email, None)
+        return list(seen)
+
+
+def _sniff_delimiter(text: str) -> str:
+    try:
+        return csv.Sniffer().sniff(text[:20000], delimiters=DELIMITERS).delimiter
+    except csv.Error:
+        # Fall back to whichever delimiter appears on the most lines.
+        lines = [ln for ln in text.splitlines() if ln.strip()][:200]
+        best, best_hits = ",", 0
+        for d in DELIMITERS:
+            hits = sum(1 for ln in lines if d in ln)
+            if hits > best_hits:
+                best, best_hits = d, hits
+        return best
+
+
+def _pick_email_column(columns: list[str], rows: list[list[str]], wanted: str) -> int:
+    """The column the user named, else one whose header says "email", else
+    the column with the most email-looking cells."""
+    if wanted:
+        lowered = [c.strip().lower() for c in columns]
+        if wanted.strip().lower() in lowered:
+            return lowered.index(wanted.strip().lower())
+        if wanted.isdigit() and 0 < int(wanted) <= len(columns):
+            return int(wanted) - 1
+        raise ValueError(f"no column called {wanted!r}; columns are: {', '.join(columns)}")
+    for i, name in enumerate(columns):
+        if any(h in name.strip().lower() for h in EMAIL_HEADER_HINTS):
+            return i
+    width = max((len(r) for r in rows), default=len(columns))
+    scores = [0] * max(width, 1)
+    for row in rows[:500]:
+        for i, cell in enumerate(row):
+            if EMAIL_RE.search(cell):
+                scores[i] += 1
+    return max(range(len(scores)), key=lambda i: scores[i]) if any(scores) else 0
+
+
+def parse_table(text: str, source: str = "", column: str = "") -> Table:
+    """Turn pasted text or a file's contents into a Table. Handles a real
+    CSV/TSV with a header, a bare list of addresses, or free text."""
+    text = text.lstrip("\ufeff")
+    delimiter = _sniff_delimiter(text)
+    raw = [r for r in csv.reader(text.splitlines(), delimiter=delimiter)]
+    rows = [r for r in raw if any(cell.strip() for cell in r)]
+    if not rows:
+        return Table(["email"], [], 0, True, delimiter, source)
+    # A header row is one with no address in it, followed by data rows.
+    first_has_email = any(EMAIL_RE.search(c) for c in rows[0])
+    has_header = not first_has_email and len(rows) > 1
+    if has_header:
+        columns = [c.strip() or f"col{i + 1}" for i, c in enumerate(rows[0])]
+        body = rows[1:]
+    else:
+        width = max(len(r) for r in rows)
+        columns = ["email"] if width == 1 else [f"col{i + 1}" for i in range(width)]
+        body = rows
+    width = max([len(columns)] + [len(r) for r in body])
+    if width > len(columns):
+        columns += [f"col{i + 1}" for i in range(len(columns), width)]
+    body = [r + [""] * (width - len(r)) for r in body]
+    if has_header or column or len(columns) == 1:
+        email_col = _pick_email_column(columns, body, column)
+    else:
+        email_col = -1          # no header to trust: take addresses from any cell
+    return Table(columns, body, email_col, has_header, delimiter, source)
+
+
+def load_table_file(path: Path, column: str = "") -> Table:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return parse_table(text, source=str(path), column=column)
+
+
+def tables_from_args(items: list[str], column: str = "") -> tuple[list[Table], list[str]]:
+    """Each item is a file (its own table) or an address / free text (all
+    bare addresses are pooled into one table). Returns (tables, bad_items)."""
+    tables: list[Table] = []
+    loose: list[str] = []
     bad: list[str] = []
     for item in items:
         item = item.strip()
@@ -542,22 +646,24 @@ def read_sources(items: list[str]) -> tuple[list[str], list[str]]:
         path = Path(os.path.expanduser(item))
         if path.is_file():
             try:
-                emails.extend(extract_emails(path.read_text(encoding="utf-8", errors="replace")))
-            except OSError as exc:
+                tables.append(load_table_file(path, column))
+            except (OSError, ValueError) as exc:
                 bad.append(f"{item} ({exc})")
             continue
         found = extract_emails(item)
         if found:
-            emails.extend(found)
+            loose.extend(found)
         else:
             bad.append(item)
-    # de-dupe, keep order
-    return list(dict.fromkeys(emails)), bad
+    if loose:
+        unique = list(dict.fromkeys(loose))
+        tables.append(Table(["email"], [[e] for e in unique], 0, True))
+    return tables, bad
 
 
-def read_pasted() -> list[str]:
-    say(Style.dim("  Paste emails (any format: one per line, commas, a whole CSV…)."))
-    say(Style.dim("  Or type a file path. Finish with an empty line."))
+def read_pasted(column: str = "") -> list[Table]:
+    say(Style.dim("  Paste emails or a whole CSV (header row and all columns are kept),"))
+    say(Style.dim("  or type a file path. Finish with an empty line."))
     lines: list[str] = []
     while True:
         try:
@@ -570,8 +676,17 @@ def read_pasted() -> list[str]:
                 break
             continue
         lines.append(line)
-    emails, _ignored = read_sources(lines)
-    return emails
+    paths = [ln.strip() for ln in lines if Path(os.path.expanduser(ln.strip())).is_file()]
+    if paths:
+        tables, bad = tables_from_args(paths, column)
+        for b in bad:
+            say(Style.yellow(f"  skipping {b}"))
+        return tables
+    try:
+        return [parse_table("\n".join(lines), column=column)]
+    except ValueError as exc:
+        say(Style.yellow(f"  {exc}"))
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -669,15 +784,43 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
     return [results[e] for e in emails], note
 
 
-def write_results(results: list[Result], out: Path) -> None:
+def row_verdict(table: Table, row: list[str], by_email: dict[str, Result],
+                keep: set[str]) -> tuple[list[str], str, str]:
+    """(kept emails, status, message) for one row of the user's data."""
+    emails = table.row_emails(row)
+    if not emails:
+        return [], "no-email", "no email address in this row"
+    kept = [e for e in emails if e in by_email and by_email[e].status in keep]
+    if kept:
+        best = by_email[kept[0]]
+        return kept, best.status, best.message
+    first = by_email.get(emails[0])
+    if first is None:
+        return [], STATUS_UNKNOWN, "not checked"
+    return [], first.status, first.message
+
+
+def write_table(table: Table, by_email: dict[str, Result], out: Path,
+                keep: set[str], keep_all: bool) -> tuple[int, int]:
+    """Write the user's rows (every original column) plus the verdict
+    columns. Only rows with a kept email are written unless keep_all.
+    Returns (rows written, rows dropped)."""
+    written = dropped = 0
     with open(out, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["email", "status", "code", "message", "mx"])
-        writer.writeheader()
-        for r in results:
-            writer.writerow(r.as_row())
+        writer = csv.writer(fh, delimiter=table.delimiter, lineterminator="\n")
+        writer.writerow(list(table.columns) + list(APPENDED_COLUMNS))
+        for row in table.rows:
+            kept, status, message = row_verdict(table, row, by_email, keep)
+            if not kept and not keep_all:
+                dropped += 1
+                continue
+            writer.writerow(list(row) + ["; ".join(kept), status, message])
+            written += 1
+    return written, dropped
 
 
-def summarize(results: list[Result], elapsed: float, out: Optional[Path]) -> None:
+def summarize(results: list[Result], elapsed: float, out: Optional[Path],
+              rows_written: int, rows_dropped: int, keep_all: bool) -> None:
     counts: dict[str, int] = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
@@ -690,6 +833,11 @@ def summarize(results: list[Result], elapsed: float, out: Optional[Path]) -> Non
             say(f"    {paint(f'{status:<11}')} {counts[status]}")
     per_min = (len(results) / elapsed * 60) if elapsed > 0 else 0
     say(Style.dim(f"    {len(results)} address(es) in {elapsed:.1f}s  (~{per_min:.0f}/min)"))
+    if keep_all:
+        say(f"    {rows_written} row(s) written with their verdicts")
+    else:
+        say(f"    {Style.green(str(rows_written))} row(s) kept, "
+            f"{Style.dim(str(rows_dropped) + ' dropped')} (all original columns preserved)")
     if out:
         say(f"    saved → {Style.bold(str(out))}")
     say()
@@ -797,17 +945,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="verifier",
         description="Verifier Buddy - MailTester Ninja email verifier for the terminal.",
-        epilog="Run with no arguments for the interactive flow.")
+        epilog="Run with no arguments for the interactive flow. A CSV keeps every one of "
+               "its columns; only rows whose email verified are written out.")
     parser.add_argument("items", nargs="*", help="email addresses and/or files to verify")
     parser.add_argument("-k", "--key", default="", help="use this API key (also saved)")
     parser.add_argument("-r", "--rate", type=int, default=0, help="requests per 10 seconds")
     parser.add_argument("-w", "--workers", type=int, default=0, help="concurrent requests")
     parser.add_argument("-o", "--output", default="", help="results CSV path")
+    parser.add_argument("-c", "--column", default="",
+                        help="name (or 1-based number) of the email column; auto-detected by default")
+    parser.add_argument("--keep", default=STATUS_VALID,
+                        help="statuses that count as verified, comma-separated "
+                             f"(default: {STATUS_VALID}; e.g. valid,catch-all)")
+    parser.add_argument("--all", action="store_true",
+                        help="write every row with its verdict instead of only verified ones")
     parser.add_argument("--no-recheck", action="store_true", help="skip second looks at busy mailboxes")
     parser.add_argument("--reset", action="store_true", help="forget the saved key and ask again")
     parser.add_argument("--no-banner", action="store_true")
     parser.add_argument("--version", action="version", version=f"verifier buddy {__version__}")
     args = parser.parse_args(argv)
+
+    keep = {k.strip().lower() for k in args.keep.split(",") if k.strip()}
+    known = {STATUS_VALID, STATUS_INVALID, STATUS_CATCH_ALL, STATUS_RISKY, STATUS_UNKNOWN}
+    if not keep <= known:
+        parser.error(f"--keep accepts: {', '.join(sorted(known))}")
 
     if not args.no_banner:
         say(Style.cyan(BANNER))
@@ -823,35 +984,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     workers = workers_for(rate, args.workers)
     passes = 0 if args.no_recheck else RECHECK_PASSES
 
-    def verify_and_report(emails: list[str], hint: str) -> None:
+    def verify_table(table: Table, out_override: str) -> None:
+        emails = table.unique_emails()
         if not emails:
             say(Style.yellow("  no email addresses found"))
             return
         say()
-        say(f"  verifying {Style.bold(str(len(emails)))} address(es) "
-            f"{Style.dim(f'({workers} threads, {rate} req / 10s)')}")
-        out = Path(args.output) if args.output else default_output(hint)
+        where = f" in {Style.bold(table.source)}" if table.source else ""
+        say(f"  {len(table.rows)} row(s){where}, {Style.bold(str(len(emails)))} unique address(es) "
+            f"from {Style.bold(table.email_column_name)}")
+        say(Style.dim(f"  verifying with {workers} threads at {rate} req / 10s"))
+        out = Path(out_override) if out_override else default_output(table.source)
         started = time.monotonic()
         results, note = run_batch(client, emails, workers, passes)
         if note and note != "interrupted":
             say(Style.red(f"  ✗ {note}"))
-        write_results(results, out)
-        summarize(results, time.monotonic() - started, out)
+        by_email = {r.email: r for r in results}
+        written, dropped = write_table(table, by_email, out, keep, args.all)
+        summarize(results, time.monotonic() - started, out, written, dropped, args.all)
         if note == "interrupted":
             raise KeyboardInterrupt
 
     if args.items:
-        emails, bad = read_sources(args.items)
+        tables, bad = tables_from_args(args.items, args.column)
         for b in bad:
             say(Style.yellow(f"  skipping {b!r}: not an email or a readable file"))
-        hint = next((i for i in args.items if Path(os.path.expanduser(i)).is_file()), "")
-        verify_and_report(emails, hint)
+        if not tables:
+            say(Style.red("  nothing to verify"))
+            return 1
+        if args.output and len(tables) > 1:
+            say(Style.yellow("  several inputs: --output is used for the first, the rest are auto-named"))
+        for i, table in enumerate(tables):
+            verify_table(table, args.output if i == 0 else "")
         return 0
 
     while True:
         say()
-        emails = read_pasted()
-        verify_and_report(emails, "")
+        for table in read_pasted(args.column):
+            verify_table(table, "")
         if not ask_yes_no("Verify more?", True):
             say(Style.dim("  bye!"))
             return 0

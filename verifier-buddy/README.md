@@ -36,9 +36,29 @@ verifier leads.csv -o clean.csv   # choose where results go
 the saved key; answer `n` to paste a different one. The key is stored in
 `~/.config/verifier-buddy/config.json` with owner-only permissions.
 
-Results print live, colour-coded, and are saved to a CSV in the current
-folder (`<input>-verified-<timestamp>.csv`) with columns
-`email,status,code,message,mx`. Statuses:
+## CSV in, the same CSV out (verified rows only)
+
+Give it a CSV with any columns and it finds the email column on its own
+(a header containing "email", otherwise the column with the most addresses;
+`--column NAME` to pick one). The output keeps **every original column and
+value exactly as it was**, contains **only the rows whose email verified**,
+and appends three columns:
+
+```
+Name,Company,Email Address,Phone,verified_email,verify_status,verify_message
+Ann,Acme,ann@acme.com,111,ann@acme.com,valid,Accepted
+```
+
+- Rows whose email was rejected, unknown, or missing are dropped
+  (the summary says how many). `--all` writes every row with its verdict instead.
+- By default only `valid` counts as verified. `--keep valid,catch-all` widens it.
+- A cell holding several addresses is fine: the ones that verified land in `verified_email`.
+- The same address in many rows is verified once; every row gets the verdict.
+- Tab- and semicolon-separated files come back with the same delimiter.
+- A plain list of addresses works too and produces a one-column table.
+
+Results print live, colour-coded, and are saved next to where you run
+(`<input>-verified-<timestamp>.csv` or `-o path`). Statuses:
 
 | status       | meaning                                          |
 |--------------|--------------------------------------------------|
@@ -48,6 +68,7 @@ folder (`<input>-verified-<timestamp>.csv`) with columns
 | `risky`      | disposable / temporary address                   |
 | `unknown`    | busy / timed out / rate limited after retries    |
 | `bad-syntax` | not an email address; never sent to the API      |
+| `no-email`   | (with `--all`) the row had no address            |
 
 ## Why it's fast and doesn't fall over
 
@@ -69,6 +90,9 @@ folder (`<input>-verified-<timestamp>.csv`) with columns
 -r, --rate N        requests per 10 seconds (Starter 5, Pro 11, Ultimate 57)
 -w, --workers N     concurrent requests (default: 3× rate, max 64)
 -o, --output FILE   results CSV path
+-c, --column NAME   email column (name or 1-based number); auto-detected by default
+    --keep LIST     statuses that count as verified (default: valid)
+    --all           write every row with its verdict, not only verified ones
     --no-recheck    skip the second look at busy mailboxes
     --reset         forget the saved key and ask again
     --no-banner     skip the ASCII art
