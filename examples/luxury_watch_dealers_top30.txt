@@ -1,0 +1,42 @@
+# Luxury watch dealers in the 30 wealthiest U.S. cities.
+# One search per line, "business type in location". Lines starting with # are ignored.
+#
+# Cities: the U.S. entries of the Henley & Partners "World's Wealthiest Cities"
+# ranking (resident millionaires), with the Bay Area split into San Francisco
+# and San Jose, plus the highest-net-worth enclaves that have their own luxury
+# retail districts (Scottsdale, Palm Beach, Naples, Greenwich, Beverly Hills,
+# Newport Beach). Edit freely.
+#
+# Run:   gmscrape run -f examples/luxury_watch_dealers_top30.txt -n 40
+#        (or paste this path at the "Searches" prompt in `scraper buddy`)
+
+luxury watch dealer in new york ny
+luxury watch dealer in san francisco ca
+luxury watch dealer in los angeles ca
+luxury watch dealer in chicago il
+luxury watch dealer in houston tx
+luxury watch dealer in washington dc
+luxury watch dealer in seattle wa
+luxury watch dealer in boston ma
+luxury watch dealer in miami fl
+luxury watch dealer in dallas tx
+luxury watch dealer in austin tx
+luxury watch dealer in san jose ca
+luxury watch dealer in san diego ca
+luxury watch dealer in philadelphia pa
+luxury watch dealer in atlanta ga
+luxury watch dealer in denver co
+luxury watch dealer in phoenix az
+luxury watch dealer in scottsdale az
+luxury watch dealer in las vegas nv
+luxury watch dealer in minneapolis mn
+luxury watch dealer in charlotte nc
+luxury watch dealer in nashville tn
+luxury watch dealer in palm beach fl
+luxury watch dealer in naples fl
+luxury watch dealer in greenwich ct
+luxury watch dealer in beverly hills ca
+luxury watch dealer in newport beach ca
+luxury watch dealer in honolulu hi
+luxury watch dealer in fort lauderdale fl
+luxury watch dealer in tampa fl
