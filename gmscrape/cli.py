@@ -102,6 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="continue an interrupted run (default: the latest one)")
     run.add_argument("--table-name", dest="supabase_table_name",
                      help="name for this run's Supabase table (default: from the search)")
+    run.add_argument("--no-supervise", dest="no_supervise", action="store_true",
+                     help="run in this process without the restart-on-kill supervisor")
     run.add_argument("--hours", type=float, dest="run_hours", default=None,
                      help="time budget: addresses found on sites are always checked; guessing "
                           "owner/info@ mailboxes stops when this runs out (default 2, 0 = no limit)")
@@ -282,6 +284,8 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd.add_argument("run_id", nargs="?", help="run id (default: latest unfinished)")
     resume_cmd.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
                             default=None)
+    resume_cmd.add_argument("--no-supervise", dest="no_supervise", action="store_true",
+                            help="run in this process without the restart-on-kill supervisor")
     resume_cmd.add_argument("-o", "--out-dir", dest="out_dir")
     resume_cmd.add_argument("--basename", default="leads")
     resume_cmd.add_argument("--format", dest="export_formats")
@@ -553,7 +557,84 @@ def _startup_key_check(settings: Settings, args: argparse.Namespace) -> Optional
     return settings
 
 
+# --- the supervisor: a run that gets killed picks itself back up --------------
+SUPERVISE_MAX_RESTARTS = 25
+SUPERVISE_PAUSE = 15.0
+_CLEAN_EXITS = {0, 2, 130}          # done / refused to start / Ctrl-C: the person decides
+
+
+def _supervised(args: argparse.Namespace) -> bool:
+    """Only a real terminal session gets a supervisor; the child, tests and
+    scripts run the pipeline directly."""
+    if os.environ.get("GMSCRAPE_CHILD") or getattr(args, "no_supervise", False):
+        return False
+    argv = getattr(args, "_argv", None)
+    if not argv:
+        return False
+    return _is_tty()
+
+
+def _is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _common_argv(args: argparse.Namespace) -> list[str]:
+    out: list[str] = []
+    for flag, attr in (("--env-file", "env_file"), ("--db", "db_path"), ("--log-level", "log_level")):
+        value = getattr(args, attr, None)
+        if value:
+            out += [flag, str(value)]
+    return out
+
+
+def _resume_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["resume", "-y"] + _common_argv(args)
+    for flag, attr in (("-o", "out_dir"), ("--basename", "basename")):
+        value = getattr(args, attr, None)
+        if value:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _run_child(argv: list[str]) -> int:
+    import subprocess
+
+    env = {**os.environ, "GMSCRAPE_CHILD": "1"}
+    try:
+        return subprocess.run([sys.executable, "-m", "gmscrape.cli", *argv], env=env).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUPERVISE_PAUSE) -> int:
+    """Run the command in a child process and, if that child is killed or dies
+    with an error, resume it - up to SUPERVISE_MAX_RESTARTS times. A finished
+    run, a refusal to start and Ctrl-C end the loop."""
+    import time as _time
+
+    argv = list(args._argv)
+    for attempt in range(SUPERVISE_MAX_RESTARTS + 1):
+        code = run_child(argv)
+        if code in _CLEAN_EXITS:
+            return code
+        if attempt == SUPERVISE_MAX_RESTARTS:
+            echo(f"[red]the run stopped {attempt + 1} times; giving up. `scraper resume` continues it.[/red]")
+            return code
+        why = f"killed by signal {-code}" if code < 0 else f"exit code {code}"
+        echo(f"[yellow]the run stopped ({why}). Nothing finished is lost; resuming in "
+             f"{int(pause)}s (restart {attempt + 1}/{SUPERVISE_MAX_RESTARTS}).[/yellow]")
+        logging.getLogger(__name__).warning("run stopped (%s); resuming", why)
+        _time.sleep(pause)
+        argv = _resume_argv(args)
+    return code
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    if _supervised(args):
+        return supervise(args)
     _launch()
     settings = settings_from_args(args)
     queries: list[str] = list(args.queries or [])
@@ -590,6 +671,8 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
                  else f"[yellow]no run {resume_id}[/yellow]")
             return 2
         run_id, queries, resume = previous["run_id"], previous["queries"], True
+        if previous.get("run_table") and not settings.supabase_table_name:
+            settings.supabase_table_name = previous["run_table"]     # same live table, not a new one
         echo(f"resuming run [cyan]{run_id}[/cyan]: {previous['done']}/{previous['total']} businesses "
              f"already done, {len(queries)} search{'es' if len(queries) != 1 else ''}")
 
@@ -712,6 +795,8 @@ class _Exporter:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    if _supervised(args):
+        return supervise(args)
     _launch()
     settings = settings_from_args(args)
     return _execute_run(settings, [], basename=args.basename, run_id=None,
@@ -1371,7 +1456,8 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
                      f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg, "
                      f"{stages.get('search_slots', 0)} at a time) · "
                      f"verify {_fmt_duration(stages['verify'] / n)} ({stages.get('checks', 0) // n} checks{gap}{keys}) · "
-                     f"maps {_fmt_duration(stages['maps'])} total · memory peak {int(stages.get('memory_mb', 0)):,} MB[/dim]")
+                     f"maps {_fmt_duration(stages['maps'])} total · memory {int(stages.get('memory_now_mb', 0)):,} MB "
+                     f"(peak {int(stages.get('memory_mb', 0)):,}, limit {int(stages.get('memory_limit_mb', 0)):,})[/dim]")
                 logging.getLogger(__name__).info("pace: %s", {k: round(v, 2) if isinstance(v, float) else v
                                                               for k, v in stages.items()})
                 if stages.get("memory_mb", 0) > 3000 and not state.get("memory_warned"):
@@ -1498,6 +1584,7 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args._argv = list(argv if argv is not None else sys.argv[1:])
     configure_logging(getattr(args, "log_level", None) or "INFO")
     handlers = {
         "run": cmd_run,

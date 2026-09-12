@@ -270,7 +270,9 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         echo("cancelled")
         return 0
 
-    args = build_parser().parse_args(["run", "-y", "-n", str(limit), *extra, *queries])
+    argv = ["run", "-y", "-n", str(limit), *extra, *queries]
+    args = build_parser().parse_args(argv)
+    args._argv = argv             # the supervisor restarts from this
     settings_from_args(args)      # loads .env + saved keys for the run
     return cmd_run(args)
 

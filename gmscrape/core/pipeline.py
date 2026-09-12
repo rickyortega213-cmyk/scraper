@@ -68,7 +68,10 @@ from ..store.sinks import (
     NullSink,
 )
 from ..data.domains import FREE_MAIL_DOMAINS
-from ..util import city_from_address, hostname, mx_lookup, prefetch_mx, registered_domain
+from ..util import (
+    city_from_address, current_rss_mb, hostname, mx_lookup, prefetch_mx, registered_domain,
+    total_ram_mb,
+)
 from ..web.crawl import scrape_site
 from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
@@ -520,6 +523,7 @@ class Pipeline:
                     in_flight.acquire()
                     if stop.is_set():
                         return
+                    self._wait_for_memory(stop)
                     ordered.put(("work", work, pool.submit(self._prepare_batch, work.batch)))
                 ordered.put(("done", None, None))
             except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
@@ -546,6 +550,32 @@ class Pipeline:
             except ValueError:
                 pass
             pool.shutdown(wait=False, cancel_futures=True)
+
+    def memory_limit_mb(self) -> float:
+        configured = float(getattr(self.settings, "memory_limit_mb", 0) or 0)
+        if configured > 0:
+            return configured
+        ram = total_ram_mb()
+        return min(6144.0, max(1024.0, ram * 0.45)) if ram else 3072.0
+
+    def _wait_for_memory(self, stop: threading.Event, max_wait: float = 180.0) -> None:
+        """Hold the next batch back while the process is above its memory
+        limit: batches already in flight finish and free theirs. Never waits
+        forever, so a leak cannot turn into a silent hang either."""
+        limit = self.memory_limit_mb()
+        waited = 0.0
+        warned = False
+        while not stop.is_set() and waited < max_wait:
+            rss = current_rss_mb()
+            if rss <= 0 or rss < limit:
+                return
+            if not warned:
+                warned = True
+                log.warning("memory %.0f MB is above the %.0f MB limit; holding new batches until it drops",
+                            rss, limit)
+                self._stage["memory_holds"] = self._stage.get("memory_holds", 0) + 1
+            stop.wait(3.0)
+            waited += 3.0
 
     def _prepare_batch(self, batch: list[BusinessResult]) -> None:
         """Everything that is not metered: crawl, discover, find the owner, plan guesses."""
@@ -638,6 +668,9 @@ class Pipeline:
             "keys": int(getattr(self.verifier, "working_keys", 1) or 1),
             "search_slots": self._search_gate.limit,
             "memory_mb": _memory_peak_mb(),
+            "memory_now_mb": current_rss_mb(),
+            "memory_limit_mb": self.memory_limit_mb(),
+            "memory_holds": self._stage.get("memory_holds", 0),
         }
 
     # --- pass 2: the guesses, most valuable first, while time allows ----------

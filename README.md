@@ -605,6 +605,17 @@ buys more speed.
 
 ## If something breaks mid-run
 
+**The run looks after itself.** `scraper buddy` and `scraper resume` run the
+scrape in a child process and watch it. If that process is killed - by the
+system under memory pressure, by a security tool, by anything - the
+supervisor says so, waits fifteen seconds and resumes the same run, up to 25
+times. Only a finished run, a refusal to start (a bad key) or your own Ctrl-C
+end the loop. Memory is kept in check on purpose: only a few pages are parsed
+at a time (a parsed page is ten times its HTML), the live-table buffer holds
+one row per business, and when the process nears its memory limit (45% of
+RAM by default, `MEMORY_LIMIT_MB` to change) new batches are held until the
+ones in flight finish. A resumed run keeps writing to the same live table.
+
 Nothing you've paid for is ever bought twice, and nothing finished is lost:
 
 - **Every API result is cached the moment it arrives** — Maps results per
@@ -680,7 +691,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 253 tests, no network or API keys needed
+make test     # 258 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

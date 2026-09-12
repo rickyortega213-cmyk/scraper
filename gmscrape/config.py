@@ -133,6 +133,7 @@ class Settings:
     rotate_user_agent: bool = True
     crawl_delay: float = 0.0
     site_timeout: float = 45.0        # whole-site budget: discover + crawl + owner search, then move on
+    memory_limit_mb: int = 0          # pause starting new batches above this RSS (0 = 45% of RAM, 1-6 GB)
     follow_social_profiles: bool = False
 
     # --- permutations ------------------------------------------------------

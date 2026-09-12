@@ -274,3 +274,31 @@ def city_from_address(address: str) -> str:
                 return candidate
             return ""
     return ""
+
+
+def current_rss_mb() -> float:
+    """Resident memory of this process right now, in MB (0 when unknown)."""
+    import os
+    import sys
+
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/statm", encoding="ascii") as handle:
+                pages = int(handle.read().split()[1])
+            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        import subprocess
+
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return float(out) / 1024 if out else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def total_ram_mb() -> float:
+    import os
+
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        return 0.0
