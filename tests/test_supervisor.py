@@ -24,7 +24,7 @@ def test_supervisor_resumes_after_a_kill_and_stops_on_a_clean_exit(monkeypatch):
     seen: list[list[str]] = []
     codes = iter([-9, 137, 1, 0])
 
-    def fake_child(argv):
+    def fake_child(argv, console_path=None):
         seen.append(list(argv))
         return next(codes)
 
@@ -39,7 +39,7 @@ def test_supervisor_leaves_ctrl_c_and_refusals_alone(monkeypatch):
     monkeypatch.setattr(cli, "echo", lambda *a, **k: None)
     for clean in (130, 2):
         calls = []
-        assert cli.supervise(_args(), run_child=lambda argv: calls.append(argv) or clean, pause=0) == clean
+        assert cli.supervise(_args(), run_child=lambda argv, path=None: calls.append(argv) or clean, pause=0) == clean
         assert len(calls) == 1
 
 
@@ -47,7 +47,7 @@ def test_supervisor_gives_up_eventually(monkeypatch):
     monkeypatch.setattr(cli, "echo", lambda *a, **k: None)
     monkeypatch.setattr(cli, "SUPERVISE_MAX_RESTARTS", 3)
     calls = []
-    assert cli.supervise(_args(), run_child=lambda argv: calls.append(argv) or -9, pause=0) == -9
+    assert cli.supervise(_args(), run_child=lambda argv, path=None: calls.append(argv) or -9, pause=0) == -9
     assert len(calls) == 4
 
 
@@ -81,5 +81,5 @@ def test_supervisor_stops_a_tight_failure_loop(monkeypatch):
     monkeypatch.setattr(cli, "echo", lambda *a, **k: None)
     monkeypatch.setattr(cli, "SUPERVISE_FAST_FAILS_MAX", 3)
     calls = []
-    assert cli.supervise(_args(), run_child=lambda argv: calls.append(argv) or -9, pause=0) == -9
+    assert cli.supervise(_args(), run_child=lambda argv, path=None: calls.append(argv) or -9, pause=0) == -9
     assert len(calls) == 3                                     # dying instantly three times: stop, say why

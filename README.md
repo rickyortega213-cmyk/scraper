@@ -605,11 +605,15 @@ buys more speed.
 
 ## If something breaks mid-run
 
-**The run looks after itself.** `scraper buddy` and `scraper resume` run the
-scrape in a child process and watch it. If that process is killed - by the
-system under memory pressure, by a security tool, by anything - the
-supervisor says so, waits fifteen seconds and resumes the same run, up to 25
-times. Only a finished run, a refusal to start (a bad key) or your own Ctrl-C
+**The run looks after itself.** `scraper buddy` and `scraper resume` ask
+everything they need on the terminal, then run the scrape in a worker
+process of its own session - not a foreground job of the terminal, with its
+searches read from `out/queries.txt` rather than the command line - and show
+its output live (it is also written to `out/console.txt`). If that worker is
+killed - by the system under memory pressure, by a security tool, by anything -
+the supervisor says so, waits fifteen seconds and resumes the same run, up to
+200 times; a worker that dies within a minute five times in a row stops the
+loop with a message. Ctrl-C is forwarded so the worker checkpoints and stops. Only a finished run, a refusal to start (a bad key) or your own Ctrl-C
 end the loop. Memory is kept in check on purpose: only a few pages are parsed
 at a time (a parsed page is ten times its HTML), the live-table buffer holds
 one row per business, and when the process nears its memory limit (45% of

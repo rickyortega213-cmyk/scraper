@@ -106,7 +106,8 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
     captured: dict = {}
 
     def fake_run(args):
-        captured["queries"] = list(args.queries)
+        from gmscrape.cli import read_query_file
+        captured["queries"] = list(args.queries) + (list(read_query_file(args.queries_file)) if args.queries_file else [])
         captured["limit"] = args.results_per_query
         captured["confirm"] = args.confirm_keys_on_start
         captured["hours"] = args.run_hours

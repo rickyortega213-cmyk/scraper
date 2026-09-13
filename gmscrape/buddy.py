@@ -270,9 +270,18 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         echo("cancelled")
         return 0
 
-    argv = ["run", "-y", "-n", str(limit), *extra, *queries]
+    from pathlib import Path
+
+    from .config import Settings
+
+    out_dir = Path(Settings.from_env().out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    queries_file = out_dir / "queries.txt"          # thousands of searches do not belong on a command line
+    queries_file.write_text("\n".join(queries) + "\n", encoding="utf-8")
+    argv = ["run", "-y", "-n", str(limit), *extra, "-f", str(queries_file)]
     args = build_parser().parse_args(argv)
     args._argv = argv             # the supervisor restarts from this
+    args._launched = True         # banner already shown
     settings_from_args(args)      # loads .env + saved keys for the run
     return cmd_run(args)
 

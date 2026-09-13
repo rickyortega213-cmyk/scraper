@@ -601,27 +601,70 @@ def _resume_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def _run_child(argv: list[str]) -> int:
+def _run_child(argv: list[str], console_path: Optional[str] = None) -> int:
+    """Run the pipeline in a process of its own session - not a foreground job
+    of the terminal, no controlling terminal, no prompts - writing what it would
+    have printed to out/console.txt, which this process shows live. A kill
+    aimed at the terminal-attached process leaves the worker running; Ctrl-C
+    here is forwarded so the worker checkpoints and stops cleanly."""
+    import signal
     import subprocess
+    import time as _time
 
     env = {**os.environ, "GMSCRAPE_CHILD": "1"}
-    try:
-        return subprocess.run([sys.executable, "-m", "gmscrape.cli", *argv], env=env).returncode
-    except KeyboardInterrupt:
-        return 130
+    if not any(a in ("-y", "--yes") for a in argv):
+        argv = list(argv) + ["-y"]                       # nothing to ask once detached
+    path = Path(console_path or "out/console.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as sink:
+        offset = sink.tell()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "gmscrape.cli", *argv], env=env,
+            stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    echo(f"[dim]worker pid {proc.pid} · output also in {path}[/dim]")
+    with path.open("rb") as follow:
+        follow.seek(offset)
+        try:
+            while True:
+                chunk = follow.read()
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                code = proc.poll()
+                if code is not None:
+                    tail = follow.read()
+                    if tail:
+                        sys.stdout.write(tail.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+                    return code
+                _time.sleep(0.5)
+        except KeyboardInterrupt:
+            echo("\n[yellow]stopping the worker cleanly (it checkpoints first)…[/yellow]")
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=120)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                proc.kill()
+            tail = follow.read()
+            if tail:
+                sys.stdout.write(tail.decode("utf-8", errors="replace"))
+            return 130
 
 
-def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUPERVISE_PAUSE) -> int:
-    """Run the command in a child process and, if that child is killed or dies
-    with an error, resume it - up to SUPERVISE_MAX_RESTARTS times. A finished
-    run, a refusal to start and Ctrl-C end the loop."""
+def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUPERVISE_PAUSE,
+              console_path: Optional[str] = None) -> int:
+    """Run the command in a detached worker and, if that worker is killed or
+    dies with an error, resume it - up to SUPERVISE_MAX_RESTARTS times. A
+    finished run, a refusal to start and Ctrl-C end the loop."""
     import time as _time
 
     argv = list(args._argv)
     fast_fails = 0
     for attempt in range(SUPERVISE_MAX_RESTARTS + 1):
         started = _time.monotonic()
-        code = run_child(argv)
+        code = run_child(argv, console_path)
         if code in _CLEAN_EXITS:
             return code
         lasted = _time.monotonic() - started
@@ -643,9 +686,9 @@ def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUP
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if _supervised(args):
-        return supervise(args)
-    _launch()
+    supervised = _supervised(args)
+    if not (supervised and getattr(args, "_launched", False)):
+        _launch()
     settings = settings_from_args(args)
     queries: list[str] = list(args.queries or [])
     if args.queries_file:
@@ -657,13 +700,19 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     specs = parse_queries(queries)
     echo(f"[bold]{len(specs)}[/bold] quer{'y' if len(specs) == 1 else 'ies'} to run:")
-    for spec in specs:
+    for spec in specs[:12]:
         echo(f"  • [cyan]{spec.business_type}[/cyan] in [magenta]{spec.location or 'anywhere'}[/magenta]")
+    if len(specs) > 12:
+        echo(f"  … and {len(specs) - 12} more")
 
     checked = _startup_key_check(settings, args)
     if checked is None:
         return 2
     settings = checked
+    if supervised:
+        # Everything a person could be asked has been asked here, on the terminal;
+        # the work itself runs detached and is resumed if it is killed.
+        return supervise(args, console_path=str(Path(settings.out_dir) / "console.txt"))
     return _execute_run(settings, [s.search_string for s in specs], basename=args.basename,
                         run_id=None, resume_id=getattr(args, "resume", None))
 
@@ -805,10 +854,10 @@ class _Exporter:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    if _supervised(args):
-        return supervise(args)
     _launch()
     settings = settings_from_args(args)
+    if _supervised(args):
+        return supervise(args, console_path=str(Path(settings.out_dir) / "console.txt"))
     return _execute_run(settings, [], basename=args.basename, run_id=None,
                         resume_id=args.run_id or "latest")
 
