@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import http.server
+import os
 import socket
 import threading
 from pathlib import Path
 
 import pytest
+
+os.environ.setdefault("UNSAFE_LISTS", "0")          # tests never download the public lists
 
 from gmscrape.config import Settings
 from gmscrape.models import VerificationResult, V_INVALID, V_VALID

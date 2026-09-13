@@ -116,7 +116,7 @@ def test_buddy_runs_the_pipeline_with_the_answers(clean_env, monkeypatch, tmp_pa
     monkeypatch.setattr("gmscrape.cli.cmd_run", fake_run)
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
     script = Script(
-        "", "", "", "", "",                      # keep / skip every key
+        "", "", "", "", "", "",                  # keep / skip every key
         "dentist in austin tx", "plumber in miami fl", "",   # searches
         "25",                                    # businesses per search
         "3",                                     # time budget: 3 hours
@@ -162,6 +162,7 @@ def test_review_keys_accepts_a_key_pasted_at_the_yes_no_prompt(clean_env):
         "https://mcp.scraper.tech/a25e0000000000000000000000000ce8",   # pasted at the y/n prompt
         "n",                                                            # MailTester: skip
         "ak_testkey0000000000000000000000000000000000000000",           # pasted at the y/n prompt
+        "n",                                                            # Safe Browsing: skip
         "y", "https://abc.supabase.co/rest/v1/Some Table Name",        # URL with a table path
         "y", SERVICE_JWT,
     )
@@ -178,11 +179,11 @@ def test_review_keys_accepts_a_key_pasted_at_the_yes_no_prompt(clean_env):
 
 
 def test_review_keys_warns_about_the_wrong_kind_of_key(clean_env):
-    script = Script("n", "n", "n", "n", "y", ANON_JWT)
+    script = Script("n", "n", "n", "n", "n", "y", ANON_JWT)
     B.review_keys(script.prompt, script.echo)
     assert any("warning" in t and "anon" in t for t in script.said)
     # the anon key is now on file, so the prompt is "keep it?": no -> paste a token by mistake
-    script = Script("n", "n", "n", "n", "n", "sbp_example_not_a_real_token")
+    script = Script("n", "n", "n", "n", "n", "n", "sbp_example_not_a_real_token")
     B.review_keys(script.prompt, script.echo)
     assert any("warning" in t and "access token" in t for t in script.said)
 

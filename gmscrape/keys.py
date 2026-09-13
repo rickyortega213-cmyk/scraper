@@ -60,6 +60,9 @@ KEY_FIELDS: tuple[KeyField, ...] = (
     KeyField("BOUNCER_KEY", "Bouncer key", "app.usebouncer.com/api", "verify"),
     KeyField("OPENWEBNINJA_KEY", "OpenWeb Ninja key(s)",
              "ak_... from openwebninja.com - website discovery + owner lookup; several: key1,key2", "search"),
+    KeyField("SAFE_BROWSING_KEY", "Google Safe Browsing key",
+             "AIza... from console.cloud.google.com (Safe Browsing API) - sites are checked before a "
+             "visit, so macOS never stops the run", "safety"),
     KeyField("SUPABASE_URL", "Supabase project URL",
              "https://<project>.supabase.co - Project Settings → API", "supabase", secret=False),
     KeyField("SUPABASE_KEY", "Supabase project API key",
@@ -77,6 +80,7 @@ GROUP_TITLES = {
     "verify": "2. Email verification (set one; none = local checks only)",
     "search": "3. Web search (website discovery + owner lookup; optional)",
     "supabase": "4. Supabase live table (optional)",
+    "safety": "5. Unsafe-site check (optional; a Mac stops a run that reaches a listed site)",
 }
 
 
@@ -300,7 +304,7 @@ def run_setup(
     echo: Callable[[str], None] = print,
     *,
     path: Optional[Path] = None,
-    groups: tuple[str, ...] = ("maps", "verify", "search", "supabase"),
+    groups: tuple[str, ...] = ("maps", "verify", "search", "supabase", "safety"),
 ) -> dict[str, str]:
     """Walk through the keys; returns what was saved (env var -> value)."""
     echo("")

@@ -183,7 +183,7 @@ def test_buddy_asks_for_the_table_name_after_the_searches(tmp_path, monkeypatch)
     captured: dict = {}
     monkeypatch.setattr("gmscrape.cli.cmd_run", lambda args: captured.update(vars(args)) or 0)
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
-    answers = iter(["", "", "", "", "",                 # keep every key
+    answers = iter(["", "", "", "", "", "",             # keep every key
                     "dentist in austin tx", "",         # searches
                     "",                                 # businesses per search -> 40
                     "",                                 # time budget -> 2 h

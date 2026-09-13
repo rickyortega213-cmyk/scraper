@@ -56,6 +56,8 @@ BUDDY_KEYS: tuple[BuddyKey, ...] = (
     BuddyKey("MailTester Ninja (email verification)", "MAILTESTER_KEY", "confirms emails are real"),
     BuddyKey("OpenWeb Ninja (web search)", "OPENWEBNINJA_KEY",
              "finds missing websites and owners", optional=True),
+    BuddyKey("Google Safe Browsing (unsafe-site check)", "SAFE_BROWSING_KEY",
+             "keeps macOS from stopping the run", optional=True),
     BuddyKey("Supabase project URL (live table)", "SUPABASE_URL",
              "https://<project>.supabase.co", optional=True, secret=False),
     BuddyKey("Supabase project API key (live table)", "SUPABASE_KEY",

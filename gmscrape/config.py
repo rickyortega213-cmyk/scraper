@@ -92,6 +92,15 @@ class Settings:
     emaillistverify_key: str = ""
     bouncer_key: str = ""
 
+    # Unsafe websites: checked before they are visited (macOS stops a scrape
+    # that reaches a site on Apple's Safe Browsing list - see web/unsafe.py)
+    safe_browsing_key: str = ""         # Google Safe Browsing API key (free): every site asked about first
+    unsafe_lists: bool = True           # also download public malware/phishing host lists (no key needed)
+    unsafe_list_urls: tuple[str, ...] = (
+        "https://urlhaus.abuse.ch/downloads/hostfile/",
+        "https://openphish.com/feed.txt",
+    )
+
     # Web search (website discovery + owner lookup)
     web_search_provider: str = "auto"   # auto|openwebninja|none
     openwebninja_key: str = ""

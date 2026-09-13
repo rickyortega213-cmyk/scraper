@@ -75,7 +75,8 @@ from ..util import (
 from ..web.crawl import scrape_site
 from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
-from ..web.unsafe import load_blocked, site_key
+from ..web.safebrowsing import SafeBrowsing
+from ..web.unsafe import add_blocked, host_listed, load_blocked, refresh_public_lists, site_key
 
 log = logging.getLogger(__name__)
 
@@ -300,6 +301,10 @@ class Pipeline:
         # Where the time goes, so the progress line can say what sets the pace.
         # Sites a previous run was cut off on (see web/unsafe.py): never fetched again.
         self.blocked_domains: set[str] = load_blocked(settings.out_dir)
+        self._public_unsafe: set[str] = set()                  # hosts from the public lists, loaded in run()
+        self.safety: Optional[SafeBrowsing] = (
+            SafeBrowsing(settings.safe_browsing_key, cache=self.store) if settings.safe_browsing_key else None
+        )
         self._stage = {"maps": 0.0, "crawl": 0.0, "verify": 0.0,
                        "search_n": 0, "search_s": 0.0, "fetch_n": 0, "fetch_s": 0.0}
         # Web searches run in their own pool: asyncio's default one is capped
@@ -339,6 +344,7 @@ class Pipeline:
         specs = parse_queries(queries)
         if not specs:
             raise ValueError("no usable queries provided")
+        self._load_unsafe_lists()
         lean = self.settings.lean_memory or len(specs) > self.settings.lean_threshold_queries
         if lean and self.settings.cache_http:
             # A million pages do not belong in SQLite; the per-business
@@ -580,11 +586,39 @@ class Pipeline:
             stop.wait(3.0)
             waited += 3.0
 
+    def _load_unsafe_lists(self) -> None:
+        if not self.settings.unsafe_lists or not self.settings.unsafe_list_urls:
+            return
+        started = time.perf_counter()
+        self._public_unsafe = refresh_public_lists(self.settings.out_dir, self.settings.unsafe_list_urls)
+        log.info("unsafe-site lists: %d hosts (%.1fs)", len(self._public_unsafe), time.perf_counter() - started)
+
+    def _screen_sites(self, batch: Sequence[BusinessResult]) -> int:
+        """Ask Safe Browsing about the batch's websites before any is visited;
+        a listed one joins the skip list. Returns how many were listed."""
+        if self.safety is None or not self.safety.enabled:
+            return 0
+        urls = [r.place.website for r in batch if r.place.website and not self._site_blocked(r.place.website, r.place.domain)]
+        if not urls:
+            return 0
+        flagged = self.safety.check(urls)
+        if flagged:
+            self._block(flagged, "listed by Safe Browsing")
+        return len(flagged)
+
+    def _block(self, domains: set[str], why: str) -> None:
+        self.blocked_domains |= domains
+        try:
+            add_blocked(self.settings.out_dir, domains, why)
+        except OSError as exc:  # pragma: no cover
+            log.debug("could not record blocked sites: %s", exc)
+
     def _prepare_batch(self, batch: list[BusinessResult]) -> None:
         """Everything that is not metered: crawl, discover, find the owner, plan guesses."""
         if not batch:
             return
         started = time.perf_counter()
+        self._screen_sites(batch)
         asyncio.run(self._scrape_websites(batch))
         self._stage["crawl"] += time.perf_counter() - started
         self._publish(batch, STATUS_CRAWLED)
@@ -983,7 +1017,10 @@ class Pipeline:
             result.website_source = result.website_source or "maps"
 
         find_owner = self.settings.find_owners and (profile is None or self.settings.chain_people)
-        if self._site_blocked(place.website, place.domain):
+        blocked = self._site_blocked(place.website, place.domain)
+        if not blocked and result.website_source == "search":
+            blocked = await self._discovered_site_unsafe(place.website)
+        if blocked:
             # The computer stopped a run on this site; the owner search and
             # the address guesses still happen, the crawl does not.
             result.website_status = "skipped:unsafe_site"
@@ -1040,12 +1077,22 @@ class Pipeline:
                 self._tag_owner_emails(result)
 
     def _site_blocked(self, website: str, domain: str = "") -> bool:
-        if not self.blocked_domains:
-            return False
-        return bool(
+        if self.blocked_domains and (
             (domain and domain.lower() in self.blocked_domains)
             or (website and site_key(website) in self.blocked_domains)
-        )
+        ):
+            return True
+        return bool(website) and host_listed(hostname(website), self._public_unsafe)
+
+    async def _discovered_site_unsafe(self, url: str) -> bool:
+        """A site found by search was not in the batch screen: ask now."""
+        if self.safety is None or not self.safety.enabled:
+            return False
+        flagged = await asyncio.to_thread(self.safety.check, [url])
+        if flagged:
+            self._block(flagged, "listed by Safe Browsing")
+            return True
+        return False
 
     async def _find_owner_by_search(
         self, result: BusinessResult, search_sem: asyncio.Semaphore

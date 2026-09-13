@@ -51,6 +51,7 @@ mid-run" for why).
     Scraper Tech (Google Maps) ............ a25e…ce8   keep it? [Y/n]
     MailTester Ninja (email verification)  sub_…ABC   keep it? [Y/n]
     OpenWeb Ninja (web search) ............ not set    add it now? [y/N]
+    Google Safe Browsing (unsafe-site check) not set   add it now? [y/N]
     Supabase URL (live table) ............. not set    add it now? [y/N]
 
   Searches - paste them, one per line (business type in location),
@@ -623,7 +624,20 @@ it:
 1. **Start it by typing `scraper` (seven letters) or by double-clicking
    `Scraper Buddy.command`** - never by pasting. Typed and double-clicked
    commands are not traced.
-2. **The site that got a run stopped is never visited again.** While it
+2. **Ask before visiting.** Apple's list is Google Safe Browsing, which
+   answers lookups for free with an API key. With `SAFE_BROWSING_KEY` set
+   (`scraper buddy` asks for it; getting one takes five minutes at
+   console.cloud.google.com → APIs & Services → Library → *Safe Browsing
+   API* → Enable → Credentials → Create credentials → API key), every batch's
+   websites are checked before the first byte is fetched, 500 per request,
+   and a listed one is skipped (`skipped:unsafe_site`) and written to
+   `out/blocked_sites.txt`. Verdicts are kept in the database for a day. A
+   site found by web search is checked the same way before it is visited.
+   Without a key, two public lists of malware and phishing hosts (URLhaus,
+   OpenPhish; `UNSAFE_LISTS`, `UNSAFE_LIST_URLS`) are downloaded once a day
+   into `out/unsafe_lists/` and used the same way - partial cover, better
+   than none.
+3. **The site that got a run stopped is never visited again.** While it
    runs, the worker keeps `out/inflight.json` listing the websites it is
    fetching at that moment. A clean exit removes the file; a killed worker
    leaves it behind, and the next start (the supervisor's automatic one, or

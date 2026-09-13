@@ -27,7 +27,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from ..util import hostname, registered_domain
 
@@ -160,7 +160,7 @@ def load_blocked(out_dir: Path | str) -> set[str]:
     return out
 
 
-def add_blocked(out_dir: Path | str, domains: Iterable[str]) -> list[str]:
+def add_blocked(out_dir: Path | str, domains: Iterable[str], why: str = "cut off") -> list[str]:
     """Append `domains` (those not already listed); return the ones added."""
     known = load_blocked(out_dir)
     fresh = sorted({d for d in (site_key(x) or x.strip().lower() for x in domains) if d} - known)
@@ -172,7 +172,7 @@ def add_blocked(out_dir: Path | str, domains: Iterable[str]) -> list[str]:
     with path.open("a", encoding="utf-8") as handle:
         if not known and path.stat().st_size == 0:
             handle.write(_HEADER)
-        handle.write(f"# cut off {stamp}\n")
+        handle.write(f"# {why} {stamp}\n")
         handle.write("".join(f"{d}\n" for d in fresh))
     return fresh
 
@@ -202,3 +202,80 @@ def quarantine_leftovers(out_dir: Path | str) -> list[str]:
         log.warning("previous run was cut off while visiting %d site(s); they are now skipped "
                     "(see %s)", len(added), Path(out_dir) / BLOCKED_FILE)
     return added
+
+
+# -- public lists of malware / phishing hosts (no key needed) -----------------
+LISTS_DIR = "unsafe_lists"
+
+
+def refresh_public_lists(out_dir: Path | str, urls: Sequence[str], *, max_age_hours: float = 24.0,
+                         timeout: float = 20.0) -> set[str]:
+    """Download each list at most once a day into out/unsafe_lists/ and return
+    the hosts they name. A list that cannot be fetched is skipped (its last
+    copy is used when there is one): the run never waits on it."""
+    import httpx
+
+    folder = Path(out_dir) / LISTS_DIR
+    hosts: set[str] = set()
+    for index, url in enumerate(urls):
+        if not url:
+            continue
+        path = folder / f"{index}_{hostname(url) or 'list'}.txt"
+        fresh = path.exists() and (time.time() - path.stat().st_mtime) < max_age_hours * 3600
+        if not fresh:
+            try:
+                response = httpx.get(url, timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "gmscrape (unsafe-site list refresh)"})
+                if response.status_code == 200 and response.text:
+                    folder.mkdir(parents=True, exist_ok=True)
+                    path.write_text(response.text, encoding="utf-8")
+                else:
+                    log.info("unsafe-site list %s: HTTP %s; using the last copy if any", url, response.status_code)
+            except (httpx.HTTPError, OSError) as exc:
+                log.info("unsafe-site list %s not fetched (%s); using the last copy if any", url, exc)
+        try:
+            hosts.update(parse_host_list(path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    return hosts
+
+
+def parse_host_list(text: str) -> set[str]:
+    """Host names from a hosts-file ("127.0.0.1 bad.example"), a list of URLs,
+    or bare host names - one per line, '#' comments. Exact hosts are kept: a
+    listed sub-site must not condemn every site on a shared platform."""
+    import ipaddress
+
+    out: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        token = parts[0]
+        if len(parts) > 1:
+            try:
+                ipaddress.ip_address(parts[0])
+                token = parts[1]
+            except ValueError:
+                pass
+        host = hostname(token)
+        if host and host not in ("localhost", "0.0.0.0", "127.0.0.1", "broadcasthost", "ip6-localhost"):
+            out.add(host)
+    return out
+
+
+def host_listed(host: str, hosts: set[str]) -> bool:
+    """True when `host` or a parent of it (down to the registered domain) is listed."""
+    if not host or not hosts:
+        return False
+    host = host.lower()
+    floor = registered_domain(host) or host
+    labels = host.split(".")
+    for i in range(len(labels)):
+        candidate = ".".join(labels[i:])
+        if candidate in hosts:
+            return True
+        if candidate == floor:
+            break
+    return False

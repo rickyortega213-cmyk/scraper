@@ -824,6 +824,9 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
     finally:
         unsafe.close_inflight()          # a clean exit leaves nothing to quarantine
     _print_report(report, paths)
+    if getattr(pipeline, "safety", None) is not None and pipeline.safety.stats["checked"]:
+        stats = pipeline.safety.stats
+        echo(f"[dim]unsafe-site check: {stats['checked']} sites asked about, {stats['flagged']} skipped[/dim]")
     _print_final_table(report)
     _print_supabase_link(settings, report)
     return 0
