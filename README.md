@@ -35,8 +35,14 @@ publishes none, and verifies everything before it lands in your CSV.
 ```bash
 make dev                      # venv + install (one time)
 source .venv/bin/activate
-scraper buddy                 # that's it
+scraper                       # that's it
 ```
+
+Or skip the terminal: double-click **`Scraper Buddy.command`** in the
+`scraper` folder. It sets itself up the first time and starts the same guided
+flow. **On a Mac, start it one of these two ways - type `scraper` or
+double-click - never by pasting a command** (see "If something breaks
+mid-run" for why).
 
 `scraper buddy` walks you through everything:
 
@@ -604,6 +610,28 @@ remaining ceiling is a per-key limit at a provider, so more keys is what
 buys more speed.
 
 ## If something breaks mid-run
+
+**"Malicious Script Blocked" on a Mac.** Since macOS 26.4, a command
+*pasted* into Terminal is traced: every process it starts is watched, every
+website those processes connect to is checked against Apple's Safe Browsing
+list, and the moment one is on the list the whole process tree is stopped
+with this notice and no override. A scrape visits tens of thousands of
+business websites, some of which are compromised or reported, so a pasted
+start ends this way sooner or later, mid-run and at random. Two things fix
+it:
+
+1. **Start it by typing `scraper` (seven letters) or by double-clicking
+   `Scraper Buddy.command`** - never by pasting. Typed and double-clicked
+   commands are not traced.
+2. **The site that got a run stopped is never visited again.** While it
+   runs, the worker keeps `out/inflight.json` listing the websites it is
+   fetching at that moment. A clean exit removes the file; a killed worker
+   leaves it behind, and the next start (the supervisor's automatic one, or
+   yours) moves every site on it to `out/blocked_sites.txt` and says so. The
+   crawler skips those sites from then on (owner search and address guesses
+   still happen for those businesses; only the crawl is skipped, marked
+   `skipped:unsafe_site`). Delete a line from the file to visit a site again.
+   You can also report a wrongly-listed site to Apple from the notice.
 
 **The run looks after itself.** `scraper buddy` and `scraper resume` ask
 everything they need on the terminal, then run the scrape in a worker

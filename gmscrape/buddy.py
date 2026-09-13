@@ -225,7 +225,9 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         echo(f"A previous run stopped early: {first}{more} - "
              f"{unfinished['done']}/{unfinished['total']} businesses finished.")
         if _yes(prompt("Resume it? [Y/n] "), default=True):
-            args = build_parser().parse_args(["resume", "-y", unfinished["run_id"]])
+            argv = ["resume", "-y", unfinished["run_id"]]
+            args = build_parser().parse_args(argv)
+            args._argv = argv         # the supervisor restarts from this
             return cmd_resume(args)
 
     review_keys(prompt, rich_echo if echo is print else echo)

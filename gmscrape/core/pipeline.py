@@ -75,6 +75,7 @@ from ..util import (
 from ..web.crawl import scrape_site
 from ..web.discover import confirm_website, discovery_query, pick_website
 from ..web.fetch import Fetcher
+from ..web.unsafe import load_blocked, site_key
 
 log = logging.getLogger(__name__)
 
@@ -297,6 +298,8 @@ class Pipeline:
         self._outstanding = 0               # businesses handed out but not yet finished
         self._deadline = 0.0                # run_hours turned into a wall-clock deadline
         # Where the time goes, so the progress line can say what sets the pace.
+        # Sites a previous run was cut off on (see web/unsafe.py): never fetched again.
+        self.blocked_domains: set[str] = load_blocked(settings.out_dir)
         self._stage = {"maps": 0.0, "crawl": 0.0, "verify": 0.0,
                        "search_n": 0, "search_s": 0.0, "fetch_n": 0, "fetch_s": 0.0}
         # Web searches run in their own pool: asyncio's default one is capped
@@ -980,6 +983,19 @@ class Pipeline:
             result.website_source = result.website_source or "maps"
 
         find_owner = self.settings.find_owners and (profile is None or self.settings.chain_people)
+        if self._site_blocked(place.website, place.domain):
+            # The computer stopped a run on this site; the owner search and
+            # the address guesses still happen, the crawl does not.
+            result.website_status = "skipped:unsafe_site"
+            result.notes.append("site_skipped:flagged_unsafe")
+            if find_owner and owner_search:
+                if profile is not None:
+                    await self._find_chain_person(result, profile, search_sem)
+                elif place.domain:
+                    await self._find_owner_by_search(result, search_sem)
+                if result.owner is not None:
+                    self._tag_owner_emails(result)
+            return
         scrape = await scrape_site(
             fetcher, place.website, self.settings, place.domain,
             business_name=place.name,
@@ -1022,6 +1038,14 @@ class Pipeline:
                 await self._find_owner_by_search(result, search_sem)
             if result.owner is not None:
                 self._tag_owner_emails(result)
+
+    def _site_blocked(self, website: str, domain: str = "") -> bool:
+        if not self.blocked_domains:
+            return False
+        return bool(
+            (domain and domain.lower() in self.blocked_domains)
+            or (website and site_key(website) in self.blocked_domains)
+        )
 
     async def _find_owner_by_search(
         self, result: BusinessResult, search_sem: asyncio.Semaphore

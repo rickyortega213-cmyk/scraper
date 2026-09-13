@@ -37,6 +37,7 @@ from .providers.registry import detect_maps_provider, detect_verify_provider
 from .query import parse_queries, read_query_file
 from .store.db import Store
 from .store.export import CsvAppender, export_results
+from .web import unsafe
 
 log = logging.getLogger("gmscrape")
 
@@ -661,6 +662,7 @@ def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUP
     import time as _time
 
     argv = list(args._argv)
+    out_dir = str(Path(console_path).parent) if console_path else ""
     fast_fails = 0
     for attempt in range(SUPERVISE_MAX_RESTARTS + 1):
         started = _time.monotonic()
@@ -677,6 +679,14 @@ def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUP
             echo(f"[red]the run stopped {attempt + 1} times; giving up. `scraper resume` continues it.[/red]")
             return code
         why = f"killed by signal {-code}" if code < 0 else f"exit code {code}"
+        if code < 0:
+            echo("[yellow]the computer stopped the worker.[/yellow] On a Mac this is the "
+                 "\"Malicious Script Blocked\" notice: a website the scrape visited is on "
+                 "Apple's unsafe list. That site is skipped from here on; the run continues.")
+        blocked = unsafe.quarantine_leftovers(out_dir) if out_dir else []
+        if blocked:
+            echo(f"[dim]{len(blocked)} website{'s' if len(blocked) != 1 else ''} added to "
+                 f"{Path(out_dir) / unsafe.BLOCKED_FILE}[/dim]")
         echo(f"[yellow]the run stopped ({why}). Nothing finished is lost; resuming in "
              f"{int(pause)}s (restart {attempt + 1}/{SUPERVISE_MAX_RESTARTS}).[/yellow]")
         logging.getLogger(__name__).warning("run stopped (%s); resuming", why)
@@ -717,6 +727,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                         run_id=None, resume_id=getattr(args, "resume", None))
 
 
+def _skip_unsafe_sites(out_dir: str) -> list[str]:
+    """Before a start: block the sites the previous worker was visiting when it
+    was cut off (it leaves out/inflight.json behind only then)."""
+    blocked = unsafe.quarantine_leftovers(out_dir)
+    if blocked:
+        shown = ", ".join(blocked[:5]) + (" …" if len(blocked) > 5 else "")
+        echo(f"[yellow]the last run was cut off while visiting {len(blocked)} website"
+             f"{'s' if len(blocked) != 1 else ''} ({shown}); they will be skipped from now on "
+             f"- see {Path(out_dir) / unsafe.BLOCKED_FILE}[/yellow]")
+    return blocked
+
+
 def _execute_run(settings: Settings, queries: list[str], *, basename: str,
                  run_id: Optional[str], resume_id: Optional[str]) -> int:
     """Run (or resume) the pipeline, exporting after every batch and on any exit."""
@@ -736,6 +758,7 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
              f"already done, {len(queries)} search{'es' if len(queries) != 1 else ''}")
 
     add_log_file(str(Path(settings.out_dir) / "scraper.log"))
+    _skip_unsafe_sites(settings.out_dir)
     exporter = _Exporter(settings, basename)
     maps = None
     if resume:
@@ -755,47 +778,51 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
         return 2
 
     lean = settings.lean_memory or len(queries) > settings.lean_threshold_queries
-    with pipeline:
-        echo(f"maps: [green]{pipeline.maps.name}[/green]   "
-             f"verification: [green]{pipeline.verifier.name}[/green]   "
-             f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
-             f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
-        if settings.verify_emails and getattr(pipeline.verifier, "requires_key", False):
-            # Prove the verification key works before a single Maps credit is spent.
+    unsafe.open_inflight(settings.out_dir)      # which sites are on the wire, for a cut-off run
+    try:
+        with pipeline:
+            echo(f"maps: [green]{pipeline.maps.name}[/green]   "
+                 f"verification: [green]{pipeline.verifier.name}[/green]   "
+                 f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
+                 f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
+            if settings.verify_emails and getattr(pipeline.verifier, "requires_key", False):
+                # Prove the verification key works before a single Maps credit is spent.
+                try:
+                    pipeline.verifier.preflight()
+                except ProviderAuthError as exc:
+                    echo(f"[red]{exc}[/red]")
+                    echo("Nothing was spent. Fix the key and start again.")
+                    return 2
+                except ProviderError as exc:
+                    echo(f"[yellow]could not check the verification key up front ({exc}); continuing[/yellow]")
+            if lean:
+                exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
             try:
-                pipeline.verifier.preflight()
-            except ProviderAuthError as exc:
-                echo(f"[red]{exc}[/red]")
-                echo("Nothing was spent. Fix the key and start again.")
-                return 2
-            except ProviderError as exc:
-                echo(f"[yellow]could not check the verification key up front ({exc}); continuing[/yellow]")
-        if lean:
-            exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
-        try:
-            report = pipeline.run(queries, run_id=run_id, resume=resume)
-        except RunStopped as stopped:
-            report = stopped.report
-            paths = exporter.finish(report)
-            echo("")
-            if isinstance(stopped.cause, KeyboardInterrupt):
-                echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
-                     f"finished and are in {paths[0] if paths else 'the export'}.")
-            elif isinstance(stopped.cause, ProviderAuthError):
-                echo(f"[red]Stopped: {stopped.cause}[/red]")
-                echo(f"{report.done}/{report.total} businesses were finished and are in "
-                     f"{paths[0] if paths else 'the export'}. Fix the key, then pick it up with:  "
-                     f"[cyan]scraper resume[/cyan]   (run id {report.run_id})")
-                return 2
-            else:
-                echo(f"[red]The run hit an error:[/red] {stopped.cause}")
-                echo(f"{report.done}/{report.total} businesses were finished and are in "
-                     f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
-                     "re-bought on resume.")
-            echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
-                 f"(run id {report.run_id})")
-            return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
-        paths = exporter.finish(report, getattr(pipeline, "store", None))
+                report = pipeline.run(queries, run_id=run_id, resume=resume)
+            except RunStopped as stopped:
+                report = stopped.report
+                paths = exporter.finish(report)
+                echo("")
+                if isinstance(stopped.cause, KeyboardInterrupt):
+                    echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
+                         f"finished and are in {paths[0] if paths else 'the export'}.")
+                elif isinstance(stopped.cause, ProviderAuthError):
+                    echo(f"[red]Stopped: {stopped.cause}[/red]")
+                    echo(f"{report.done}/{report.total} businesses were finished and are in "
+                         f"{paths[0] if paths else 'the export'}. Fix the key, then pick it up with:  "
+                         f"[cyan]scraper resume[/cyan]   (run id {report.run_id})")
+                    return 2
+                else:
+                    echo(f"[red]The run hit an error:[/red] {stopped.cause}")
+                    echo(f"{report.done}/{report.total} businesses were finished and are in "
+                         f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
+                         "re-bought on resume.")
+                echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
+                     f"(run id {report.run_id})")
+                return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
+            paths = exporter.finish(report, getattr(pipeline, "store", None))
+    finally:
+        unsafe.close_inflight()          # a clean exit leaves nothing to quarantine
     _print_report(report, paths)
     _print_final_table(report)
     _print_supabase_link(settings, report)

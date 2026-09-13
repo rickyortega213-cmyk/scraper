@@ -41,6 +41,7 @@ def _cache_missing_optional_modules() -> None:
 
 
 _cache_missing_optional_modules()
+from . import unsafe
 from ..util import hostname, normalize_url
 
 log = logging.getLogger(__name__)
@@ -196,19 +197,27 @@ class Fetcher:
                     html=body, from_cache=True,
                 )
 
-        if not await self.allowed_by_robots(url):
-            return Page(url=url, error="blocked_by_robots")
+        # The site is on record as "being visited" for as long as anything is
+        # on the wire, so a run cut off by the computer knows what to skip.
+        tracker = unsafe.current
+        visiting = tracker.enter(url) if tracker is not None else ""
+        try:
+            if not await self.allowed_by_robots(url):
+                return Page(url=url, error="blocked_by_robots")
 
-        host = hostname(url)
-        started = time.perf_counter()
-        async with self._global_sem, self._host_sem(host):
-            if self.settings.crawl_delay > 0:
-                await asyncio.sleep(self.settings.crawl_delay)
-            inner = time.perf_counter()
-            page = await self._get_with_retries(url)
-            self.stats["n"] += 1
-            self.stats["s"] += time.perf_counter() - inner      # on the wire, not queueing
-        page.elapsed = time.perf_counter() - started
+            host = hostname(url)
+            started = time.perf_counter()
+            async with self._global_sem, self._host_sem(host):
+                if self.settings.crawl_delay > 0:
+                    await asyncio.sleep(self.settings.crawl_delay)
+                inner = time.perf_counter()
+                page = await self._get_with_retries(url)
+                self.stats["n"] += 1
+                self.stats["s"] += time.perf_counter() - inner      # on the wire, not queueing
+            page.elapsed = time.perf_counter() - started
+        finally:
+            if tracker is not None:
+                tracker.leave(visiting)
 
         if page.ok and self.cache is not None:
             try:
