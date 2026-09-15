@@ -26,13 +26,19 @@ class Harness:
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         self.tmp = Path(tempfile.mkdtemp(prefix="verifier-test-"))
         self.cfg_dir = self.tmp / "config"
+        self.dl = self.tmp / "Downloads"          # stands in for the user's Downloads folder
 
-    def run(self, *args: str, stdin: str = "", timeout: float = 120) -> subprocess.CompletedProcess:
+    def run(self, *args: str, stdin: str = "", timeout: float = 120,
+            interactive: bool = False) -> subprocess.CompletedProcess:
         env = {**os.environ,
                "VERIFIER_API_URL": f"{self.base}/ninja",
                "VERIFIER_TOKEN_URL": f"{self.base}/token",
                "VERIFIER_CONFIG_DIR": str(self.cfg_dir),
+               "VERIFIER_DOWNLOADS": str(self.dl),
                "NO_COLOR": "1"}
+        env.pop("VERIFIER_INTERACTIVE", None)
+        if interactive:
+            env["VERIFIER_INTERACTIVE"] = "1"
         return subprocess.run([sys.executable, str(VERIFIER), "--no-banner", *args],
                               input=stdin, capture_output=True, text=True,
                               env=env, cwd=self.tmp, timeout=timeout)
@@ -113,7 +119,7 @@ def test_inconclusive_answers_are_unknown_not_invalid():
         r = h.run("--key", "good-key-12345", "--rate", "100", "--all", "--no-recheck",
                   "spam@a.com", "tko@b.com", "flagged@c.com", "nomx@d.com")
         assert r.returncode == 0, r.stderr + r.stdout
-        rows = by_email(next(h.tmp.glob("*.csv")))
+        rows = by_email(next(h.dl.glob("*.csv")))
         assert rows["spam@a.com"]["verify_status"] == "unknown", rows
         assert rows["tko@b.com"]["verify_status"] == "unknown", rows
         assert rows["flagged@c.com"]["verify_status"] == "catch-all", rows
@@ -151,7 +157,7 @@ def test_tsv_and_semicolon_delimiters_are_kept():
         src.write_text("id\towner_email\tnote\n1\tok@a.com\thello, world\n2\tko@b.com\tx\n")
         r = h.run("--key", "good-key-12345", "--rate", "100", str(src))
         assert r.returncode == 0, r.stderr + r.stdout
-        out = next(h.tmp.glob("leads-verified-*.csv"))
+        out = next(h.dl.glob("leads-verified.csv"))
         text = out.read_text()
         assert text.splitlines()[0] == "id\towner_email\tnote\tverified_email\tverify_status\tverify_message"
         assert text.splitlines()[1].startswith("1\tok@a.com\thello, world\tok@a.com\tvalid")
@@ -165,7 +171,7 @@ def test_second_run_offers_saved_key_and_can_replace_it():
     try:
         r = h.run("--key", "good-key-12345", "--rate", "100", "ok@a.com")
         assert r.returncode == 0, r.stderr
-        assert by_email(next(h.tmp.glob("verified-*.csv")))["ok@a.com"]["verify_status"] == "valid"
+        assert by_email(next(h.dl.glob("verified-*.csv")))["ok@a.com"]["verify_status"] == "valid"
         # keep it
         r = h.run("ok@b.com", stdin="y\n")
         assert r.returncode == 0, r.stderr + r.stdout
@@ -193,7 +199,7 @@ def test_interactive_paste_flow():
         stdin = "good-key-12345\nok@x.com, ko@y.com\nsomething ok@z.com\n\nn\n"
         r = h.run("--all", stdin=stdin)
         assert r.returncode == 0, r.stderr + r.stdout
-        outs = list(h.tmp.glob("verified-*.csv"))
+        outs = list(h.dl.glob("verified-*.csv"))
         assert len(outs) == 1
         rows = read_rows(outs[0])
         assert [x["verified_email"] for x in rows] == ["ok@x.com", "ok@z.com"]
@@ -204,9 +210,39 @@ def test_interactive_paste_flow():
         stdin = "y\nname,email\nA,ok@p.com\nB,ko@q.com\n\nn\n"
         r = h.run(stdin=stdin)
         assert r.returncode == 0, r.stderr + r.stdout
-        newest = max(h.tmp.glob("verified-*.csv"), key=lambda p: p.stat().st_mtime_ns)
+        newest = max(h.dl.glob("verified-*.csv"), key=lambda p: p.stat().st_mtime_ns)
         assert read_rows(newest) == [{"name": "A", "email": "ok@p.com", "verified_email": "ok@p.com",
                                       "verify_status": "valid", "verify_message": "Accepted"}]
+    finally:
+        h.close()
+
+
+def test_first_run_asks_computer_type_once_and_names_the_file():
+    h = Harness()
+    try:
+        # first run: computer type, key, plan, paste, file name, no more
+        stdin = "2\ngood-key-12345\n1\nok@x.com\n\nmy leads\nn\n"
+        r = h.run(stdin=stdin, interactive=True)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "Mac or a Windows" in r.stdout
+        assert h.config()["os"] == "windows" and h.config()["rate"] == 5
+        assert (h.dl / "my leads.csv").exists(), list(h.dl.iterdir())
+        assert by_email(h.dl / "my leads.csv")["ok@x.com"]["verify_status"] == "valid"
+        # second run: no computer question; same name → refuse overwrite → new name
+        stdin = "y\nok@y.com\n\nmy leads\nn\nmy leads 2.csv\nn\n"
+        r = h.run(stdin=stdin, interactive=True)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "Mac or a Windows" not in r.stdout
+        assert "already exists" in r.stdout
+        assert (h.dl / "my leads 2.csv").exists(), list(h.dl.iterdir())
+        assert by_email(h.dl / "my leads.csv")["ok@x.com"]["verify_status"] == "valid", "untouched"
+        # a file argument suggests <file>-verified and illegal characters are cleaned
+        src = h.tmp / "list.csv"
+        src.write_text("email\nok@z.com\n")
+        r = h.run(str(src), stdin="y\nbad:name/here?\n", interactive=True)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "[list-verified]" in r.stdout
+        assert (h.dl / "bad-name-here-.csv").exists(), list(h.dl.iterdir())
     finally:
         h.close()
 
@@ -220,7 +256,7 @@ def test_rate_limit_is_respected():
         r = h.run("--key", "good-key-12345", "--rate", str(limit), "--no-recheck", *emails)
         elapsed = time.monotonic() - started
         assert r.returncode == 0, r.stderr + r.stdout
-        rows = by_email(next(h.tmp.glob("*.csv")))
+        rows = by_email(next(h.dl.glob("*.csv")))
         assert len(rows) == 14 and all(v["verify_status"] == "valid" for v in rows.values())
         assert h.state.max_in_window <= limit
         # 15 calls (14 + probe) at 6 / 10s ≈ 25s of drip; well under a burst-then-429 pattern
@@ -237,7 +273,7 @@ def test_backs_off_after_429_instead_of_failing():
         emails = [f"ok{i}@s.com" for i in range(6)]
         r = h.run("--key", "good-key-12345", "--rate", "30", "--no-recheck", *emails)
         assert r.returncode == 0, r.stderr + r.stdout
-        rows = by_email(next(h.tmp.glob("*.csv")))
+        rows = by_email(next(h.dl.glob("*.csv")))
         assert len(rows) == 6 and all(v["verify_status"] == "valid" for v in rows.values()), rows
     finally:
         h.close()

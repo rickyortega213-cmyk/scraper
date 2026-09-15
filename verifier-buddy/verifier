@@ -20,6 +20,7 @@ import http.client
 import io
 import json
 import os
+import platform
 import re
 import signal
 import ssl
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlsplit
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --------------------------------------------------------------------------- #
 # MailTester Ninja API
@@ -83,8 +84,29 @@ CODE_MAP = {
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
-CONFIG_DIR = Path(os.environ.get("VERIFIER_CONFIG_DIR", Path.home() / ".config" / "verifier-buddy"))
+OS_MAC, OS_WINDOWS, OS_LINUX = "mac", "windows", "linux"
+
+
+def detected_os() -> str:
+    name = platform.system().lower()
+    if name == "darwin":
+        return OS_MAC
+    if name == "windows":
+        return OS_WINDOWS
+    return OS_LINUX
+
+
+def _default_config_dir() -> Path:
+    if detected_os() == OS_WINDOWS and os.environ.get("APPDATA"):
+        return Path(os.environ["APPDATA"]) / "verifier-buddy"
+    return Path.home() / ".config" / "verifier-buddy"
+
+
+CONFIG_DIR = Path(os.environ.get("VERIFIER_CONFIG_DIR") or _default_config_dir())
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Prompts that only make sense with a person at the keyboard.
+INTERACTIVE = sys.stdin.isatty() or os.environ.get("VERIFIER_INTERACTIVE") == "1"
 
 BANNER = r"""
  _    __          _ _____              ____            __    __
@@ -99,6 +121,40 @@ BANNER = r"""
 # --------------------------------------------------------------------------- #
 # Terminal helpers
 # --------------------------------------------------------------------------- #
+class Sym:
+    """Pretty glyphs, with ASCII stand-ins for consoles that can't show them."""
+    ok, bad, arrow, dots = "✓", "✗", "→", "…"
+
+    @classmethod
+    def ascii(cls) -> None:
+        cls.ok, cls.bad, cls.arrow, cls.dots = "OK", "X", "->", "..."
+
+
+def setup_console(os_name: str) -> None:
+    """Make colours and Unicode work on Windows consoles; harmless elsewhere."""
+    if os_name != OS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+    utf8_console = True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for handle_id in (-11, -12):                 # stdout, stderr
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        utf8_console = kernel32.GetConsoleOutputCP() == 65001
+    except (AttributeError, OSError):
+        Style.enabled = False
+    if not utf8_console and not os.environ.get("WT_SESSION"):
+        Sym.ascii()
+
+
 class Style:
     enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -166,7 +222,7 @@ def mask_key(key: str) -> str:
     key = key.strip()
     if len(key) <= 8:
         return "*" * len(key)
-    return f"{key[:4]}…{key[-4:]}"
+    return f"{key[:4]}{Sym.dots}{key[-4:]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -847,7 +903,7 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
             retry = [e for e in todo if e in results and results[e].retryable]
             if not retry or stop.is_set():
                 break
-            say(Style.dim(f"  {len(retry)} inconclusive; re-checking in {RECHECK_PAUSES[n]:.0f}s…"))
+            say(Style.dim(f"  {len(retry)} inconclusive; re-checking in {RECHECK_PAUSES[n]:.0f}s{Sym.dots}"))
             if stop.wait(RECHECK_PAUSES[n]):
                 break
             run_pass(retry, f"re-check pass {n + 1}")
@@ -916,7 +972,7 @@ def summarize(results: list[Result], elapsed: float, out: Optional[Path],
         say(f"    {Style.green(str(rows_written))} row(s) kept, "
             f"{Style.dim(str(rows_dropped) + ' dropped')} (all original columns preserved)")
     if out:
-        say(f"    saved → {Style.bold(str(out))}")
+        say(f"    saved {Sym.arrow} {Style.bold(str(out))}")
     say()
 
 
@@ -971,16 +1027,16 @@ def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
     """Authenticate and persist the key. A refused key is asked for again
     when the flow is interactive; a refused --key is a hard exit (2)."""
     while True:
-        if is_new and not rate_override and sys.stdin.isatty():
+        if is_new and not rate_override and INTERACTIVE:
             rate = choose_plan(cfg)
         else:
             rate = rate_override or int(cfg.get("rate") or PLANS[DEFAULT_PLAN])
         client = MailTester(key, rate)
-        say(Style.dim("  checking key…"))
+        say(Style.dim(f"  checking key{Sym.dots}"))
         try:
             mode = client.authenticate()
         except AuthError as exc:
-            say(Style.red(f"  ✗ MailTester Ninja refused this key ({exc})."))
+            say(Style.red(f"  {Sym.bad} MailTester Ninja refused this key ({exc})."))
             say(Style.dim("    Copy it exactly from the API page at https://mailtester.ninja "
                           "and check the subscription is active."))
             if not interactive:
@@ -990,10 +1046,10 @@ def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
                 key = ask("Paste a different API key:")
             continue
         except FatalError as exc:
-            say(Style.red(f"  ✗ {exc}"))
+            say(Style.red(f"  {Sym.bad} {exc}"))
             sys.exit(3)
         except ApiError as exc:
-            say(Style.red(f"  ✗ could not reach MailTester Ninja: {exc}"))
+            say(Style.red(f"  {Sym.bad} could not reach MailTester Ninja: {exc}"))
             sys.exit(3)
         cfg["api_key"] = key
         cfg["rate"] = rate
@@ -1002,19 +1058,114 @@ def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
             save_config(cfg)
         except OSError as exc:
             say(Style.yellow(f"  ! could not save config: {exc}"))
-        say(Style.green(f"  ✓ key accepted ({mode} auth, {rate} req / 10s, "
+        say(Style.green(f"  {Sym.ok} key accepted ({mode} auth, {rate} req / 10s, "
                         f"saved to {CONFIG_FILE})"))
         return client
 
 
-def default_output(source_hint: str = "") -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    stem = Path(source_hint).stem if source_hint else ""
-    base = Path.cwd() / f"{stem + '-' if stem else ''}verified-{stamp}"
-    out, n = base.with_suffix(".csv"), 2
+def ensure_os(cfg: dict[str, Any]) -> str:
+    """Asked once, on the very first run; remembered after that."""
+    if cfg.get("os") in (OS_MAC, OS_WINDOWS, OS_LINUX):
+        return str(cfg["os"])
+    guess = detected_os()
+    if not INTERACTIVE:
+        cfg["os"] = guess
+        return guess
+    labels = {OS_MAC: "Mac", OS_WINDOWS: "Windows", OS_LINUX: "Linux"}
+    say("  Is this a Mac or a Windows computer?")
+    say("    1) Mac")
+    say("    2) Windows")
+    default = {OS_MAC: "1", OS_WINDOWS: "2"}.get(guess, "")
+    hint = f" (looks like {labels[guess]}, Enter to accept)" if default else ""
+    while True:
+        answer = ask(f"Computer{hint}:", default).lower()
+        if answer in ("1", "mac", "macos", "apple", "m"):
+            chosen = OS_MAC
+        elif answer in ("2", "windows", "win", "pc", "w"):
+            chosen = OS_WINDOWS
+        elif answer in ("3", "linux", "ubuntu"):
+            chosen = OS_LINUX
+        else:
+            say(Style.dim("  type 1 for Mac or 2 for Windows"))
+            continue
+        if chosen != guess:
+            say(Style.dim(f"  (this machine reports itself as {labels[guess]}; using {labels[chosen]} "
+                          "settings as you asked)"))
+        cfg["os"] = chosen
+        try:
+            save_config(cfg)
+        except OSError as exc:
+            say(Style.yellow(f"  ! could not save config: {exc}"))
+        return chosen
+
+
+def downloads_dir(os_name: str) -> Path:
+    """The user's Downloads folder; created if missing; cwd as a last resort."""
+    override = os.environ.get("VERIFIER_DOWNLOADS")
+    folder: Optional[Path] = Path(override).expanduser() if override else None
+    if folder is None and os_name == OS_WINDOWS:
+        try:
+            import winreg  # type: ignore
+            shell_folders = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, shell_folders) as key:
+                value, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E38DB}")
+            folder = Path(os.path.expandvars(str(value)))
+        except (ImportError, OSError, ValueError):
+            folder = None
+    if folder is None and os_name == OS_LINUX:
+        try:
+            for line in (Path.home() / ".config" / "user-dirs.dirs").read_text().splitlines():
+                if line.startswith("XDG_DOWNLOAD_DIR="):
+                    raw = line.split("=", 1)[1].strip().strip('"')
+                    folder = Path(raw.replace("$HOME", str(Path.home())))
+        except OSError:
+            folder = None
+    if folder is None:
+        folder = Path.home() / "Downloads"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+    except OSError:
+        return Path.cwd()
+
+
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def clean_file_name(name: str) -> str:
+    name = name.strip().strip('"').strip("'")
+    if name.lower().endswith(".csv"):
+        name = name[:-4]
+    name = _ILLEGAL_NAME_CHARS.sub("-", name).strip(" .")
+    return name[:120]
+
+
+def unique_path(base: Path) -> Path:
+    out, n = base, 2
     while out.exists():
-        out, n = Path(f"{base}-{n}.csv"), n + 1
+        out, n = base.with_name(f"{base.stem}-{n}{base.suffix}"), n + 1
     return out
+
+
+def choose_output(table: Table, folder: Path, override: str) -> Path:
+    """Where the results go: --output if given, else a name the user types
+    (interactive) or a sensible default, always inside the Downloads folder."""
+    if override:
+        return Path(override).expanduser()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    suggested = f"{Path(table.source).stem}-verified" if table.source else f"verified-{stamp}"
+    if not INTERACTIVE:
+        return unique_path(folder / f"{suggested}.csv")
+    while True:
+        raw = ask(f"Name for the results file (saved in {folder}) [{suggested}]:", suggested)
+        name = clean_file_name(raw)
+        if not name:
+            say(Style.dim("  please type a file name"))
+            continue
+        out = folder / f"{name}.csv"
+        if out.exists() and not ask_yes_no(f"{out.name} already exists there, overwrite it?", False):
+            continue
+        return out
 
 
 def workers_for(rate: int, requested: int) -> int:
@@ -1035,7 +1186,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("-k", "--key", default="", help="use this API key (also saved)")
     parser.add_argument("-r", "--rate", type=int, default=0, help="requests per 10 seconds")
     parser.add_argument("-w", "--workers", type=int, default=0, help="concurrent requests")
-    parser.add_argument("-o", "--output", default="", help="results CSV path")
+    parser.add_argument("-o", "--output", default="",
+                        help="results CSV path (default: a name you choose, in your Downloads folder)")
     parser.add_argument("-c", "--column", default="",
                         help="name (or 1-based number) of the email column; auto-detected by default")
     parser.add_argument("--keep", default=STATUS_VALID,
@@ -1062,12 +1214,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         bits.append("Ctrl-C to quit")
         say(Style.dim("  " + " · ".join(bits)))
         if os.environ.get("VERIFIER_UPDATED"):
-            say(Style.green(f"  ✓ updated from GitHub ({os.environ['VERIFIER_UPDATED']})"))
+            say(Style.green(f"  {Sym.ok} updated from GitHub ({os.environ['VERIFIER_UPDATED']})"))
     say()
 
     cfg = load_config()
     if args.reset:
         cfg.pop("api_key", None)
+    os_name = ensure_os(cfg)
+    setup_console(os_name)
+    folder = downloads_dir(os_name)
     key, is_new = obtain_key(cfg, args.key, args.reset)
     client = connect(cfg, key, is_new, args.rate, interactive=not args.key)
     rate = client.limiter.limit
@@ -1083,12 +1238,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         where = f" in {Style.bold(table.source)}" if table.source else ""
         say(f"  {len(table.rows)} row(s){where}, {Style.bold(str(len(emails)))} unique address(es) "
             f"from {Style.bold(table.email_column_name)}")
-        say(Style.dim(f"  verifying with {workers} threads at {rate} req / 10s"))
-        out = Path(out_override) if out_override else default_output(table.source)
+        out = choose_output(table, folder, out_override)
+        say(Style.dim(f"  verifying with {workers} threads at {rate} req / 10s {Sym.arrow} {out}"))
         started = time.monotonic()
         results, note = run_batch(client, emails, workers, passes)
         if note and note != "interrupted":
-            say(Style.red(f"  ✗ {note}"))
+            say(Style.red(f"  {Sym.bad} {note}"))
         by_email = {r.email: r for r in results}
         written, dropped = write_table(table, by_email, out, keep, args.all)
         summarize(results, time.monotonic() - started, out, written, dropped, args.all)
