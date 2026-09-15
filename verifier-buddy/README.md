@@ -14,13 +14,20 @@ One file, no dependencies beyond Python 3.9+, and it remembers your API key.
 
 ## Install
 
-One line, on a Mac or Linux terminal:
+**Mac / Linux** (Terminal):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.sh | bash
 ```
 
-Open a new terminal and type `verifier`.
+**Windows** (PowerShell; needs [git](https://git-scm.com/download/win) and
+[Python 3.9+](https://www.python.org/downloads/) with "Add python.exe to PATH" ticked):
+
+```powershell
+irm https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.ps1 | iex
+```
+
+Open a new terminal window and type `verifier`.
 
 GitHub is the single source of truth. The installer clones the repo's
 default branch into `~/.verifier-buddy` and puts a tiny launcher at
@@ -46,10 +53,17 @@ verifier leads.csv                # every address found in the file
 verifier leads.csv -o clean.csv   # choose where results go
 ```
 
-**First run** asks for your MailTester Ninja API key and which plan it's on
+**First run** asks whether this is a Mac or a Windows computer (asked once,
+never again), then for your MailTester Ninja API key and which plan it's on
 (that sets the request rate). **Every run after that** asks whether to keep
-the saved key; answer `n` to paste a different one. The key is stored in
-`~/.config/verifier-buddy/config.json` with owner-only permissions.
+the saved key; answer `n` to paste a different one. Settings live in
+`~/.config/verifier-buddy/config.json` (Mac/Linux) or
+`%APPDATA%\verifier-buddy\config.json` (Windows), owner-only.
+
+**Before each verification** it asks what to call the results file and
+saves it in your **Downloads** folder (`~/Downloads`, or the Windows
+Downloads folder). Press Enter to accept the suggested name; if the name is
+already taken it asks before overwriting. `-o path` skips the question.
 
 ## CSV in, the same CSV out (verified rows only)
 
@@ -74,8 +88,8 @@ Ann,Acme,ann@acme.com,111,ann@acme.com,valid,Accepted
   Excel's `sep=,` hint line is understood.
 - A plain list of addresses works too and produces a one-column table.
 
-Results print live, colour-coded, and are saved next to where you run
-(`<input>-verified-<timestamp>.csv` or `-o path`). Statuses:
+Results print live, colour-coded, and are saved in your Downloads folder
+under the name you chose. Statuses:
 
 | status       | meaning                                          |
 |--------------|--------------------------------------------------|
@@ -109,7 +123,7 @@ Results print live, colour-coded, and are saved next to where you run
 -k, --key KEY       use (and save) this API key
 -r, --rate N        requests per 10 seconds (Starter 5, Pro 11, Ultimate 57)
 -w, --workers N     concurrent requests (default: 3× rate, max 64)
--o, --output FILE   results CSV path
+-o, --output FILE   results CSV path (default: the name you type, in Downloads)
 -c, --column NAME   email column (name or 1-based number); auto-detected by default
     --keep LIST     statuses that count as verified (default: valid)
     --all           write every row with its verdict, not only verified ones
@@ -122,6 +136,7 @@ Results print live, colour-coded, and are saved next to where you run
 
 ```bash
 python3 verifier-buddy/tests/test_verifier.py
+bash verifier-buddy/tests/test_install.sh
 ```
 
 They run the real CLI against a local fake MailTester server (auth, rate
