@@ -116,10 +116,13 @@ def test_first_run_keeps_every_column_and_only_verified_rows():
 def test_inconclusive_answers_are_unknown_not_invalid():
     h = Harness()
     try:
+        out = h.tmp / "inconclusive.csv"
         r = h.run("--key", "good-key-12345", "--rate", "100", "--all", "--no-recheck",
-                  "spam@a.com", "tko@b.com", "flagged@c.com", "nomx@d.com")
+                  "spam@a.com", "tko@b.com", "flagged@c.com", "nomx@d.com", "-o", str(out))
         assert r.returncode == 0, r.stderr + r.stdout
-        rows = by_email(next(h.dl.glob("*.csv")))
+        rows = by_email(out)
+        retry_rows = read_rows(h.tmp / "inconclusive-retry.csv")
+        assert [x["email"] for x in retry_rows] == ["spam@a.com", "tko@b.com"]
         assert rows["spam@a.com"]["verify_status"] == "unknown", rows
         assert rows["tko@b.com"]["verify_status"] == "unknown", rows
         assert rows["flagged@c.com"]["verify_status"] == "catch-all", rows
@@ -160,6 +163,59 @@ def test_unwritable_output_path_falls_back_to_downloads():
         assert r.returncode == 0, r.stderr + r.stdout
         assert "could not write" in r.stdout
         assert by_email(h.dl / "out.csv")["ok@a.com"]["verify_status"] == "valid"
+    finally:
+        h.close()
+
+
+def test_network_outage_pauses_instead_of_failing():
+    h = Harness()
+    try:
+        emails = [f"slow{i}@o.com" for i in range(16)]
+        env_run = subprocess.Popen(
+            [sys.executable, str(VERIFIER), "--no-banner", "--key", "good-key-12345", "--rate", "100",
+             "--no-recheck", "-o", str(h.tmp / "outage.csv"), *emails],
+            env={**os.environ, "VERIFIER_API_URL": f"{h.base}/ninja", "VERIFIER_TOKEN_URL": f"{h.base}/token",
+                 "VERIFIER_CONFIG_DIR": str(h.cfg_dir), "VERIFIER_DOWNLOADS": str(h.dl), "NO_COLOR": "1"},
+            cwd=h.tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(1.2)                       # a few checks are in flight
+        port = h.server.server_port
+        h.server.shutdown()
+        h.server.server_close()                               # the "outage"
+        time.sleep(7)
+        h.server, _ = serve(port=port, state=h.state)         # Wi-Fi is back
+        out, _ = env_run.communicate(timeout=120)
+        assert env_run.returncode == 0, out
+        assert "network connection lost" in out and "network is back" in out, out
+        rows = by_email(h.tmp / "outage.csv")
+        assert len(rows) == 16 and all(v["verify_status"] == "valid" for v in rows.values()), out
+        assert not (h.tmp / "outage-retry.csv").exists()
+    finally:
+        h.close()
+
+
+def test_retry_file_lists_unchecked_rows_and_can_be_rerun():
+    h = Harness()
+    try:
+        src = h.tmp / "leads.csv"
+        src.write_text("Name,Email\nAnn,ok@a.com\nBob,spam@b.com\nCy,ko@c.com\nDi,tko@d.com\n")
+        out = h.tmp / "run1.csv"
+        r = h.run("--key", "good-key-12345", "--rate", "100", "--no-recheck", str(src), "-o", str(out))
+        assert r.returncode == 0, r.stderr + r.stdout
+        retry = h.tmp / "run1-retry.csv"
+        assert retry.exists() and "2 row(s) could not be checked" in r.stdout, r.stdout
+        rows = read_rows(retry)
+        assert [x["Name"] for x in rows] == ["Bob", "Di"], rows
+        assert list(rows[0].keys()) == ["Name", "Email", "verified_email", "verify_status", "verify_message"]
+        assert [x["Name"] for x in read_rows(out)] == ["Ann"]
+        # re-running the retry file: old verdict columns are dropped, not duplicated,
+        # and the right email column is used
+        out2 = h.tmp / "run2.csv"
+        r = h.run("--all", "--no-recheck", str(retry), "-o", str(out2))
+        assert r.returncode == 0, r.stderr + r.stdout
+        rows2 = read_rows(out2)
+        assert list(rows2[0].keys()) == ["Name", "Email", "verified_email", "verify_status", "verify_message"]
+        assert [(x["Name"], x["Email"]) for x in rows2] == [("Bob", "spam@b.com"), ("Di", "tko@d.com")]
+        assert "from Email" in r.stdout
     finally:
         h.close()
 
