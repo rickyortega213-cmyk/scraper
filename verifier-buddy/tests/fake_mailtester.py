@@ -112,9 +112,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {**base, "code": "ok", "message": "Accepted"})
 
 
-def serve(limit: int = 100) -> tuple[ThreadingHTTPServer, State]:
-    state = State(limit)
+def serve(limit: int = 100, port: int = 0, state: "State | None" = None) -> tuple[ThreadingHTTPServer, State]:
+    """Start the fake API. Pass `port` and `state` to bring a stopped server
+    back on the same address with its memory intact (an "outage")."""
+    state = state or State(limit)
     handler = type("H", (Handler,), {"state": state})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, state

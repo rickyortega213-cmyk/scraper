@@ -22,7 +22,9 @@ import json
 import os
 import platform
 import re
+import errno
 import signal
+import socket
 import ssl
 import stat
 import sys
@@ -34,7 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlsplit
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 # --------------------------------------------------------------------------- #
 # MailTester Ninja API
@@ -51,6 +53,8 @@ DEFAULT_PLAN = "starter"
 
 LIMITED_BACKOFF = (2.0, 5.0, 10.0, 20.0)  # after "Limited" / HTTP 429
 NETWORK_RETRIES = 3                       # transient socket / 5xx errors
+OFFLINE_MAX_WAIT = 30 * 60.0              # give up on an address after this long offline
+OFFLINE_PROBE_EVERY = 3.0
 RECHECK_PAUSES = (5.0, 15.0)              # re-ask about busy / timed-out mailboxes
 RECHECK_PASSES = len(RECHECK_PAUSES)
 
@@ -273,6 +277,11 @@ class RateLimited(Exception):
     """HTTP 429 or a "Limited" answer."""
 
 
+class NetworkDown(ApiError):
+    """The machine has no route to the service at all (Wi-Fi off, DNS gone).
+    Not a fault of the address being checked: wait, don't count it."""
+
+
 class Cancelled(Exception):
     """The run was stopped (Ctrl-C or a dead key); the worker should bail."""
 
@@ -354,7 +363,72 @@ def http_get(url: str, params: dict[str, str]) -> tuple[int, str]:
             _drop_connection(url)
             if attempt == 0:
                 continue
+    if _looks_offline(last):
+        raise NetworkDown(f"network error: {last}")
     raise ApiError(f"network error: {last}")
+
+
+_OFFLINE_ERRNOS = {errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTUNREACH, errno.ECONNREFUSED,
+                   errno.EADDRNOTAVAIL}
+
+
+def _looks_offline(exc: Optional[Exception]) -> bool:
+    if isinstance(exc, socket.gaierror):          # "nodename nor servname provided"
+        return True
+    return isinstance(exc, OSError) and exc.errno in _OFFLINE_ERRNOS
+
+
+class NetworkGate:
+    """When one worker finds the network gone, every worker waits here until
+    a probe can reach the service again. Prints once on the way down and
+    once on the way back up."""
+
+    def __init__(self, url: str) -> None:
+        parts = urlsplit(url)
+        self.host = parts.hostname or ""
+        self.port = parts.port or (443 if parts.scheme == "https" else 80)
+        self._up = threading.Event()
+        self._up.set()
+        self._lock = threading.Lock()
+        self._down_since = 0.0
+        self.outages = 0
+
+    def wait_if_down(self, stop: Optional[threading.Event]) -> None:
+        while not self._up.is_set():
+            if stop is not None and stop.is_set():
+                raise Cancelled()
+            if time.monotonic() - self._down_since > OFFLINE_MAX_WAIT:
+                raise ApiError("offline for too long")
+            self._up.wait(0.5)
+
+    def report_down(self, stop: Optional[threading.Event]) -> None:
+        with self._lock:
+            if self._up.is_set():
+                self._up.clear()
+                self._down_since = time.monotonic()
+                self.outages += 1
+                say(Style.yellow(f"  ! network connection lost; waiting for it to come back{Sym.dots}"))
+                threading.Thread(target=self._probe, daemon=True).start()
+        self.wait_if_down(stop)
+
+    def reachable(self) -> bool:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=5.0):
+                return True
+        except OSError:
+            return False
+
+    def _probe(self) -> None:
+        last_note = time.monotonic()
+        while not self.reachable():
+            time.sleep(OFFLINE_PROBE_EVERY)
+            if time.monotonic() - last_note >= 60.0:
+                waited = int(time.monotonic() - self._down_since) // 60
+                say(Style.dim(f"    still offline ({waited} min){Sym.dots}"))
+                last_note = time.monotonic()
+        waited = time.monotonic() - self._down_since
+        say(Style.green(f"  {Sym.ok} network is back after {waited:.0f}s; carrying on"))
+        self._up.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -455,6 +529,7 @@ class MailTester:
         self.token_expires_at = 0.0
         self._auth_lock = threading.Lock()
         self.stop: Optional[threading.Event] = None
+        self.gate = NetworkGate(VERIFY_URL)
 
     # -- auth ---------------------------------------------------------------
     def _key_variants(self) -> list[str]:
@@ -540,6 +615,7 @@ class MailTester:
     def _call(self, email: str) -> dict[str, Any]:
         params = self._auth_params()
         for retry_auth in (False, True):
+            self.gate.wait_if_down(self.stop)
             self.limiter.wait(self.stop)
             status, body = http_get(VERIFY_URL, {"email": email, **params})
             if status == 429:
@@ -588,6 +664,13 @@ class MailTester:
                 limited += 1
                 self.limiter.penalize(pause)
                 self._nap(pause)
+            except NetworkDown:
+                # Not this address's fault: hold until the network is back,
+                # then try again without counting the attempt.
+                try:
+                    self.gate.report_down(self.stop)
+                except ApiError as exc:
+                    return Result(email, STATUS_UNKNOWN, "error", str(exc)[:120], attempts=attempts)
             except ApiError as exc:
                 errors += 1
                 if errors > NETWORK_RETRIES:
@@ -698,8 +781,12 @@ def _pick_email_column(columns: list[str], rows: list[list[str]], wanted: str) -
         if wanted.isdigit() and 0 < int(wanted) <= len(columns):
             return int(wanted) - 1
         raise ValueError(f"no column called {wanted!r}; columns are: {', '.join(columns)}")
-    for i, name in enumerate(columns):
-        if any(h in name.strip().lower() for h in EMAIL_HEADER_HINTS):
+    names = [c.strip().lower() for c in columns]
+    for exact in ("email", "e-mail", "email address", "e-mail address", "emails"):
+        if exact in names:
+            return names.index(exact)
+    for i, name in enumerate(names):
+        if any(h in name for h in EMAIL_HEADER_HINTS) and not name.startswith("verif"):
             return i
     width = max((len(r) for r in rows), default=len(columns))
     scores = [0] * max(width, 1)
@@ -745,6 +832,12 @@ def parse_table(text: str, source: str = "", column: str = "") -> Table:
     if has_header:
         columns = [c.strip() or f"col{i + 1}" for i, c in enumerate(rows[0])]
         body = rows[1:]
+        # A file this tool wrote earlier (results or -retry): strip its verdict
+        # columns so they are not duplicated and cannot be mistaken for the emails.
+        n = len(APPENDED_COLUMNS)
+        if len(columns) > n and tuple(c.lower() for c in columns[-n:]) == APPENDED_COLUMNS:
+            columns = columns[:-n]
+            body = [r[:len(columns)] for r in body]
     else:
         width = max(len(r) for r in rows)
         columns = ["email"] if width == 1 else [f"col{i + 1}" for i in range(width)]
@@ -946,27 +1039,43 @@ def row_verdict(table: Table, row: list[str], by_email: dict[str, Result],
 
 
 def write_table(table: Table, by_email: dict[str, Result], out: Path,
-                keep: set[str], keep_all: bool) -> tuple[int, int]:
+                keep: set[str], keep_all: bool) -> tuple[int, int, int]:
     """Write the user's rows (every original column) plus the verdict
     columns. Only rows with a kept email are written unless keep_all.
-    Returns (rows written, rows dropped)."""
-    written = dropped = 0
+    Rows whose address could not be checked (unknown) go to a sibling
+    "<name>-retry.csv" so just those can be run again.
+    Returns (rows written, rows dropped, rows in the retry file)."""
+    written = dropped = retry = 0
+    retry_path = out.with_name(f"{out.stem}-retry{out.suffix}")
     # utf-8-sig: the byte-order mark makes Excel read accents correctly.
-    with open(out, "w", newline="", encoding="utf-8-sig") as fh:
+    with open(out, "w", newline="", encoding="utf-8-sig") as fh, \
+            open(retry_path, "w", newline="", encoding="utf-8-sig") as rh:
         writer = csv.writer(fh, delimiter=table.delimiter, lineterminator="\n")
-        writer.writerow(list(table.columns) + list(APPENDED_COLUMNS))
+        retry_writer = csv.writer(rh, delimiter=table.delimiter, lineterminator="\n")
+        header = list(table.columns) + list(APPENDED_COLUMNS)
+        writer.writerow(header)
+        retry_writer.writerow(header)
         for row in table.rows:
             kept, status, message = row_verdict(table, row, by_email, keep)
+            verdict = list(row) + ["; ".join(kept), status, message]
+            if not kept and status == STATUS_UNKNOWN:
+                retry_writer.writerow(verdict)
+                retry += 1
             if not kept and not keep_all:
                 dropped += 1
                 continue
-            writer.writerow(list(row) + ["; ".join(kept), status, message])
+            writer.writerow(verdict)
             written += 1
-    return written, dropped
+    if retry == 0:
+        try:
+            retry_path.unlink()
+        except OSError:
+            pass
+    return written, dropped, retry
 
 
 def summarize(results: list[Result], elapsed: float, out: Optional[Path],
-              rows_written: int, rows_dropped: int, keep_all: bool) -> None:
+              rows_written: int, rows_dropped: int, keep_all: bool, rows_retry: int = 0) -> None:
     counts: dict[str, int] = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
@@ -986,6 +1095,11 @@ def summarize(results: list[Result], elapsed: float, out: Optional[Path],
             f"{Style.dim(str(rows_dropped) + ' dropped')} (all original columns preserved)")
     if out:
         say(f"    saved {Sym.arrow} {Style.bold(str(out))}")
+    if out and rows_retry:
+        retry_path = out.with_name(f"{out.stem}-retry{out.suffix}")
+        say(Style.yellow(f"    {rows_retry} row(s) could not be checked (network / timeouts) "
+                         f"{Sym.arrow} {retry_path}"))
+        say(Style.yellow(f"    run them again with:  verifier \"{retry_path}\""))
     say()
 
 
@@ -1264,17 +1378,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         if note and note != "interrupted":
             say(Style.red(f"  {Sym.bad} {note}"))
         by_email = {r.email: r for r in results}
-        written, dropped = 0, 0
+        written, dropped, retry = 0, 0, 0
         for candidate in (out, unique_path(folder / out.name), unique_path(Path.cwd() / out.name)):
             try:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
-                written, dropped = write_table(table, by_email, candidate, keep, args.all)
+                written, dropped, retry = write_table(table, by_email, candidate, keep, args.all)
             except OSError as exc:
                 say(Style.yellow(f"  ! could not write {candidate}: {exc}"))
                 continue
             out = candidate
             break
-        summarize(results, time.monotonic() - started, out, written, dropped, args.all)
+        summarize(results, time.monotonic() - started, out, written, dropped, args.all, retry)
         if note == "interrupted":
             raise KeyboardInterrupt
 

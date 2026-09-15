@@ -113,6 +113,13 @@ under the name you chose. Statuses:
   re-checked twice at the end (after 5 s and 15 s) before being left unknown.
 - A worker hitting an unexpected error records that one address as unknown
   instead of taking the batch down with it.
+- **Losing the internet pauses the run instead of failing it.** Every worker
+  waits until the service is reachable again (it says so, and again when it
+  is back), then continues; nothing is counted against any address.
+- Anything that still could not be checked is written to
+  `<name>-retry.csv` next to the results, with all its columns, so you can
+  run just those again: `verifier ~/Downloads/<name>-retry.csv`. Re-running
+  a file the tool wrote does not duplicate the verdict columns.
 - Duplicates and malformed addresses are dropped locally before any API call.
 - Ctrl-C stops within a moment and still writes everything that finished.
 - Both MailTester auth styles work: direct `key=` and the older token flow.
