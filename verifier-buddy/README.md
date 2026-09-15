@@ -17,19 +17,22 @@ One file, no dependencies beyond Python 3.9+, and it remembers your API key.
 One line, on a Mac or Linux terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/claude/loving-lamport-9qut59/verifier-buddy/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.sh | bash
 ```
 
 Open a new terminal and type `verifier`.
 
-GitHub is the single source of truth. The installer clones the repo into
-`~/.verifier-buddy` and puts a tiny launcher at `~/.local/bin/verifier`.
-**Every time you run `verifier` it pulls the latest commit from GitHub
-first**, so a change pushed to the branch is live in your terminal on the
-next run (the banner shows the revision and says when it just updated).
-Offline, it simply runs the version it already has.
+GitHub is the single source of truth. The installer clones the repo's
+default branch into `~/.verifier-buddy` and puts a tiny launcher at
+`~/.local/bin/verifier`. **Every time you run `verifier` it pulls the latest
+commit from GitHub first**, so a change merged to the default branch is live
+in your terminal on the next run (the banner shows the revision and says
+when it just updated). Offline, it simply runs the version it already has.
+The link uses `HEAD`, so it stays valid whatever the default branch is named,
+and an install keeps working even if that branch is later renamed.
 
 - `VERIFIER_NO_UPDATE=1 verifier` skips the update check for one run.
+- `VERIFIER_BRANCH=some-branch` before the install line follows that branch instead.
 - Run the installer from inside your own checkout of the repo and it uses
   that checkout instead of `~/.verifier-buddy`.
 - `bash ~/.verifier-buddy/verifier-buddy/install.sh --uninstall` removes the launcher.

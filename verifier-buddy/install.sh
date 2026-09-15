@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # Verifier Buddy installer. GitHub is the single source of truth:
 #
-#   curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/claude/loving-lamport-9qut59/verifier-buddy/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.sh | bash
 #
-# It clones the repo into ~/.verifier-buddy (or reuses the checkout it is run
-# from) and puts a `verifier` launcher in ~/.local/bin. Every time you type
-# `verifier`, the launcher pulls the latest commit from GitHub first, so a
-# change pushed to the branch shows up in your terminal on the next run.
+# It clones the repo's default branch into ~/.verifier-buddy (or reuses the
+# checkout it is run from) and puts a `verifier` launcher in ~/.local/bin.
+# Every time you type `verifier`, the launcher pulls the latest commit from
+# GitHub first, so a change merged to the default branch shows up in your
+# terminal on the next run. The link above uses HEAD, so it keeps working
+# whatever the default branch is called.
 #
 #   bash install.sh --uninstall     remove the launcher (keeps the clone)
 #
-# Overrides:  VERIFIER_BRANCH, VERIFIER_REPO, VERIFIER_HOME (clone location)
+# Overrides:  VERIFIER_BRANCH (follow a specific branch instead of the default),
+#             VERIFIER_REPO, VERIFIER_HOME (clone location)
 set -euo pipefail
 
 REPO_URL="${VERIFIER_REPO:-https://github.com/rickyortega213-cmyk/scraper.git}"
-BRANCH="${VERIFIER_BRANCH:-claude/loving-lamport-9qut59}"
+BRANCH="${VERIFIER_BRANCH:-}"
 REPO_DIR="${VERIFIER_HOME:-$HOME/.verifier-buddy}"
 BIN_DIR="$HOME/.local/bin"
 LAUNCHER="$BIN_DIR/verifier"
-INSTALL_URL="https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/$BRANCH/verifier-buddy/install.sh"
+INSTALL_URL="https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.sh"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -45,13 +48,36 @@ if [[ -n "$SELF" && -f "$SELF" ]]; then
   fi
 fi
 
+# The branch to follow: the one asked for, else the repo's default branch.
+remote_default() {
+  git ls-remote --symref "$REPO_URL" HEAD 2>/dev/null | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }'
+}
+
 if [[ -f "$REPO_DIR/verifier-buddy/verifier" ]]; then
   say "using checkout at $REPO_DIR"
+  current="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  want="$BRANCH"
+  if [[ -z "$want" && "$REPO_DIR" == "${VERIFIER_HOME:-$HOME/.verifier-buddy}" ]]; then
+    want="$(remote_default)"           # a managed clone follows the default branch
+  fi
+  if [[ -n "$want" && "$want" != "$current" ]]; then
+    say "switching from $current to $want"
+    git -C "$REPO_DIR" fetch --quiet origin "$want" \
+      && git -C "$REPO_DIR" checkout --quiet -B "$want" FETCH_HEAD \
+      && git -C "$REPO_DIR" branch --quiet --set-upstream-to "origin/$want" 2>/dev/null \
+      || say "  (could not switch; continuing on $current)"
+    git -C "$REPO_DIR" config remote.origin.fetch "+refs/heads/$want:refs/remotes/origin/$want"
+  fi
   git -C "$REPO_DIR" pull --ff-only --quiet || say "  (could not pull; continuing with what is there)"
 else
   [[ ! -e "$REPO_DIR" ]] || die "$REPO_DIR exists but is not a Verifier Buddy checkout; move it or set VERIFIER_HOME"
-  say "cloning $REPO_URL ($BRANCH) → $REPO_DIR"
-  git clone --quiet --branch "$BRANCH" --single-branch "$REPO_URL" "$REPO_DIR"
+  if [[ -n "$BRANCH" ]]; then
+    say "cloning $REPO_URL ($BRANCH) → $REPO_DIR"
+    git clone --quiet --branch "$BRANCH" --single-branch "$REPO_URL" "$REPO_DIR"
+  else
+    say "cloning $REPO_URL (default branch) → $REPO_DIR"
+    git clone --quiet --single-branch "$REPO_URL" "$REPO_DIR"
+  fi
 fi
 chmod 0755 "$REPO_DIR/verifier-buddy/verifier"
 
@@ -77,6 +103,20 @@ if [[ "${VERIFIER_NO_UPDATE:-}" != "1" ]] && command -v git >/dev/null 2>&1; the
     [[ "$before" == "$after" ]] || export VERIFIER_UPDATED="$before → $after"
   else
     case "$out" in
+      *"couldn't find remote ref"*|*"no such ref"*|*"Could not find remote branch"*)
+        # The branch we follow is gone (renamed or deleted): move to the default one.
+        def="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" ls-remote --symref origin HEAD 2>/dev/null \
+               | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }')"
+        if [[ -n "$def" ]] && GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch --quiet origin "$def" 2>/dev/null \
+           && git -C "$REPO_DIR" checkout --quiet -B "$def" FETCH_HEAD 2>/dev/null; then
+          git -C "$REPO_DIR" config remote.origin.fetch "+refs/heads/$def:refs/remotes/origin/$def"
+          git -C "$REPO_DIR" branch --quiet --set-upstream-to "origin/$def" 2>/dev/null
+          after="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)"
+          export VERIFIER_UPDATED="now following $def, $before → $after"
+        else
+          echo "  (the branch this install follows is gone; re-run the installer:" >&2
+          echo "   curl -fsSL __INSTALL_URL__ | bash )" >&2
+        fi ;;
       *"local changes"*|*"would be overwritten"*|*"fast-forward"*|*"diverg"*)
         echo "  ! GitHub has a newer version but local edits in $REPO_DIR block the update." >&2
         echo "    Push them:     git -C \"$REPO_DIR\" add -A && git -C \"$REPO_DIR\" commit -m 'tweak' && git -C \"$REPO_DIR\" push" >&2

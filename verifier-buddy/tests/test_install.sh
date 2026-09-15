@@ -38,7 +38,7 @@ pass "launcher runs verifier"
 # 3. a new commit on "GitHub" is picked up on the next run
 scratch="$WORK/scratch"
 git clone --quiet --branch "$BRANCH" "$ORIGIN" "$scratch"
-sed -i.bak 's/^__version__ = "1.0.0"/__version__ = "1.0.1"/' "$scratch/verifier-buddy/verifier"; rm -f "$scratch/verifier-buddy/verifier.bak"
+sed -i.bak 's/^__version__ = ".*"/__version__ = "1.0.1"/' "$scratch/verifier-buddy/verifier"; rm -f "$scratch/verifier-buddy/verifier.bak"
 git -C "$scratch" -c user.name=t -c user.email=t@t commit --quiet -am "bump"
 git -C "$scratch" push --quiet origin "$BRANCH"
 out="$("$HOME/.local/bin/verifier" --version)"
@@ -55,7 +55,7 @@ pass "no-op update is quiet"
 
 # 5. local edits block the update with a clear hint, but the tool still runs
 echo "# local tweak" >> "$HOME/.verifier-buddy/verifier-buddy/verifier"
-sed -i.bak 's/^__version__ = "1.0.1"/__version__ = "1.0.2"/' "$scratch/verifier-buddy/verifier"; rm -f "$scratch/verifier-buddy/verifier.bak"
+sed -i.bak 's/^__version__ = ".*"/__version__ = "1.0.2"/' "$scratch/verifier-buddy/verifier"; rm -f "$scratch/verifier-buddy/verifier.bak"
 git -C "$scratch" -c user.name=t -c user.email=t@t commit --quiet -am "bump again"
 git -C "$scratch" push --quiet origin "$BRANCH"
 out="$("$HOME/.local/bin/verifier" --version 2>&1)"
@@ -88,5 +88,36 @@ git clone --quiet --branch "$BRANCH" "$ORIGIN" "$WORK/mine"
 bash "$WORK/mine/verifier-buddy/install.sh" >"$WORK/install2.log" 2>&1 || { cat "$WORK/install2.log"; fail "checkout install"; }
 grep -q "REPO_DIR=\"$WORK/mine\"" "$HOME/.local/bin/verifier" || fail "launcher not pointed at checkout"
 pass "installer inside a checkout uses that checkout"
+
+# 9. with no branch given, a fresh install follows the repo's default branch,
+#    and re-running the installer migrates an old install to it
+unset VERIFIER_BRANCH
+rm -rf "$HOME/.verifier-buddy" "$HOME/.local/bin/verifier"
+git -C "$scratch" checkout --quiet -b main
+sed -i.bak 's/^__version__ = ".*"/__version__ = "2.0.0"/' "$scratch/verifier-buddy/verifier"; rm -f "$scratch/verifier-buddy/verifier.bak"
+git -C "$scratch" -c user.name=t -c user.email=t@t commit --quiet -am "main"
+git -C "$scratch" push --quiet origin main
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main            # main is now the default
+cat "$SRC_REPO/verifier-buddy/install.sh" | bash >"$WORK/install3.log" 2>&1 || { cat "$WORK/install3.log"; fail "default-branch install"; }
+[[ "$(git -C "$HOME/.verifier-buddy" rev-parse --abbrev-ref HEAD)" == "main" ]] || fail "fresh install not on default branch"
+[[ "$("$HOME/.local/bin/verifier" --version)" == "verifier buddy 2.0.0" ]] || fail "wrong version from default branch"
+pass "fresh install follows the default branch"
+
+rm -rf "$HOME/.verifier-buddy"
+VERIFIER_BRANCH="$BRANCH" bash -c "cat '$SRC_REPO/verifier-buddy/install.sh' | bash" >/dev/null 2>&1 || fail "old-branch install"
+[[ "$("$HOME/.local/bin/verifier" --version)" == "verifier buddy 1.0.2" ]] || fail "old-branch install wrong version"
+cat "$SRC_REPO/verifier-buddy/install.sh" | bash >"$WORK/install4.log" 2>&1 || { cat "$WORK/install4.log"; fail "migration install"; }
+[[ "$(git -C "$HOME/.verifier-buddy" rev-parse --abbrev-ref HEAD)" == "main" ]] || fail "re-install did not migrate to default"
+[[ "$("$HOME/.local/bin/verifier" --version)" == "verifier buddy 2.0.0" ]] || fail "migrated install wrong version"
+pass "re-running the installer migrates an old install to the default branch"
+
+# 10. the launcher heals itself when the branch it follows is deleted
+rm -rf "$HOME/.verifier-buddy"
+VERIFIER_BRANCH="$BRANCH" bash -c "cat '$SRC_REPO/verifier-buddy/install.sh' | bash" >/dev/null 2>&1 || fail "old-branch install 2"
+git -C "$ORIGIN" branch -D "$BRANCH" >/dev/null
+out="$(printf '' | "$HOME/.local/bin/verifier" 2>&1 || true)"
+grep -q "now following main" <<<"$out" || fail "launcher did not switch to default: $out"
+[[ "$("$HOME/.local/bin/verifier" --version)" == "verifier buddy 2.0.0" ]] || fail "after heal wrong version"
+pass "launcher moves to the default branch when its branch disappears"
 
 echo "all install tests passed"
