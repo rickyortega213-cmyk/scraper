@@ -92,6 +92,15 @@ class Settings:
     emaillistverify_key: str = ""
     bouncer_key: str = ""
 
+    # Unsafe websites: checked before they are visited (macOS stops a scrape
+    # that reaches a site on Apple's Safe Browsing list - see web/unsafe.py)
+    safe_browsing_key: str = ""         # Google Safe Browsing API key (free): every site asked about first
+    unsafe_lists: bool = True           # also download public malware/phishing host lists (no key needed)
+    unsafe_list_urls: tuple[str, ...] = (
+        "https://urlhaus.abuse.ch/downloads/hostfile/",
+        "https://openphish.com/feed.txt",
+    )
+
     # Web search (website discovery + owner lookup)
     web_search_provider: str = "auto"   # auto|openwebninja|none
     openwebninja_key: str = ""
@@ -133,6 +142,7 @@ class Settings:
     rotate_user_agent: bool = True
     crawl_delay: float = 0.0
     site_timeout: float = 45.0        # whole-site budget: discover + crawl + owner search, then move on
+    memory_limit_mb: int = 0          # pause starting new batches above this RSS (0 = 45% of RAM, 1-6 GB)
     follow_social_profiles: bool = False
 
     # --- permutations ------------------------------------------------------

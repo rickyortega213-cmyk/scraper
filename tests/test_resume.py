@@ -183,7 +183,7 @@ def test_buddy_asks_for_the_table_name_after_the_searches(tmp_path, monkeypatch)
     captured: dict = {}
     monkeypatch.setattr("gmscrape.cli.cmd_run", lambda args: captured.update(vars(args)) or 0)
     monkeypatch.setattr("gmscrape.banner.print_banner", lambda console=None: None)
-    answers = iter(["", "", "", "", "",                 # keep every key
+    answers = iter(["", "", "", "", "", "",             # keep every key
                     "dentist in austin tx", "",         # searches
                     "",                                 # businesses per search -> 40
                     "",                                 # time budget -> 2 h
@@ -197,7 +197,8 @@ def test_buddy_asks_for_the_table_name_after_the_searches(tmp_path, monkeypatch)
         os.environ.update(snapshot)
     assert any("Supabase table" in t and "run_" in t for t in asked)   # default offered
     assert captured["supabase_table_name"] == "austin_dentists_sept"
-    assert captured["queries"] == ["dentist in austin tx"]
+    from gmscrape.cli import read_query_file
+    assert list(read_query_file(captured["queries_file"])) == ["dentist in austin tx"]
 
 
 def test_a_refused_verification_key_stops_the_run_resumably(settings, site_server):

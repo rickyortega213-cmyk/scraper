@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS domain_facts (
     is_catch_all INTEGER,
     updated_at   REAL
 );
+CREATE TABLE IF NOT EXISTS site_safety (
+    domain      TEXT PRIMARY KEY,
+    unsafe      INTEGER,
+    source      TEXT,
+    checked_at  REAL
+);
 CREATE TABLE IF NOT EXISTS businesses (
     key          TEXT PRIMARY KEY,
     run_id       TEXT,
@@ -349,6 +355,35 @@ class Store:
             has_mx = None if row["has_mx"] is None else bool(row["has_mx"])
             catch_all = None if row["is_catch_all"] is None else bool(row["is_catch_all"])
             return has_mx, catch_all
+
+    def get_site_safety(self, domains: Iterable[str]) -> dict[str, tuple[bool, float]]:
+        """Safe Browsing verdicts on record: domain -> (unsafe, checked_at)."""
+        wanted = sorted({d.lower() for d in domains if d})
+        out: dict[str, tuple[bool, float]] = {}
+        if not wanted:
+            return out
+        with self._lock:
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                for row in self.conn.execute(
+                    f"SELECT domain, unsafe, checked_at FROM site_safety WHERE domain IN ({marks})", chunk
+                ):
+                    out[str(row["domain"])] = (bool(row["unsafe"]), float(row["checked_at"] or 0))
+        return out
+
+    def put_site_safety(self, verdicts: dict[str, bool], source: str) -> None:
+        if not verdicts:
+            return
+        now = time.time()
+        with self._lock:
+            self.conn.executemany(
+                "INSERT INTO site_safety(domain, unsafe, source, checked_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(domain) DO UPDATE SET unsafe=excluded.unsafe, source=excluded.source, "
+                "checked_at=excluded.checked_at",
+                [(d.lower(), int(u), source, now) for d, u in verdicts.items()],
+            )
+            self.conn.commit()
 
     def put_domain_facts(
         self, domain: str, has_mx: Optional[bool] = None, is_catch_all: Optional[bool] = None

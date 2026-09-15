@@ -37,6 +37,7 @@ from .providers.registry import detect_maps_provider, detect_verify_provider
 from .query import parse_queries, read_query_file
 from .store.db import Store
 from .store.export import CsvAppender, export_results
+from .web import unsafe
 
 log = logging.getLogger("gmscrape")
 
@@ -102,6 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="continue an interrupted run (default: the latest one)")
     run.add_argument("--table-name", dest="supabase_table_name",
                      help="name for this run's Supabase table (default: from the search)")
+    run.add_argument("--no-supervise", dest="no_supervise", action="store_true",
+                     help="run in this process without the restart-on-kill supervisor")
     run.add_argument("--hours", type=float, dest="run_hours", default=None,
                      help="time budget: addresses found on sites are always checked; guessing "
                           "owner/info@ mailboxes stops when this runs out (default 2, 0 = no limit)")
@@ -282,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd.add_argument("run_id", nargs="?", help="run id (default: latest unfinished)")
     resume_cmd.add_argument("-y", "--yes", dest="confirm_keys_on_start", action="store_false",
                             default=None)
+    resume_cmd.add_argument("--no-supervise", dest="no_supervise", action="store_true",
+                            help="run in this process without the restart-on-kill supervisor")
     resume_cmd.add_argument("-o", "--out-dir", dest="out_dir")
     resume_cmd.add_argument("--basename", default="leads")
     resume_cmd.add_argument("--format", dest="export_formats")
@@ -553,8 +558,147 @@ def _startup_key_check(settings: Settings, args: argparse.Namespace) -> Optional
     return settings
 
 
+# --- the supervisor: a run that gets killed picks itself back up --------------
+SUPERVISE_MAX_RESTARTS = 200
+SUPERVISE_PAUSE = 15.0
+SUPERVISE_FAST_FAIL = 60.0           # a child dying inside a minute, repeatedly, is not making progress
+SUPERVISE_FAST_FAILS_MAX = 5
+_CLEAN_EXITS = {0, 2, 130}          # done / refused to start / Ctrl-C: the person decides
+
+
+def _supervised(args: argparse.Namespace) -> bool:
+    """Only a real terminal session gets a supervisor; the child, tests and
+    scripts run the pipeline directly."""
+    if os.environ.get("GMSCRAPE_CHILD") or getattr(args, "no_supervise", False):
+        return False
+    argv = getattr(args, "_argv", None)
+    if not argv:
+        return False
+    return _is_tty()
+
+
+def _is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _common_argv(args: argparse.Namespace) -> list[str]:
+    out: list[str] = []
+    for flag, attr in (("--env-file", "env_file"), ("--db", "db_path"), ("--log-level", "log_level")):
+        value = getattr(args, attr, None)
+        if value:
+            out += [flag, str(value)]
+    return out
+
+
+def _resume_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["resume", "-y"] + _common_argv(args)
+    for flag, attr in (("-o", "out_dir"), ("--basename", "basename")):
+        value = getattr(args, attr, None)
+        if value:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _run_child(argv: list[str], console_path: Optional[str] = None) -> int:
+    """Run the pipeline in a process of its own session - not a foreground job
+    of the terminal, no controlling terminal, no prompts - writing what it would
+    have printed to out/console.txt, which this process shows live. A kill
+    aimed at the terminal-attached process leaves the worker running; Ctrl-C
+    here is forwarded so the worker checkpoints and stops cleanly."""
+    import signal
+    import subprocess
+    import time as _time
+
+    env = {**os.environ, "GMSCRAPE_CHILD": "1"}
+    if not any(a in ("-y", "--yes") for a in argv):
+        argv = list(argv) + ["-y"]                       # nothing to ask once detached
+    path = Path(console_path or "out/console.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as sink:
+        offset = sink.tell()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "gmscrape.cli", *argv], env=env,
+            stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    echo(f"[dim]worker pid {proc.pid} · output also in {path}[/dim]")
+    with path.open("rb") as follow:
+        follow.seek(offset)
+        try:
+            while True:
+                chunk = follow.read()
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                code = proc.poll()
+                if code is not None:
+                    tail = follow.read()
+                    if tail:
+                        sys.stdout.write(tail.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+                    return code
+                _time.sleep(0.5)
+        except KeyboardInterrupt:
+            echo("\n[yellow]stopping the worker cleanly (it checkpoints first)…[/yellow]")
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=120)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                proc.kill()
+            tail = follow.read()
+            if tail:
+                sys.stdout.write(tail.decode("utf-8", errors="replace"))
+            return 130
+
+
+def supervise(args: argparse.Namespace, run_child=_run_child, pause: float = SUPERVISE_PAUSE,
+              console_path: Optional[str] = None) -> int:
+    """Run the command in a detached worker and, if that worker is killed or
+    dies with an error, resume it - up to SUPERVISE_MAX_RESTARTS times. A
+    finished run, a refusal to start and Ctrl-C end the loop."""
+    import time as _time
+
+    argv = list(args._argv)
+    out_dir = str(Path(console_path).parent) if console_path else ""
+    fast_fails = 0
+    for attempt in range(SUPERVISE_MAX_RESTARTS + 1):
+        started = _time.monotonic()
+        code = run_child(argv, console_path)
+        if code in _CLEAN_EXITS:
+            return code
+        lasted = _time.monotonic() - started
+        fast_fails = fast_fails + 1 if lasted < SUPERVISE_FAST_FAIL else 0
+        if fast_fails >= SUPERVISE_FAST_FAILS_MAX:
+            echo(f"[red]the run died within a minute {fast_fails} times in a row - something is stopping it "
+                 "from starting at all. See out/scraper.log; `scraper resume` continues it once fixed.[/red]")
+            return code
+        if attempt == SUPERVISE_MAX_RESTARTS:
+            echo(f"[red]the run stopped {attempt + 1} times; giving up. `scraper resume` continues it.[/red]")
+            return code
+        why = f"killed by signal {-code}" if code < 0 else f"exit code {code}"
+        if code < 0:
+            echo("[yellow]the computer stopped the worker.[/yellow] On a Mac this is the "
+                 "\"Malicious Script Blocked\" notice: a website the scrape visited is on "
+                 "Apple's unsafe list. That site is skipped from here on; the run continues.")
+        blocked = unsafe.quarantine_leftovers(out_dir) if out_dir else []
+        if blocked:
+            echo(f"[dim]{len(blocked)} website{'s' if len(blocked) != 1 else ''} added to "
+                 f"{Path(out_dir) / unsafe.BLOCKED_FILE}[/dim]")
+        echo(f"[yellow]the run stopped ({why}). Nothing finished is lost; resuming in "
+             f"{int(pause)}s (restart {attempt + 1}/{SUPERVISE_MAX_RESTARTS}).[/yellow]")
+        logging.getLogger(__name__).warning("run stopped (%s); resuming", why)
+        _time.sleep(pause)
+        argv = _resume_argv(args)
+    return code
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    _launch()
+    supervised = _supervised(args)
+    if not (supervised and getattr(args, "_launched", False)):
+        _launch()
     settings = settings_from_args(args)
     queries: list[str] = list(args.queries or [])
     if args.queries_file:
@@ -566,15 +710,33 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     specs = parse_queries(queries)
     echo(f"[bold]{len(specs)}[/bold] quer{'y' if len(specs) == 1 else 'ies'} to run:")
-    for spec in specs:
+    for spec in specs[:12]:
         echo(f"  • [cyan]{spec.business_type}[/cyan] in [magenta]{spec.location or 'anywhere'}[/magenta]")
+    if len(specs) > 12:
+        echo(f"  … and {len(specs) - 12} more")
 
     checked = _startup_key_check(settings, args)
     if checked is None:
         return 2
     settings = checked
+    if supervised:
+        # Everything a person could be asked has been asked here, on the terminal;
+        # the work itself runs detached and is resumed if it is killed.
+        return supervise(args, console_path=str(Path(settings.out_dir) / "console.txt"))
     return _execute_run(settings, [s.search_string for s in specs], basename=args.basename,
                         run_id=None, resume_id=getattr(args, "resume", None))
+
+
+def _skip_unsafe_sites(out_dir: str) -> list[str]:
+    """Before a start: block the sites the previous worker was visiting when it
+    was cut off (it leaves out/inflight.json behind only then)."""
+    blocked = unsafe.quarantine_leftovers(out_dir)
+    if blocked:
+        shown = ", ".join(blocked[:5]) + (" …" if len(blocked) > 5 else "")
+        echo(f"[yellow]the last run was cut off while visiting {len(blocked)} website"
+             f"{'s' if len(blocked) != 1 else ''} ({shown}); they will be skipped from now on "
+             f"- see {Path(out_dir) / unsafe.BLOCKED_FILE}[/yellow]")
+    return blocked
 
 
 def _execute_run(settings: Settings, queries: list[str], *, basename: str,
@@ -590,10 +752,13 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
                  else f"[yellow]no run {resume_id}[/yellow]")
             return 2
         run_id, queries, resume = previous["run_id"], previous["queries"], True
+        if previous.get("run_table") and not settings.supabase_table_name:
+            settings.supabase_table_name = previous["run_table"]     # same live table, not a new one
         echo(f"resuming run [cyan]{run_id}[/cyan]: {previous['done']}/{previous['total']} businesses "
              f"already done, {len(queries)} search{'es' if len(queries) != 1 else ''}")
 
     add_log_file(str(Path(settings.out_dir) / "scraper.log"))
+    _skip_unsafe_sites(settings.out_dir)
     exporter = _Exporter(settings, basename)
     maps = None
     if resume:
@@ -613,48 +778,55 @@ def _execute_run(settings: Settings, queries: list[str], *, basename: str,
         return 2
 
     lean = settings.lean_memory or len(queries) > settings.lean_threshold_queries
-    with pipeline:
-        echo(f"maps: [green]{pipeline.maps.name}[/green]   "
-             f"verification: [green]{pipeline.verifier.name}[/green]   "
-             f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
-             f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
-        if settings.verify_emails and getattr(pipeline.verifier, "requires_key", False):
-            # Prove the verification key works before a single Maps credit is spent.
+    unsafe.open_inflight(settings.out_dir)      # which sites are on the wire, for a cut-off run
+    try:
+        with pipeline:
+            echo(f"maps: [green]{pipeline.maps.name}[/green]   "
+                 f"verification: [green]{pipeline.verifier.name}[/green]   "
+                 f"web search: [green]{pipeline.web_search.name if pipeline.web_search else 'off'}[/green]   "
+                 f"batches of {settings.batch_size}" + ("   [dim]large-run mode[/dim]" if lean else ""))
+            if settings.verify_emails and getattr(pipeline.verifier, "requires_key", False):
+                # Prove the verification key works before a single Maps credit is spent.
+                try:
+                    pipeline.verifier.preflight()
+                except ProviderAuthError as exc:
+                    echo(f"[red]{exc}[/red]")
+                    echo("Nothing was spent. Fix the key and start again.")
+                    return 2
+                except ProviderError as exc:
+                    echo(f"[yellow]could not check the verification key up front ({exc}); continuing[/yellow]")
+            if lean:
+                exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
             try:
-                pipeline.verifier.preflight()
-            except ProviderAuthError as exc:
-                echo(f"[red]{exc}[/red]")
-                echo("Nothing was spent. Fix the key and start again.")
-                return 2
-            except ProviderError as exc:
-                echo(f"[yellow]could not check the verification key up front ({exc}); continuing[/yellow]")
-        if lean:
-            exporter.begin_lean(pipeline.store, run_id or "", resumed=resume)
-        try:
-            report = pipeline.run(queries, run_id=run_id, resume=resume)
-        except RunStopped as stopped:
-            report = stopped.report
-            paths = exporter.finish(report)
-            echo("")
-            if isinstance(stopped.cause, KeyboardInterrupt):
-                echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
-                     f"finished and are in {paths[0] if paths else 'the export'}.")
-            elif isinstance(stopped.cause, ProviderAuthError):
-                echo(f"[red]Stopped: {stopped.cause}[/red]")
-                echo(f"{report.done}/{report.total} businesses were finished and are in "
-                     f"{paths[0] if paths else 'the export'}. Fix the key, then pick it up with:  "
-                     f"[cyan]scraper resume[/cyan]   (run id {report.run_id})")
-                return 2
-            else:
-                echo(f"[red]The run hit an error:[/red] {stopped.cause}")
-                echo(f"{report.done}/{report.total} businesses were finished and are in "
-                     f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
-                     "re-bought on resume.")
-            echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
-                 f"(run id {report.run_id})")
-            return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
-        paths = exporter.finish(report, getattr(pipeline, "store", None))
+                report = pipeline.run(queries, run_id=run_id, resume=resume)
+            except RunStopped as stopped:
+                report = stopped.report
+                paths = exporter.finish(report)
+                echo("")
+                if isinstance(stopped.cause, KeyboardInterrupt):
+                    echo(f"[yellow]Stopped.[/yellow] {report.done}/{report.total} businesses were "
+                         f"finished and are in {paths[0] if paths else 'the export'}.")
+                elif isinstance(stopped.cause, ProviderAuthError):
+                    echo(f"[red]Stopped: {stopped.cause}[/red]")
+                    echo(f"{report.done}/{report.total} businesses were finished and are in "
+                         f"{paths[0] if paths else 'the export'}. Fix the key, then pick it up with:  "
+                         f"[cyan]scraper resume[/cyan]   (run id {report.run_id})")
+                    return 2
+                else:
+                    echo(f"[red]The run hit an error:[/red] {stopped.cause}")
+                    echo(f"{report.done}/{report.total} businesses were finished and are in "
+                         f"{paths[0] if paths else 'the export'}. Nothing already paid for will be "
+                         "re-bought on resume.")
+                echo(f"Pick it up where it stopped with:  [cyan]scraper resume[/cyan]   "
+                     f"(run id {report.run_id})")
+                return 130 if isinstance(stopped.cause, KeyboardInterrupt) else 1
+            paths = exporter.finish(report, getattr(pipeline, "store", None))
+    finally:
+        unsafe.close_inflight()          # a clean exit leaves nothing to quarantine
     _print_report(report, paths)
+    if getattr(pipeline, "safety", None) is not None and pipeline.safety.stats["checked"]:
+        stats = pipeline.safety.stats
+        echo(f"[dim]unsafe-site check: {stats['checked']} sites asked about, {stats['flagged']} skipped[/dim]")
     _print_final_table(report)
     _print_supabase_link(settings, report)
     return 0
@@ -714,6 +886,8 @@ class _Exporter:
 def cmd_resume(args: argparse.Namespace) -> int:
     _launch()
     settings = settings_from_args(args)
+    if _supervised(args):
+        return supervise(args, console_path=str(Path(settings.out_dir) / "console.txt"))
     return _execute_run(settings, [], basename=args.basename, run_id=None,
                         resume_id=args.run_id or "latest")
 
@@ -1371,7 +1545,8 @@ def _make_progress(exporter: Optional["_Exporter"] = None):
                      f"(pages {stages['fetch_avg']:.1f}s avg, searches {stages['search_avg']:.1f}s avg, "
                      f"{stages.get('search_slots', 0)} at a time) · "
                      f"verify {_fmt_duration(stages['verify'] / n)} ({stages.get('checks', 0) // n} checks{gap}{keys}) · "
-                     f"maps {_fmt_duration(stages['maps'])} total · memory peak {int(stages.get('memory_mb', 0)):,} MB[/dim]")
+                     f"maps {_fmt_duration(stages['maps'])} total · memory {int(stages.get('memory_now_mb', 0)):,} MB "
+                     f"(peak {int(stages.get('memory_mb', 0)):,}, limit {int(stages.get('memory_limit_mb', 0)):,})[/dim]")
                 logging.getLogger(__name__).info("pace: %s", {k: round(v, 2) if isinstance(v, float) else v
                                                               for k, v in stages.items()})
                 if stages.get("memory_mb", 0) > 3000 and not state.get("memory_warned"):
@@ -1498,6 +1673,7 @@ def _print_report(report: RunReport, paths: Sequence[Path]) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args._argv = list(argv if argv is not None else sys.argv[1:])
     configure_logging(getattr(args, "log_level", None) or "INFO")
     handlers = {
         "run": cmd_run,

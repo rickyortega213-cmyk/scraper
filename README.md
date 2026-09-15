@@ -35,8 +35,14 @@ publishes none, and verifies everything before it lands in your CSV.
 ```bash
 make dev                      # venv + install (one time)
 source .venv/bin/activate
-scraper buddy                 # that's it
+scraper                       # that's it
 ```
+
+Or skip the terminal: double-click **`Scraper Buddy.command`** in the
+`scraper` folder. It sets itself up the first time and starts the same guided
+flow. **On a Mac, start it one of these two ways - type `scraper` or
+double-click - never by pasting a command** (see "If something breaks
+mid-run" for why).
 
 `scraper buddy` walks you through everything:
 
@@ -45,6 +51,7 @@ scraper buddy                 # that's it
     Scraper Tech (Google Maps) ............ a25e…ce8   keep it? [Y/n]
     MailTester Ninja (email verification)  sub_…ABC   keep it? [Y/n]
     OpenWeb Ninja (web search) ............ not set    add it now? [y/N]
+    Google Safe Browsing (unsafe-site check) not set   add it now? [y/N]
     Supabase URL (live table) ............. not set    add it now? [y/N]
 
   Searches - paste them, one per line (business type in location),
@@ -605,6 +612,56 @@ buys more speed.
 
 ## If something breaks mid-run
 
+**"Malicious Script Blocked" on a Mac.** Since macOS 26.4, a command
+*pasted* into Terminal is traced: every process it starts is watched, every
+website those processes connect to is checked against Apple's Safe Browsing
+list, and the moment one is on the list the whole process tree is stopped
+with this notice and no override. A scrape visits tens of thousands of
+business websites, some of which are compromised or reported, so a pasted
+start ends this way sooner or later, mid-run and at random. Two things fix
+it:
+
+1. **Start it by typing `scraper` (seven letters) or by double-clicking
+   `Scraper Buddy.command`** - never by pasting. Typed and double-clicked
+   commands are not traced.
+2. **Ask before visiting.** Apple's list is Google Safe Browsing, which
+   answers lookups for free with an API key. With `SAFE_BROWSING_KEY` set
+   (`scraper buddy` asks for it; getting one takes five minutes at
+   console.cloud.google.com → APIs & Services → Library → *Safe Browsing
+   API* → Enable → Credentials → Create credentials → API key), every batch's
+   websites are checked before the first byte is fetched, 500 per request,
+   and a listed one is skipped (`skipped:unsafe_site`) and written to
+   `out/blocked_sites.txt`. Verdicts are kept in the database for a day. A
+   site found by web search is checked the same way before it is visited.
+   Without a key, two public lists of malware and phishing hosts (URLhaus,
+   OpenPhish; `UNSAFE_LISTS`, `UNSAFE_LIST_URLS`) are downloaded once a day
+   into `out/unsafe_lists/` and used the same way - partial cover, better
+   than none.
+3. **The site that got a run stopped is never visited again.** While it
+   runs, the worker keeps `out/inflight.json` listing the websites it is
+   fetching at that moment. A clean exit removes the file; a killed worker
+   leaves it behind, and the next start (the supervisor's automatic one, or
+   yours) moves every site on it to `out/blocked_sites.txt` and says so. The
+   crawler skips those sites from then on (owner search and address guesses
+   still happen for those businesses; only the crawl is skipped, marked
+   `skipped:unsafe_site`). Delete a line from the file to visit a site again.
+   You can also report a wrongly-listed site to Apple from the notice.
+
+**The run looks after itself.** `scraper buddy` and `scraper resume` ask
+everything they need on the terminal, then run the scrape in a worker
+process of its own session - not a foreground job of the terminal, with its
+searches read from `out/queries.txt` rather than the command line - and show
+its output live (it is also written to `out/console.txt`). If that worker is
+killed - by the system under memory pressure, by a security tool, by anything -
+the supervisor says so, waits fifteen seconds and resumes the same run, up to
+200 times; a worker that dies within a minute five times in a row stops the
+loop with a message. Ctrl-C is forwarded so the worker checkpoints and stops. Only a finished run, a refusal to start (a bad key) or your own Ctrl-C
+end the loop. Memory is kept in check on purpose: only a few pages are parsed
+at a time (a parsed page is ten times its HTML), the live-table buffer holds
+one row per business, and when the process nears its memory limit (45% of
+RAM by default, `MEMORY_LIMIT_MB` to change) new batches are held until the
+ones in flight finish. A resumed run keeps writing to the same live table.
+
 Nothing you've paid for is ever bought twice, and nothing finished is lost:
 
 - **Every API result is cached the moment it arrives** — Maps results per
@@ -680,7 +737,7 @@ and each API's terms all apply to what you do with the output.
 ## Tests
 
 ```bash
-make test     # 253 tests, no network or API keys needed
+make test     # 259 tests, no network or API keys needed
 ```
 
 The end-to-end test serves fake business sites over real HTTP and runs the

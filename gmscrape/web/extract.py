@@ -275,11 +275,24 @@ class ParsedPage:
     links: list[str] = None          # type: ignore[assignment]  ranked same-site links (if asked)
 
 
+# A parsed tree is ten times the size of the HTML. Parsing is CPU-bound and
+# serialised by the interpreter anyway, so letting every socket's page be
+# parsed at once only multiplied memory (hundreds of trees at a time was a
+# fast way to exhaust a laptop); a few at a time costs no speed.
+_PARSE_GATE = __import__("threading").BoundedSemaphore(4)
+
+
 def parse_page(raw_html: str, base_url: str = "", *, want_links: bool = False,
                link_limit: int = 40) -> ParsedPage:
     page = ParsedPage(raw_html or "", jsonld_bodies=[], soup_found=[], links=[])
     if not raw_html:
         return page
+    with _PARSE_GATE:
+        return _parse_page_locked(page, raw_html, base_url, want_links, link_limit)
+
+
+def _parse_page_locked(page: ParsedPage, raw_html: str, base_url: str, want_links: bool,
+                       link_limit: int) -> ParsedPage:
     soup = BeautifulSoup(raw_html, "lxml")
     page.title = soup.title.get_text(" ", strip=True) if soup.title else ""
     page.soup_found.extend(_iter_mailto(soup))

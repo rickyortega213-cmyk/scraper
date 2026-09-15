@@ -274,3 +274,54 @@ def city_from_address(address: str) -> str:
                 return candidate
             return ""
     return ""
+
+
+def current_rss_mb() -> float:
+    """Resident memory of this process right now, in MB (0 when unknown)."""
+    import os
+    import sys
+
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/statm", encoding="ascii") as handle:
+                pages = int(handle.read().split()[1])
+            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        if sys.platform == "darwin":
+            return _darwin_rss_bytes() / (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return 0.0
+
+
+def _darwin_rss_bytes() -> float:
+    """proc_pidinfo(PROC_PIDTASKINFO) through libproc - no child process."""
+    import ctypes
+    import ctypes.util
+    import os
+
+    class TaskInfo(ctypes.Structure):
+        _fields_ = [
+            ("pti_virtual_size", ctypes.c_uint64), ("pti_resident_size", ctypes.c_uint64),
+            ("pti_total_user", ctypes.c_uint64), ("pti_total_system", ctypes.c_uint64),
+            ("pti_threads_user", ctypes.c_uint64), ("pti_threads_system", ctypes.c_uint64),
+            ("pti_policy", ctypes.c_int32), ("pti_faults", ctypes.c_int32),
+            ("pti_pageins", ctypes.c_int32), ("pti_cow_faults", ctypes.c_int32),
+            ("pti_messages_sent", ctypes.c_int32), ("pti_messages_received", ctypes.c_int32),
+            ("pti_syscalls_mach", ctypes.c_int32), ("pti_syscalls_unix", ctypes.c_int32),
+            ("pti_csw", ctypes.c_int32), ("pti_threadnum", ctypes.c_int32),
+            ("pti_numrunning", ctypes.c_int32), ("pti_priority", ctypes.c_int32),
+        ]
+
+    libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+    info = TaskInfo()
+    size = libproc.proc_pidinfo(os.getpid(), 4, 0, ctypes.byref(info), ctypes.sizeof(info))  # 4 = PROC_PIDTASKINFO
+    return float(info.pti_resident_size) if size == ctypes.sizeof(info) else 0.0
+
+
+def total_ram_mb() -> float:
+    import os
+
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        return 0.0

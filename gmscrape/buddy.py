@@ -56,6 +56,8 @@ BUDDY_KEYS: tuple[BuddyKey, ...] = (
     BuddyKey("MailTester Ninja (email verification)", "MAILTESTER_KEY", "confirms emails are real"),
     BuddyKey("OpenWeb Ninja (web search)", "OPENWEBNINJA_KEY",
              "finds missing websites and owners", optional=True),
+    BuddyKey("Google Safe Browsing (unsafe-site check)", "SAFE_BROWSING_KEY",
+             "keeps macOS from stopping the run", optional=True),
     BuddyKey("Supabase project URL (live table)", "SUPABASE_URL",
              "https://<project>.supabase.co", optional=True, secret=False),
     BuddyKey("Supabase project API key (live table)", "SUPABASE_KEY",
@@ -225,7 +227,9 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         echo(f"A previous run stopped early: {first}{more} - "
              f"{unfinished['done']}/{unfinished['total']} businesses finished.")
         if _yes(prompt("Resume it? [Y/n] "), default=True):
-            args = build_parser().parse_args(["resume", "-y", unfinished["run_id"]])
+            argv = ["resume", "-y", unfinished["run_id"]]
+            args = build_parser().parse_args(argv)
+            args._argv = argv         # the supervisor restarts from this
             return cmd_resume(args)
 
     review_keys(prompt, rich_echo if echo is print else echo)
@@ -270,7 +274,18 @@ def buddy(prompt: Prompt = input, echo: Echo = print, argv: Optional[list[str]] 
         echo("cancelled")
         return 0
 
-    args = build_parser().parse_args(["run", "-y", "-n", str(limit), *extra, *queries])
+    from pathlib import Path
+
+    from .config import Settings
+
+    out_dir = Path(Settings.from_env().out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    queries_file = out_dir / "queries.txt"          # thousands of searches do not belong on a command line
+    queries_file.write_text("\n".join(queries) + "\n", encoding="utf-8")
+    argv = ["run", "-y", "-n", str(limit), *extra, "-f", str(queries_file)]
+    args = build_parser().parse_args(argv)
+    args._argv = argv             # the supervisor restarts from this
+    args._launched = True         # banner already shown
     settings_from_args(args)      # loads .env + saved keys for the run
     return cmd_run(args)
 
