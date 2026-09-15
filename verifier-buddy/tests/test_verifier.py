@@ -51,7 +51,7 @@ class Harness:
 
 
 def read_rows(path: Path) -> list[dict]:
-    with open(path, newline="") as fh:
+    with open(path, newline="", encoding="utf-8-sig") as fh:
         return list(csv.DictReader(fh))
 
 
@@ -94,7 +94,7 @@ def test_first_run_keeps_every_column_and_only_verified_rows():
 
         # --all keeps every row and labels it
         out_all = h.tmp / "all.csv"
-        r = h.run("--all", str(src), "-o", str(out_all), stdin="y\n")
+        r = h.run("--all", str(src), "-o", str(out_all))
         assert r.returncode == 0, r.stderr + r.stdout
         rows = read_rows(out_all)
         assert len(rows) == 8
@@ -106,7 +106,7 @@ def test_first_run_keeps_every_column_and_only_verified_rows():
         # --keep widens what counts as verified; --column picks the column by name
         out_keep = h.tmp / "keep.csv"
         r = h.run("--keep", "valid,catch-all", "--column", "Email Address", str(src),
-                  "-o", str(out_keep), stdin="y\n")
+                  "-o", str(out_keep))
         assert r.returncode == 0, r.stderr + r.stdout
         assert [x["Name"] for x in read_rows(out_keep)] == ["Ann", "Cy", "Di", "Ed", "Gus"]
     finally:
@@ -150,6 +150,20 @@ def test_csv_edge_cases_keep_every_data_row():
         h.close()
 
 
+def test_unwritable_output_path_falls_back_to_downloads():
+    h = Harness()
+    try:
+        blocker = h.tmp / "not-a-dir"
+        blocker.write_text("x")                                   # a file where a folder is needed
+        r = h.run("--key", "good-key-12345", "--rate", "100", "ok@a.com",
+                  "-o", str(blocker / "sub" / "out.csv"))
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "could not write" in r.stdout
+        assert by_email(h.dl / "out.csv")["ok@a.com"]["verify_status"] == "valid"
+    finally:
+        h.close()
+
+
 def test_tsv_and_semicolon_delimiters_are_kept():
     h = Harness()
     try:
@@ -158,7 +172,7 @@ def test_tsv_and_semicolon_delimiters_are_kept():
         r = h.run("--key", "good-key-12345", "--rate", "100", str(src))
         assert r.returncode == 0, r.stderr + r.stdout
         out = next(h.dl.glob("leads-verified.csv"))
-        text = out.read_text()
+        text = out.read_text(encoding="utf-8-sig")
         assert text.splitlines()[0] == "id\towner_email\tnote\tverified_email\tverify_status\tverify_message"
         assert text.splitlines()[1].startswith("1\tok@a.com\thello, world\tok@a.com\tvalid")
         assert len(text.splitlines()) == 2
@@ -172,23 +186,34 @@ def test_second_run_offers_saved_key_and_can_replace_it():
         r = h.run("--key", "good-key-12345", "--rate", "100", "ok@a.com")
         assert r.returncode == 0, r.stderr
         assert by_email(next(h.dl.glob("verified-*.csv")))["ok@a.com"]["verify_status"] == "valid"
-        # keep it
-        r = h.run("ok@b.com", stdin="y\n")
+        # unattended: the saved key is used without a question
+        r = h.run("ok@a2.com")
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "Keep the saved API key" not in r.stdout
+        # interactive: keep it (Enter), then name the file
+        r = h.run("ok@b.com", stdin="\n\n", interactive=True)
         assert r.returncode == 0, r.stderr + r.stdout
         assert "Keep the saved API key (good…2345)?" in r.stdout
         assert h.config()["api_key"] == "good-key-12345"
-        # replace it with a token-only key
-        r = h.run("ok@c.com", stdin="n\ntokenonly-key-12345\n")
+        # replace it with a token-only key (new key → plan question), name the file
+        r = h.run("ok@c.com", stdin="n\ntokenonly-key-12345\n2\n\n", interactive=True)
         assert r.returncode == 0, r.stderr + r.stdout
         assert h.config()["api_key"] == "tokenonly-key-12345"
-        assert h.config()["auth_mode"] == "token"
+        assert h.config()["auth_mode"] == "token" and h.config()["rate"] == 11
         paths = [q["path"] for q in h.state.requests]
         assert "/token" in paths
         # a refused key asks again, then the good one is saved
-        r = h.run("ok@d.com", stdin="n\nnope-nope-nope\ngood-key-12345\n")
+        r = h.run("ok@d.com", stdin="n\nnope-nope-nope\ngood-key-12345\n1\n\n", interactive=True)
         assert r.returncode == 0, r.stderr + r.stdout
         assert "refused this key" in r.stdout
         assert h.config()["api_key"] == "good-key-12345"
+        # unattended with no saved key at all: a clear exit, not a hang
+        h2 = Harness()
+        try:
+            r = h2.run("ok@e.com")
+            assert r.returncode == 2 and "no saved API key" in r.stdout
+        finally:
+            h2.close()
     finally:
         h.close()
 
@@ -196,23 +221,24 @@ def test_second_run_offers_saved_key_and_can_replace_it():
 def test_interactive_paste_flow():
     h = Harness()
     try:
-        stdin = "good-key-12345\nok@x.com, ko@y.com\nsomething ok@z.com\n\nn\n"
-        r = h.run("--all", stdin=stdin)
+        # computer, key, plan, paste, file name, no more
+        stdin = "1\ngood-key-12345\n1\nok@x.com, ko@y.com\nsomething ok@z.com\n\n\nn\n"
+        r = h.run("--all", stdin=stdin, interactive=True)
         assert r.returncode == 0, r.stderr + r.stdout
         outs = list(h.dl.glob("verified-*.csv"))
-        assert len(outs) == 1
+        assert len(outs) == 1, list(h.dl.iterdir())
         rows = read_rows(outs[0])
         assert [x["verified_email"] for x in rows] == ["ok@x.com", "ok@z.com"]
         assert "bye!" in r.stdout
         assert "3 unique address(es)" in r.stdout
 
-        # pasting a whole CSV keeps its columns too
-        stdin = "y\nname,email\nA,ok@p.com\nB,ko@q.com\n\nn\n"
-        r = h.run(stdin=stdin)
+        # pasting a whole CSV keeps its columns too (keep key, paste, name, no more)
+        stdin = "\nname,email\nA,ok@p.com\nB,ko@q.com\n\npasted\nn\n"
+        r = h.run(stdin=stdin, interactive=True)
         assert r.returncode == 0, r.stderr + r.stdout
-        newest = max(h.dl.glob("verified-*.csv"), key=lambda p: p.stat().st_mtime_ns)
-        assert read_rows(newest) == [{"name": "A", "email": "ok@p.com", "verified_email": "ok@p.com",
-                                      "verify_status": "valid", "verify_message": "Accepted"}]
+        assert read_rows(h.dl / "pasted.csv") == [
+            {"name": "A", "email": "ok@p.com", "verified_email": "ok@p.com",
+             "verify_status": "valid", "verify_message": "Accepted"}]
     finally:
         h.close()
 
