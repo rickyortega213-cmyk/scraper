@@ -1,0 +1,128 @@
+# Verifier Buddy
+
+A fast email verifier for the terminal, powered by [MailTester Ninja](https://mailtester.ninja).
+One file, no dependencies beyond Python 3.9+, and it remembers your API key.
+
+```
+ _    __          _ _____              ____            __    __
+| |  / /__  _____(_) __(_)__  _____   / __ )__  ______/ /___/ /_  __
+| | / / _ \/ ___/ / /_/ / _ \/ ___/  / __  / / / / __  / __  / / / /
+| |/ /  __/ /  / / __/ /  __/ /     / /_/ / /_/ / /_/ / /_/ / /_/ /
+|___/\___/_/  /_/_/ /_/\___/_/     /_____/\__,_/\__,_/\__,_/\__, /
+                                                           /____/
+```
+
+## Install
+
+One line, on a Mac or Linux terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rickyortega213-cmyk/scraper/HEAD/verifier-buddy/install.sh | bash
+```
+
+Open a new terminal and type `verifier`.
+
+GitHub is the single source of truth. The installer clones the repo's
+default branch into `~/.verifier-buddy` and puts a tiny launcher at
+`~/.local/bin/verifier`. **Every time you run `verifier` it pulls the latest
+commit from GitHub first**, so a change merged to the default branch is live
+in your terminal on the next run (the banner shows the revision and says
+when it just updated). Offline, it simply runs the version it already has.
+The link uses `HEAD`, so it stays valid whatever the default branch is named,
+and an install keeps working even if that branch is later renamed.
+
+- `VERIFIER_NO_UPDATE=1 verifier` skips the update check for one run.
+- `VERIFIER_BRANCH=some-branch` before the install line follows that branch instead.
+- Run the installer from inside your own checkout of the repo and it uses
+  that checkout instead of `~/.verifier-buddy`.
+- `bash ~/.verifier-buddy/verifier-buddy/install.sh --uninstall` removes the launcher.
+
+## Use
+
+```bash
+verifier                          # interactive: paste emails or a file path
+verifier a@b.com c@d.com          # verify a few addresses
+verifier leads.csv                # every address found in the file
+verifier leads.csv -o clean.csv   # choose where results go
+```
+
+**First run** asks for your MailTester Ninja API key and which plan it's on
+(that sets the request rate). **Every run after that** asks whether to keep
+the saved key; answer `n` to paste a different one. The key is stored in
+`~/.config/verifier-buddy/config.json` with owner-only permissions.
+
+## CSV in, the same CSV out (verified rows only)
+
+Give it a CSV with any columns and it finds the email column on its own
+(a header containing "email", otherwise the column with the most addresses;
+`--column NAME` to pick one). The output keeps **every original column and
+value exactly as it was**, contains **only the rows whose email verified**,
+and appends three columns:
+
+```
+Name,Company,Email Address,Phone,verified_email,verify_status,verify_message
+Ann,Acme,ann@acme.com,111,ann@acme.com,valid,Accepted
+```
+
+- Rows whose email was rejected, unknown, or missing are dropped
+  (the summary says how many). `--all` writes every row with its verdict instead.
+- By default only `valid` counts as verified. `--keep valid,catch-all` widens it.
+- A cell holding several addresses is fine: the ones that verified land in `verified_email`.
+- The same address in many rows is verified once; every row gets the verdict.
+- Tab- and semicolon-separated files come back with the same delimiter,
+  quoted multi-line cells and Windows line endings survive untouched, and
+  Excel's `sep=,` hint line is understood.
+- A plain list of addresses works too and produces a one-column table.
+
+Results print live, colour-coded, and are saved next to where you run
+(`<input>-verified-<timestamp>.csv` or `-o path`). Statuses:
+
+| status       | meaning                                          |
+|--------------|--------------------------------------------------|
+| `valid`      | mailbox accepted (MailTester `ok` / Accepted)    |
+| `invalid`    | rejected, or the domain has no MX (`ko`)         |
+| `catch-all`  | the domain accepts anything; can't confirm       |
+| `risky`      | disposable / temporary address                   |
+| `unknown`    | busy / timed out / rate limited after retries    |
+| `bad-syntax` | not an email address; never sent to the API      |
+| `no-email`   | (with `--all`) the row had no address            |
+
+## Why it's fast and doesn't fall over
+
+- Requests run in parallel (up to 64 threads) but are metered to your plan's
+  limit as an even drip, never a burst, so the vendor's limiter is never tripped.
+- HTTP 429 / "Limited" answers back off and retry; the gap between calls
+  stretches on a 429 and relaxes again after a run of clean answers.
+- Network hiccups and 5xx answers retry with keep-alive connections.
+- Inconclusive answers (busy, Timeout, Mx Error, SPAM Block, rate limited)
+  are never recorded as invalid, whatever code they arrive with; they are
+  re-checked twice at the end (after 5 s and 15 s) before being left unknown.
+- A worker hitting an unexpected error records that one address as unknown
+  instead of taking the batch down with it.
+- Duplicates and malformed addresses are dropped locally before any API call.
+- Ctrl-C stops within a moment and still writes everything that finished.
+- Both MailTester auth styles work: direct `key=` and the older token flow.
+
+## Options
+
+```
+-k, --key KEY       use (and save) this API key
+-r, --rate N        requests per 10 seconds (Starter 5, Pro 11, Ultimate 57)
+-w, --workers N     concurrent requests (default: 3× rate, max 64)
+-o, --output FILE   results CSV path
+-c, --column NAME   email column (name or 1-based number); auto-detected by default
+    --keep LIST     statuses that count as verified (default: valid)
+    --all           write every row with its verdict, not only verified ones
+    --no-recheck    skip the second look at busy mailboxes
+    --reset         forget the saved key and ask again
+    --no-banner     skip the ASCII art
+```
+
+## Tests
+
+```bash
+python3 verifier-buddy/tests/test_verifier.py
+```
+
+They run the real CLI against a local fake MailTester server (auth, rate
+limiting, retries, interactive prompts, Ctrl-C-safe output).
