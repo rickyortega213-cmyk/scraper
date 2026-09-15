@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlsplit
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # --------------------------------------------------------------------------- #
 # MailTester Ninja API
@@ -130,28 +130,40 @@ class Sym:
         cls.ok, cls.bad, cls.arrow, cls.dots = "OK", "X", "->", "..."
 
 
-def setup_console(os_name: str) -> None:
-    """Make colours and Unicode work on Windows consoles; harmless elsewhere."""
-    if os_name != OS_WINDOWS:
-        return
+def setup_console() -> None:
+    """Never let the console crash a run: output that the terminal cannot
+    encode is replaced, glyphs fall back to ASCII, and Windows consoles get
+    ANSI colours switched on. Based on the real machine, not the answer to
+    the Mac/Windows question, because this is about the terminal in use."""
+    is_windows = detected_os() == OS_WINDOWS
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+            if is_windows:
+                stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+            else:
+                stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass
-    utf8_console = True
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        for handle_id in (-11, -12):                 # stdout, stderr
-            handle = kernel32.GetStdHandle(handle_id)
-            mode = ctypes.c_uint()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        utf8_console = kernel32.GetConsoleOutputCP() == 65001
-    except (AttributeError, OSError):
-        Style.enabled = False
-    if not utf8_console and not os.environ.get("WT_SESSION"):
+    glyphs_ok = True
+    if is_windows:
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            for handle_id in (-11, -12):                 # stdout, stderr
+                handle = kernel32.GetStdHandle(handle_id)
+                mode = ctypes.c_uint()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING (ANSI colours)
+                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+            glyphs_ok = kernel32.GetConsoleOutputCP() == 65001 or bool(os.environ.get("WT_SESSION"))
+        except (AttributeError, OSError):
+            Style.enabled = False
+    else:
+        try:
+            "✓✗→…".encode(sys.stdout.encoding or "ascii")
+        except (UnicodeEncodeError, LookupError):
+            glyphs_ok = False
+    if not glyphs_ok:
         Sym.ascii()
 
 
@@ -691,9 +703,9 @@ def _pick_email_column(columns: list[str], rows: list[list[str]], wanted: str) -
             return i
     width = max((len(r) for r in rows), default=len(columns))
     scores = [0] * max(width, 1)
-    for row in rows[:500]:
+    for row in rows:
         for i, cell in enumerate(row):
-            if EMAIL_RE.search(cell):
+            if cell and EMAIL_RE.search(cell):
                 scores[i] += 1
     return max(range(len(scores)), key=lambda i: scores[i]) if any(scores) else 0
 
@@ -939,7 +951,8 @@ def write_table(table: Table, by_email: dict[str, Result], out: Path,
     columns. Only rows with a kept email are written unless keep_all.
     Returns (rows written, rows dropped)."""
     written = dropped = 0
-    with open(out, "w", newline="", encoding="utf-8") as fh:
+    # utf-8-sig: the byte-order mark makes Excel read accents correctly.
+    with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh, delimiter=table.delimiter, lineterminator="\n")
         writer.writerow(list(table.columns) + list(APPENDED_COLUMNS))
         for row in table.rows:
@@ -1013,9 +1026,12 @@ def obtain_key(cfg: dict[str, Any], forced_key: str = "", reset: bool = False) -
         return forced_key.strip(), forced_key.strip() != cfg.get("api_key")
     saved = str(cfg.get("api_key") or "").strip()
     if saved and not reset:
-        if ask_yes_no(f"Keep the saved API key ({mask_key(saved)})?", True):
+        if not INTERACTIVE or ask_yes_no(f"Keep the saved API key ({mask_key(saved)})?", True):
             return saved, False
     while True:
+        if not INTERACTIVE and not saved:
+            say(Style.red("  no saved API key; run `verifier` once in a terminal, or pass --key"))
+            sys.exit(2)
         key = ask("Paste your MailTester Ninja API key:")
         if len(key) >= 8:
             return key, True
@@ -1024,43 +1040,44 @@ def obtain_key(cfg: dict[str, Any], forced_key: str = "", reset: bool = False) -
 
 def connect(cfg: dict[str, Any], key: str, is_new: bool, rate_override: int = 0,
             interactive: bool = True) -> MailTester:
-    """Authenticate and persist the key. A refused key is asked for again
-    when the flow is interactive; a refused --key is a hard exit (2)."""
+    """Check the key first (asking for another one on refusal when the flow
+    is interactive; a refused --key is a hard exit), then, for a new key,
+    ask which plan it is on, once. Persists everything."""
+    rate = rate_override or int(cfg.get("rate") or PLANS[DEFAULT_PLAN])
     while True:
-        if is_new and not rate_override and INTERACTIVE:
-            rate = choose_plan(cfg)
-        else:
-            rate = rate_override or int(cfg.get("rate") or PLANS[DEFAULT_PLAN])
         client = MailTester(key, rate)
         say(Style.dim(f"  checking key{Sym.dots}"))
         try:
             mode = client.authenticate()
+            break
         except AuthError as exc:
             say(Style.red(f"  {Sym.bad} MailTester Ninja refused this key ({exc})."))
             say(Style.dim("    Copy it exactly from the API page at https://mailtester.ninja "
                           "and check the subscription is active."))
-            if not interactive:
+            if not interactive or not INTERACTIVE:
                 sys.exit(2)
             key, is_new = "", True
             while len(key) < 8:
                 key = ask("Paste a different API key:")
-            continue
         except FatalError as exc:
             say(Style.red(f"  {Sym.bad} {exc}"))
             sys.exit(3)
         except ApiError as exc:
             say(Style.red(f"  {Sym.bad} could not reach MailTester Ninja: {exc}"))
             sys.exit(3)
-        cfg["api_key"] = key
-        cfg["rate"] = rate
-        cfg["auth_mode"] = mode
-        try:
-            save_config(cfg)
-        except OSError as exc:
-            say(Style.yellow(f"  ! could not save config: {exc}"))
-        say(Style.green(f"  {Sym.ok} key accepted ({mode} auth, {rate} req / 10s, "
-                        f"saved to {CONFIG_FILE})"))
-        return client
+    if is_new and not rate_override and INTERACTIVE:
+        rate = choose_plan(cfg)
+        client.limiter = RateLimiter(rate)
+    cfg["api_key"] = key
+    cfg["rate"] = rate
+    cfg["auth_mode"] = mode
+    try:
+        save_config(cfg)
+    except OSError as exc:
+        say(Style.yellow(f"  ! could not save config: {exc}"))
+    say(Style.green(f"  {Sym.ok} key accepted ({mode} auth, {rate} req / 10s, "
+                    f"saved to {CONFIG_FILE})"))
+    return client
 
 
 def ensure_os(cfg: dict[str, Any]) -> str:
@@ -1154,8 +1171,10 @@ def choose_output(table: Table, folder: Path, override: str) -> Path:
         return Path(override).expanduser()
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     suggested = f"{Path(table.source).stem}-verified" if table.source else f"verified-{stamp}"
+    # Suggest a name that is still free, so pressing Enter never overwrites.
+    suggested = unique_path(folder / f"{suggested}.csv").stem
     if not INTERACTIVE:
-        return unique_path(folder / f"{suggested}.csv")
+        return folder / f"{suggested}.csv"
     while True:
         raw = ask(f"Name for the results file (saved in {folder}) [{suggested}]:", suggested)
         name = clean_file_name(raw)
@@ -1200,6 +1219,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-banner", action="store_true", help="skip the ASCII art")
     parser.add_argument("--version", action="version", version=f"verifier buddy {__version__}")
     args = parser.parse_args(argv)
+    setup_console()
 
     keep = {k.strip().lower() for k in args.keep.split(",") if k.strip()}
     known = {STATUS_VALID, STATUS_INVALID, STATUS_CATCH_ALL, STATUS_RISKY, STATUS_UNKNOWN}
@@ -1221,7 +1241,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.reset:
         cfg.pop("api_key", None)
     os_name = ensure_os(cfg)
-    setup_console(os_name)
     folder = downloads_dir(os_name)
     key, is_new = obtain_key(cfg, args.key, args.reset)
     client = connect(cfg, key, is_new, args.rate, interactive=not args.key)
@@ -1245,7 +1264,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if note and note != "interrupted":
             say(Style.red(f"  {Sym.bad} {note}"))
         by_email = {r.email: r for r in results}
-        written, dropped = write_table(table, by_email, out, keep, args.all)
+        written, dropped = 0, 0
+        for candidate in (out, unique_path(folder / out.name), unique_path(Path.cwd() / out.name)):
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                written, dropped = write_table(table, by_email, candidate, keep, args.all)
+            except OSError as exc:
+                say(Style.yellow(f"  ! could not write {candidate}: {exc}"))
+                continue
+            out = candidate
+            break
         summarize(results, time.monotonic() - started, out, written, dropped, args.all)
         if note == "interrupted":
             raise KeyboardInterrupt
