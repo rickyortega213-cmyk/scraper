@@ -220,6 +220,68 @@ def test_retry_file_lists_unchecked_rows_and_can_be_rerun():
         h.close()
 
 
+def _env(h: Harness) -> dict:
+    return {**os.environ, "VERIFIER_API_URL": f"{h.base}/ninja", "VERIFIER_TOKEN_URL": f"{h.base}/token",
+            "VERIFIER_CONFIG_DIR": str(h.cfg_dir), "VERIFIER_DOWNLOADS": str(h.dl), "NO_COLOR": "1"}
+
+
+def test_killed_run_resumes_where_it_stopped():
+    h = Harness()
+    try:
+        src = h.tmp / "big.csv"
+        src.write_text("name,email\n" + "".join(f"p{i},slow{i}@k.com\n" for i in range(30)))
+        out = h.tmp / "big-out.csv"
+        proc = subprocess.Popen(
+            [sys.executable, str(VERIFIER), "--no-banner", "--key", "good-key-12345", "--rate", "100",
+             "--workers", "4", "--no-recheck", str(src), "-o", str(out)],
+            env=_env(h), cwd=h.tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(3.0)
+        proc.kill()                                   # like the Mac going to sleep hard
+        proc.communicate()
+        journals = list((h.cfg_dir / "progress").glob("*.jsonl"))
+        assert len(journals) == 1, journals
+        done_before = [json.loads(ln)["e"] for ln in journals[0].read_text().splitlines()
+                       if '"e"' in ln]
+        assert 3 <= len(done_before) < 30, done_before
+        assert not out.exists()
+        asked_before = [q["email"] for q in h.state.requests if q["path"] == "/ninja"]
+
+        r = h.run("--rate", "100", "--no-recheck", str(src), "-o", str(out))
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "unfinished run found" in r.stdout and f"{len(done_before)} of 30 already verified" in r.stdout
+        rows = by_email(out)
+        assert len(rows) == 30 and all(v["verify_status"] == "valid" for v in rows.values())
+        asked_after = [q["email"] for q in h.state.requests if q["path"] == "/ninja"][len(asked_before):]
+        assert not (set(asked_after) & set(done_before)), "already-verified addresses were paid for again"
+        assert not journals[0].exists(), "journal should be removed after a finished run"
+    finally:
+        h.close()
+
+
+def test_terminal_log_is_reused_with_from_log():
+    h = Harness()
+    try:
+        log = h.tmp / "terminal.txt"
+        log.write_text("  [1/3] valid      OK@A.com  Accepted\n"
+                       "  [2/3] invalid    ko@b.com  Rejected\n"
+                       "garbage line\n"
+                       "  [3/3] unknown    ok@c.com  Timeout\n")
+        out = h.tmp / "log-out.csv"
+        r = h.run("--key", "good-key-12345", "--rate", "100", "--all", "--no-recheck",
+                  "--from-log", str(log), "ok@a.com", "ko@b.com", "ok@c.com", "ok@d.com", "-o", str(out))
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "3 verdict(s) found" in r.stdout and "recovered from the terminal log" in r.stdout
+        rows = by_email(out)
+        assert rows["ok@a.com"]["verify_status"] == "valid" and rows["ko@b.com"]["verify_status"] == "invalid"
+        assert rows["ok@c.com"]["verify_status"] == "valid", "an unknown from the log is re-checked"
+        assert rows["ok@d.com"]["verify_status"] == "valid"
+        asked = [q["email"] for q in h.state.requests if q["path"] == "/ninja"]
+        assert "ok@a.com" not in asked and "ko@b.com" not in asked, asked
+        assert "ok@c.com" in asked and "ok@d.com" in asked
+    finally:
+        h.close()
+
+
 def test_tsv_and_semicolon_delimiters_are_kept():
     h = Harness()
     try:
