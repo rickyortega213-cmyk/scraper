@@ -23,7 +23,9 @@ import os
 import platform
 import re
 import errno
+import hashlib
 import signal
+import subprocess
 import socket
 import ssl
 import stat
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlsplit
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # --------------------------------------------------------------------------- #
 # MailTester Ninja API
@@ -53,6 +55,7 @@ DEFAULT_PLAN = "starter"
 
 LIMITED_BACKOFF = (2.0, 5.0, 10.0, 20.0)  # after "Limited" / HTTP 429
 NETWORK_RETRIES = 3                       # transient socket / 5xx errors
+PROGRESS_KEEP_DAYS = 14                   # unfinished-run journals older than this are dropped
 OFFLINE_MAX_WAIT = 30 * 60.0              # give up on an address after this long offline
 OFFLINE_PROBE_EVERY = 3.0
 RECHECK_PAUSES = (5.0, 15.0)              # re-ask about busy / timed-out mailboxes
@@ -942,22 +945,29 @@ class Progress:
 
 
 def run_batch(client: MailTester, emails: list[str], workers: int,
-              recheck_passes: int = RECHECK_PASSES) -> tuple[list[Result], str]:
+              recheck_passes: int = RECHECK_PASSES,
+              known: Optional[dict[str, Result]] = None,
+              journal: Optional["Journal"] = None) -> tuple[list[Result], str]:
     """Verify every address concurrently under the rate limit, then re-ask
-    about busy / timed-out mailboxes. Returns (results, note) where note is
-    "" on a clean run, or why it stopped early; results are always complete
-    (unchecked addresses are marked unknown) so nothing is lost on Ctrl-C."""
+    about busy / timed-out mailboxes. `known` results (a resumed run) are
+    kept and not re-verified unless they are worth another look; every new
+    verdict is written to `journal` as it arrives. Returns (results, note)
+    where note is "" on a clean run, or why it stopped early; results are
+    always complete (unchecked addresses are marked unknown)."""
     results: dict[str, Result] = {}
     todo: list[str] = []
     for email in emails:
-        if looks_like_email(email):
-            todo.append(email)
-        else:
+        if not looks_like_email(email):
             results[email] = Result(email, STATUS_BAD_SYNTAX, "", "not an email address")
+        elif known and email in known and not known[email].retryable:
+            results[email] = known[email]
+        else:
+            todo.append(email)
 
     progress = Progress(len(emails))
-    for bad in list(results.values()):
-        progress.record(bad)
+    progress.done = len(results)
+    for bad in [r for r in results.values() if r.status == STATUS_BAD_SYNTAX]:
+        progress.record(bad, count=False)
 
     stop = threading.Event()
     client.stop = stop
@@ -994,6 +1004,8 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
                 result = fut.result()
                 if result is not None:
                     results[result.email] = result
+                    if journal is not None:
+                        journal.record(result)
                     progress.record(result, count=not label)
         except KeyboardInterrupt:
             stop.set()
@@ -1020,6 +1032,115 @@ def run_batch(client: MailTester, emails: list[str], workers: int,
     for email in todo:
         results.setdefault(email, Result(email, STATUS_UNKNOWN, "", "not checked"))
     return [results[e] for e in emails], note
+
+
+# --------------------------------------------------------------------------- #
+# Progress journal: every verdict is written to disk the moment it arrives,
+# so a run that dies (sleep, crash, closed window) resumes where it stopped.
+# --------------------------------------------------------------------------- #
+PROGRESS_DIR = CONFIG_DIR / "progress"
+STATUS_TOKENS = {STATUS_VALID, STATUS_INVALID, STATUS_CATCH_ALL, STATUS_RISKY, STATUS_UNKNOWN,
+                 STATUS_BAD_SYNTAX}
+LOG_LINE_RE = re.compile(r"\[\d+/\d+\]\s+(\S+)\s+(\S+@\S+)\s*(.*)$")
+
+
+def batch_id(emails: list[str]) -> str:
+    """Identifies a batch by its addresses, not its file name, so the same
+    list resumes whatever it is called or wherever it lives."""
+    digest = hashlib.sha1("\n".join(sorted(emails)).encode("utf-8")).hexdigest()
+    return digest[:20]
+
+
+class Journal:
+    def __init__(self, emails: list[str]) -> None:
+        self.id = batch_id(emails)
+        self.path = PROGRESS_DIR / f"{self.id}.jsonl"
+        self.meta: dict[str, Any] = {}
+        self.done: dict[str, Result] = {}
+        self._fh: Optional[Any] = None
+        self.load()
+
+    def load(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue                 # a half-written last line
+                    if "meta" in rec:
+                        self.meta = rec["meta"]
+                    elif "e" in rec:
+                        self.done[rec["e"]] = Result(rec["e"], rec.get("s", STATUS_UNKNOWN),
+                                                     rec.get("c", ""), rec.get("m", ""), rec.get("x", ""))
+        except OSError:
+            pass
+
+    def start(self, source: str, out: Path, total: int) -> None:
+        try:
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+            if not self.meta:
+                self.meta = {"source": source, "out": str(out), "total": total,
+                             "started": datetime.now().isoformat(timespec="seconds")}
+                self._fh.write(json.dumps({"meta": self.meta}) + "\n")
+                self._fh.flush()
+        except OSError as exc:
+            say(Style.yellow(f"  ! cannot save progress ({exc}); a crash would lose this run"))
+            self._fh = None
+
+    def record(self, result: Result) -> None:
+        if self._fh is None:
+            return
+        rec = {"e": result.email, "s": result.status, "c": result.code, "m": result.message}
+        if result.mx:
+            rec["x"] = result.mx
+        try:
+            self._fh.write(json.dumps(rec) + "\n")
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+    def finish(self) -> None:
+        """The results file is written: the journal has served its purpose."""
+        self.close()
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def sweep() -> None:
+        try:
+            cutoff = time.time() - PROGRESS_KEEP_DAYS * 86400
+            for old in PROGRESS_DIR.glob("*.jsonl"):
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+        except OSError:
+            pass
+
+
+def parse_progress_log(text: str) -> dict[str, Result]:
+    """Verdicts copied out of the terminal: lines like
+    "[123/2091] valid      someone@example.com  Accepted"."""
+    found: dict[str, Result] = {}
+    for line in text.splitlines():
+        m = LOG_LINE_RE.search(line)
+        if not m:
+            continue
+        status, email, message = m.group(1).lower(), m.group(2).lower(), m.group(3).strip()
+        if status not in STATUS_TOKENS or not looks_like_email(email):
+            continue
+        found[email] = Result(email, status, "", message)
+    return found
 
 
 def row_verdict(table: Table, row: list[str], by_email: dict[str, Result],
@@ -1301,6 +1422,19 @@ def choose_output(table: Table, folder: Path, override: str) -> Path:
         return out
 
 
+def keep_awake() -> Optional[Any]:
+    """On a Mac, stop idle sleep for as long as this process lives
+    (caffeinate -w exits by itself when we do). Harmless elsewhere."""
+    if detected_os() != OS_MAC:
+        return None
+    try:
+        return subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except (OSError, ValueError):
+        return None
+
+
 def workers_for(rate: int, requested: int) -> int:
     if requested > 0:
         return requested
@@ -1329,6 +1463,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--all", action="store_true",
                         help="write every row with its verdict instead of only verified ones")
     parser.add_argument("--no-recheck", action="store_true", help="skip second looks at busy mailboxes")
+    parser.add_argument("--from-log", default="",
+                        help="a text file of terminal output from a run that died; its verdicts are "
+                             "reused so those addresses are not paid for again")
     parser.add_argument("--reset", action="store_true", help="forget the saved key and ask again")
     parser.add_argument("--no-banner", action="store_true", help="skip the ASCII art")
     parser.add_argument("--version", action="version", version=f"verifier buddy {__version__}")
@@ -1351,10 +1488,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             say(Style.green(f"  {Sym.ok} updated from GitHub ({os.environ['VERIFIER_UPDATED']})"))
     say()
 
+    imported_log: dict[str, Result] = {}
+    if args.from_log:
+        try:
+            imported_log = parse_progress_log(Path(args.from_log).expanduser().read_text(
+                encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            parser.error(f"--from-log: {exc}")
+        say(Style.dim(f"  {len(imported_log)} verdict(s) found in {args.from_log}"))
+
     cfg = load_config()
     if args.reset:
         cfg.pop("api_key", None)
     os_name = ensure_os(cfg)
+    Journal.sweep()
+    awake = keep_awake()
     folder = downloads_dir(os_name)
     key, is_new = obtain_key(cfg, args.key, args.reset)
     client = connect(cfg, key, is_new, args.rate, interactive=not args.key)
@@ -1371,10 +1519,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         where = f" in {Style.bold(table.source)}" if table.source else ""
         say(f"  {len(table.rows)} row(s){where}, {Style.bold(str(len(emails)))} unique address(es) "
             f"from {Style.bold(table.email_column_name)}")
-        out = choose_output(table, folder, out_override)
-        say(Style.dim(f"  verifying with {workers} threads at {rate} req / 10s {Sym.arrow} {out}"))
+
+        # An unfinished run of this same list? Pick it up rather than pay again.
+        journal = Journal(emails)
+        known: dict[str, Result] = {}
+        if imported_log:
+            hits = {e: r for e, r in imported_log.items() if e in set(emails)}
+            if hits:
+                say(Style.green(f"  {Sym.ok} {len(hits)} verdict(s) recovered from the terminal log"))
+                known.update(hits)
+        if journal.done:
+            usable = {e: r for e, r in journal.done.items() if e in set(emails)}
+            when = journal.meta.get("started", "earlier")
+            say(Style.yellow(f"  unfinished run found from {when}: {len(usable)} of {len(emails)} "
+                             "already verified"))
+            if not INTERACTIVE or ask_yes_no("Resume it (skip the ones already done)?", True):
+                known.update(usable)
+            else:
+                journal.finish()
+                journal = Journal(emails)
+        if known and journal.meta.get("out") and not out_override:
+            out = Path(journal.meta["out"])
+            say(Style.dim(f"  results will go to the file chosen before: {out}"))
+        else:
+            out = choose_output(table, folder, out_override)
+        remaining = sum(1 for e in emails if e not in known or known[e].retryable)
+        say(Style.dim(f"  verifying {remaining} address(es) with {workers} threads at {rate} req / 10s "
+                      f"{Sym.arrow} {out}"))
+        journal.start(table.source, out, len(emails))
+        for r in known.values():
+            if r.email not in journal.done:
+                journal.record(r)
         started = time.monotonic()
-        results, note = run_batch(client, emails, workers, passes)
+        try:
+            results, note = run_batch(client, emails, workers, passes, known=known, journal=journal)
+        finally:
+            journal.close()
         if note and note != "interrupted":
             say(Style.red(f"  {Sym.bad} {note}"))
         by_email = {r.email: r for r in results}
@@ -1389,6 +1569,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             out = candidate
             break
         summarize(results, time.monotonic() - started, out, written, dropped, args.all, retry)
+        if note:
+            say(Style.dim("  run `verifier` again with the same list to resume; the progress is kept"))
+        else:
+            journal.finish()
         if note == "interrupted":
             raise KeyboardInterrupt
 
@@ -1405,13 +1589,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             verify_table(table, args.output if i == 0 else "")
         return 0
 
-    while True:
-        say()
-        for table in read_pasted(args.column):
-            verify_table(table, "")
-        if not ask_yes_no("Verify more?", True):
-            say(Style.dim("  bye!"))
-            return 0
+    try:
+        while True:
+            say()
+            for table in read_pasted(args.column):
+                verify_table(table, "")
+            if not ask_yes_no("Verify more?", True):
+                say(Style.dim("  bye!"))
+                return 0
+    finally:
+        if awake is not None:
+            try:
+                awake.terminate()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

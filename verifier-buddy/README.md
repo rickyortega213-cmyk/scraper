@@ -120,6 +120,16 @@ under the name you chose. Statuses:
   `<name>-retry.csv` next to the results, with all its columns, so you can
   run just those again: `verifier ~/Downloads/<name>-retry.csv`. Re-running
   a file the tool wrote does not duplicate the verdict columns.
+- **A run that dies resumes where it stopped.** Every verdict is saved to
+  disk the moment it arrives (`~/.config/verifier-buddy/progress/`). Run
+  `verifier` again with the same list, from any file name or paste, and it
+  offers to skip everything already verified, then writes the results file
+  you chose the first time. Unfinished runs are kept for 14 days.
+- Died before this feature existed? Copy the terminal output (Terminal →
+  Edit → Select All → Copy) into a text file and pass `--from-log that.txt`
+  with the same list: every verdict in it is reused, nothing is paid for twice.
+- On a Mac the machine is kept from idle-sleeping while a run is in
+  progress (closing the lid still sleeps it).
 - Duplicates and malformed addresses are dropped locally before any API call.
 - Ctrl-C stops within a moment and still writes everything that finished.
 - Both MailTester auth styles work: direct `key=` and the older token flow.
@@ -135,6 +145,7 @@ under the name you chose. Statuses:
     --keep LIST     statuses that count as verified (default: valid)
     --all           write every row with its verdict, not only verified ones
     --no-recheck    skip the second look at busy mailboxes
+    --from-log FILE reuse the verdicts printed by an earlier run (copied terminal output)
     --reset         forget the saved key and ask again
     --no-banner     skip the ASCII art
 ```
