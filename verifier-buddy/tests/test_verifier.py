@@ -282,6 +282,26 @@ def test_terminal_log_is_reused_with_from_log():
         h.close()
 
 
+def test_dragged_quoted_and_trailing_space_paths_are_found():
+    h = Harness()
+    try:
+        src = h.tmp / "socal general managers (v2).csv"
+        src.write_text("email\nok@a.com\n")
+        escaped = str(src).replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)")
+        for typed in (escaped + " ", f'"{src}"', f"'{src}'", str(src)):
+            out = h.tmp / "p.csv"
+            r = h.run("--key", "good-key-12345", "--rate", "100", "--no-recheck", typed, "-o", str(out))
+            assert r.returncode == 0 and "1 unique address" in r.stdout, (typed, r.stdout)
+            out.unlink()
+        # and in the interactive paste prompt, as a dragged path
+        stdin = f"\n{escaped} \n\n\nn\n"
+        r = h.run(stdin=stdin, interactive=True)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "no such file" not in r.stdout and "1 unique address" in r.stdout, r.stdout
+    finally:
+        h.close()
+
+
 def test_tsv_and_semicolon_delimiters_are_kept():
     h = Harness()
     try:
